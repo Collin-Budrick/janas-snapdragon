@@ -1,8 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* Private to quant.c, after the established NEON format helpers. */
+/* Fixed format/vector-count/prefix bounds remove dynamic hot-loop arrays.
+   Preserve integer corrections, ascending block order and float chains. */
 #define NEON_PANEL __attribute__((target("+dotprod+i8mm")))
+#define NEON_PANEL_K static inline __attribute__((always_inline)) NEON_PANEL
+#if defined(__clang__)
+#define PANEL_UNROLL _Pragma("clang loop unroll(full)")
+#elif defined(__GNUC__)
+#define PANEL_UNROLL _Pragma("GCC unroll 4")
+#else
+#define PANEL_UNROLL
+#endif
 
-static NEON_PANEL void panel_unpack(int type, const void *row, size_t b,
+NEON_PANEL_K void panel_unpack_k(int type, int level, const void *row, size_t b,
                                     const uint8_t *p1, const uint8_t *p0,
                                     int8_t q[256], int sc[16], int mn[8],
                                     float *d, float *dm)
@@ -46,7 +55,6 @@ static NEON_PANEL void panel_unpack(int type, const void *row, size_t b,
     } else {
         const struct janas_block_q6kp *w =
             (const struct janas_block_q6kp *)row + b;
-        int level = p0 ? 3 : p1 ? 2 : 1;
         for (int n = 0; n < 2; n++)
             for (int h = 0; h < 2; h++) {
                 size_t at = b * JANAS_Q6KP_PLANE + 32 * n + 16 * h;
@@ -67,16 +75,15 @@ static NEON_PANEL void panel_unpack(int type, const void *row, size_t b,
 /* Each block's decoded weights serve ALL token pairs and the odd SDOT
    column before the next block. There is no separate odd-token matrix pass.
    Temporary decoded bytes are per-block scratch, never a weight cache. */
-static NEON_PANEL void panel_rows_neon(int type, const void *w,
+NEON_PANEL_K void panel_rows_neon_k(int type, int nv, int level, const void *w,
                                        size_t row_bytes, const uint8_t *p1,
                                        const uint8_t *p0, size_t pb,
                                        const struct janas_q8k_panel *panel,
                                        size_t rows, float *y, size_t ys)
 {
-    size_t nv = panel->nv, pairs = panel->pairs, nb = panel->nb;
+    const size_t pairs = (size_t)nv / 2, nb = panel->nb;
     int groups = type == JANAS_Q4_K ? 8 : 16;
     int len = type == JANAS_Q4_K ? 32 : 16;
-    int level = p0 ? 3 : p1 ? 2 : 1;
     int factor = level == 3 ? 2 : level == 2 ? 8 : 32;
     int center = level == 3 ? 64 : level == 2 ? 61 : 49;
     for (size_t r = 0; r < rows; r += 2) {
@@ -84,6 +91,7 @@ static NEON_PANEL void panel_rows_neon(int type, const void *w,
                              (const char *)w + (r + 1) * row_bytes};
         float32x4_t acc[4], accm[4];
         float odd[2] = {0}, oddm[2] = {0};
+        PANEL_UNROLL
         for (size_t p = 0; p < pairs; p++)
             acc[p] = accm[p] = vdupq_n_f32(0.0f);
         for (size_t b = 0; b < nb; b++) {
@@ -91,11 +99,12 @@ static NEON_PANEL void panel_rows_neon(int type, const void *w,
             int sc[2][16], mn[2][8];
             float d[2], dm[2] = {0};
             for (int k = 0; k < 2; k++)
-                panel_unpack(type, wr[k], b,
+                panel_unpack_k(type, level, wr[k], b,
                              p1 ? p1 + (r + (size_t)k) * pb : NULL,
                              p0 ? p0 + (r + (size_t)k) * pb : NULL, q[k], sc[k],
                              mn[k], d + k, dm + k);
             int32x4_t sum[4];
+            PANEL_UNROLL
             for (size_t p = 0; p < pairs; p++)
                 sum[p] = vdupq_n_s32(0);
             int32x4_t os[2] = {vdupq_n_s32(0), vdupq_n_s32(0)};
@@ -105,12 +114,14 @@ static NEON_PANEL void panel_rows_neon(int type, const void *w,
                 int32x4_t s =
                     vcombine_s32(vdup_n_s32(sc[0][g]), vdup_n_s32(sc[1][g]));
                 int32x4_t dot[4];
+                PANEL_UNROLL
                 for (size_t p = 0; p < pairs; p++)
                     dot[p] = vdupq_n_s32(0);
                 for (int k = 0; k < len / 8; k++) {
                     int at = g * len + k * 8;
                     int8x16_t a =
                         vcombine_s8(vld1_s8(q[0] + at), vld1_s8(q[1] + at));
+                    PANEL_UNROLL
                     for (size_t p = 0; p < pairs; p++) {
                         const int8_t *bp =
                             panel->qs +
@@ -118,6 +129,7 @@ static NEON_PANEL void panel_rows_neon(int type, const void *w,
                         dot[p] = vmmlaq_s32(dot[p], a, vld1q_s8(bp));
                     }
                 }
+                PANEL_UNROLL
                 for (size_t p = 0; p < pairs; p++)
                     sum[p] = vmlaq_s32(sum[p], dot[p], s);
                 if (nv & 1) {
@@ -132,6 +144,7 @@ static NEON_PANEL void panel_rows_neon(int type, const void *w,
             }
             float32x4_t ds = vcombine_f32(vdup_n_f32(d[0]), vdup_n_f32(d[1]));
             float32x4_t ms = vcombine_f32(vdup_n_f32(dm[0]), vdup_n_f32(dm[1]));
+            PANEL_UNROLL
             for (size_t p = 0; p < pairs; p++) {
                 const struct janas_block_q8k *a =
                     panel->x + 2 * p * panel->x_stride + b;
@@ -182,6 +195,7 @@ static NEON_PANEL void panel_rows_neon(int type, const void *w,
                             fmaf(dm[k] * ox->d, (float)correction, oddm[k]);
                 }
         }
+        PANEL_UNROLL
         for (size_t p = 0; p < pairs; p++) {
             float a[4];
             vst1q_f32(a,
@@ -197,3 +211,43 @@ static NEON_PANEL void panel_rows_neon(int type, const void *w,
                     type == JANAS_Q4_K ? odd[k] - oddm[k] : odd[k];
     }
 }
+
+/* The scalar constants, rather than fields reloaded from panel, enter the
+   always-inline body. This lets O2 scalar-replace pair arrays and remove
+   all inactive format, prefix and odd-token branches. */
+static NEON_PANEL void panel_rows_neon(int type, const void *w,
+                                       size_t row_bytes, const uint8_t *p1,
+                                       const uint8_t *p0, size_t pb,
+                                       const struct janas_q8k_panel *panel,
+                                       size_t rows, float *y, size_t ys)
+{
+#define FIXED(N, T, L) panel_rows_neon_k(T, N, L, w, row_bytes, p1, p0, pb, panel, rows, y, ys)
+#define PANEL_NV(T, L) do { \
+    switch (panel->nv) { \
+    case 1: FIXED(1, T, L); break; \
+    case 2: FIXED(2, T, L); break; \
+    case 3: FIXED(3, T, L); break; \
+    case 4: FIXED(4, T, L); break; \
+    case 5: FIXED(5, T, L); break; \
+    case 6: FIXED(6, T, L); break; \
+    case 7: FIXED(7, T, L); break; \
+    case 8: FIXED(8, T, L); break; \
+    case 9: FIXED(9, T, L); break; \
+    default: break; \
+    } \
+} while (0)
+    if (type == JANAS_Q4_K)
+        PANEL_NV(JANAS_Q4_K, 0);
+    else if (type == JANAS_Q6_K)
+        PANEL_NV(JANAS_Q6_K, 0);
+    else if (p0)
+        PANEL_NV(JANAS_Q6_K_P, 3);
+    else if (p1)
+        PANEL_NV(JANAS_Q6_K_P, 2);
+    else
+        PANEL_NV(JANAS_Q6_K_P, 1);
+#undef PANEL_NV
+#undef FIXED
+}
+#undef PANEL_UNROLL
+#undef NEON_PANEL_K

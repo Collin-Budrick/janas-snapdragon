@@ -222,6 +222,7 @@ static int measure_chat(janas_llm *llm, uint32_t n_gen, int sampled,
    speedup comparison (its raw continuation and chat workloads differ). */
 struct fair_options {
     int enabled, json, speculation, drafts, threads, warmups, profile_phases;
+    int retain_controller;
     uint64_t seed;
     const char *prompt_file;
 };
@@ -621,6 +622,7 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
     p->expert_bits = 6;
     p->head_bits = 0;
     janas_llm *llm = NULL;
+    janas_llm_chat *c = NULL;
     double t0 = now();
     int32_t rc = janas_llm_open(path, p, &llm);
     double load_seconds = now() - t0;
@@ -648,6 +650,12 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
         json_text(&b, "model", path);
         json_text(&b, "speculation", spec_name(f->speculation));
         json_text(&b, "speculation_resolved", spec_name(resolved));
+        json_text(&b, "fair_controller_protocol", f->retain_controller
+                  ? "retained_across_fresh_conversations" : "fresh_chat_per_sample");
+        janas_buf_printf(&b, "\"fair_retain_controller\":%s,\"conversation_cache_reuse\":false,",
+                         f->retain_controller ? "true" : "false");
+        json_text(&b, "history_index_scope", "canonical_tokens_of_current_sample");
+        json_text(&b, "target_sampler_seed_scope", "reset_each_sample");
         struct janas_llm_speculation_config sc;
         janas_llm_speculation_config_default(&sc);
         char config_error[160];
@@ -697,6 +705,8 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
         printf(
             "load %.3f s; quality high; fresh process does not imply cold OS/SSD cache\n",
             load_seconds);
+        printf("controller protocol: %s; fresh conversation and sampler seed each sample\n",
+               f->retain_controller ? "retained measurements" : "fresh chat per sample");
         printf("expert cache allocation: main %s requested %llu -> %llu bytes; "
                "MTP %s -> %llu separate bytes; total %llu bytes%s\n",
                p->cache_bytes ? "explicit" : "auto",
@@ -728,15 +738,23 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
         cp.thinking = 0;
         cp.recap = 0;
         cp.max_reply = (int32_t)n_gen;
-        janas_llm_chat *c = NULL;
-        rc = janas_llm_chat_create(llm, &cp, &c);
+        if (c) {
+            /* Reset tokens and computed context, retaining only session-local
+               cost estimates. The index resynchronizes against this sample's
+               canonical history before its next query. Reapply params so the
+               target sampler starts from the same seed as a fresh chat. */
+            rc = janas_llm_chat_reset(c);
+            if (rc == JANAS_LLM_OK)
+                rc = janas_llm_chat_set_params(c, &cp);
+        } else {
+            rc = janas_llm_chat_create(llm, &cp, &c);
+        }
         if (rc != JANAS_LLM_OK)
             goto failed;
         if (janas_llm_chat_speculation(c, f->speculation, f->drafts) !=
                 JANAS_LLM_OK ||
             janas_llm_chat_system(c, "You are a helpful assistant.", -1) !=
                 JANAS_LLM_OK) {
-            janas_llm_chat_destroy(c);
             goto failed;
         }
         double compile0 = janas_llm_model_npu_compile_seconds(m);
@@ -770,7 +788,11 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
         struct janas_llm_chat_stats st = {.size = sizeof st};
         if (rc != JANAS_LLM_DONE ||
             janas_llm_chat_stats(c, &st) != JANAS_LLM_OK) {
-            janas_llm_chat_destroy(c);
+            goto failed;
+        }
+        if (st.cached_tokens != 0) {
+            fprintf(stderr, "janas-bench: fresh-conversation sample reused %u prompt tokens\n",
+                    st.cached_tokens);
             goto failed;
         }
         if (f->profile_phases)
@@ -790,6 +812,8 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
             json_text(&b, "phase", phase);
             json_text(&b, "speculation", spec_name(f->speculation));
             json_text(&b, "speculation_resolved", spec_name(resolved));
+            json_text(&b, "fair_controller_protocol", f->retain_controller
+                      ? "retained_across_fresh_conversations" : "fresh_chat_per_sample");
             janas_buf_printf(
                 &b,
                 "\"index\":%d,\"output_tokens\":%u,\"output_bytes\":%llu,"
@@ -873,8 +897,13 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
             if (f->profile_phases)
                 fair_profile_print(&profile, phase, i);
         }
-        janas_llm_chat_destroy(c); /* history is never reused by lookup */
+        if (!f->retain_controller) {
+            janas_llm_chat_destroy(c); /* history is never reused by lookup */
+            c = NULL;
+        }
     }
+    janas_llm_chat_destroy(c);
+    c = NULL;
     janas_llm_close(llm);
     free(owned);
     return 0;
@@ -882,6 +911,7 @@ failed:
     fprintf(stderr, "janas-bench: fair benchmark failed: %s\n",
             janas_llm_last_error());
     janas_buf_free(&b);
+    janas_llm_chat_destroy(c);
     janas_llm_close(llm);
     free(owned);
     return 1;
@@ -902,12 +932,14 @@ int main(int argc, char **argv)
                 "fair chat mode: --speculation none|lookup|mtp|hybrid|auto "
                 "[--draft-tokens <1..16>] [--prompt-file <utf8>] "
                 "[--seed <n>] [--threads <n>] [--warmups <n>] [--json] "
-                "[--profile-phases]\n"
+                "[--profile-phases] [--fair-retain-controller]\n"
                 JANAS_SPEC_RUNTIME_HELP
                 "--profile-phases: diagnostic phase wall times per chat and "
                 "reply tail (first output call excluded); JANAS_POOLTRACE=1 "
                 "and JANAS_EXPTRACE=1 add nested detail on stderr. "
                 "Repeat without profiling for throughput.\n"
+                "--fair-retain-controller: retain planner measurements across "
+                "fresh conversations; off by default.\n"
                 "<model>: a .jns file, or a name of the models Janas knows "
                 "(downloaded if it is not there yet); none: the list\n"
                 "<devices>: auto (default), cpu, gpu, npu, npu+gpu (both in "
@@ -931,7 +963,7 @@ int main(int argc, char **argv)
         "--reserve",   "--settle",   "--no-npu",   "--prompt-on",
         "--drafts-on", "--reply-on", "--npu-int8", "--gpu-profile",
         "--speculation", "--draft-tokens", "--prompt-file", "--seed",
-        "--threads", "--warmups", "--json", "--profile-phases",
+        "--threads", "--warmups", "--json", "--profile-phases", "--fair-retain-controller",
         "--spec-planner", "--spec-explore", "--draft-vocab", "--draft-vocab-rows"};
     for (int i = 1; i < argc; i += 2) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
@@ -977,6 +1009,11 @@ int main(int argc, char **argv)
         }
         if (strcmp(a, "--profile-phases") == 0) {
             fair.enabled = fair.profile_phases = 1;
+            i--;
+            continue;
+        }
+        if (strcmp(a, "--fair-retain-controller") == 0) {
+            fair.enabled = fair.retain_controller = 1;
             i--;
             continue;
         }

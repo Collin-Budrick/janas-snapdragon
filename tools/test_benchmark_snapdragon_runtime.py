@@ -63,6 +63,11 @@ class RuntimeProtocolTests(unittest.TestCase):
                  "cache_bytes_requested": 32 << 30, "reserve_bytes": 12 << 30, "gpu": "", "npu": ""}
         if run["binary"] == "B":
             setup.update({k: c[k] for k in ("spec_planner", "spec_explore", "draft_vocab", "draft_vocab_rows")})
+            setup.update({"fair_retain_controller": run["controller_protocol"] == "retained_across_fresh_conversations",
+                          "fair_controller_protocol": run["controller_protocol"],
+                          "conversation_cache_reuse": False,
+                          "history_index_scope": "canonical_tokens_of_current_sample",
+                          "target_sampler_seed_scope": "reset_each_sample"})
         samples = []
         for index in range(1 + run["warm_rounds"]):
             samples.append({"schema": 1, "kind": "sample", "index": index,
@@ -75,6 +80,8 @@ class RuntimeProtocolTests(unittest.TestCase):
                             "total_seconds": 11.0, "first_token_seconds": 1.2,
                             "input_seconds": 1.0, "accelerator_counters": {},
                             "speculation_metrics": {"cycles": 8}})
+            if run["binary"] == "B":
+                samples[-1]["fair_controller_protocol"] = run["controller_protocol"]
         return [setup, *samples]
 
     def test_public_paths_and_frozen_prompt_hashes(self):
@@ -119,6 +126,25 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertEqual((manifest["planned_processes"], manifest["planned_samples"]), (6, 18))
         self.assertEqual([r["case"] for r in runs[:3]], ["baseline", "hybrid4", "legacy"])
         self.assertTrue(all(r["warm_rounds"] == 2 for r in runs))
+
+    def test_controller_retention_condition_matrix_is_candidate_only(self):
+        inputs = self.inputs()
+        controls = [({}, False), ({"gdn_chain": 1, "gdn_journal": 1}, False),
+                    ({"spec_planner": "fixed"}, False),
+                    ({"spec_planner": "cycle"}, True),
+                    ({"speculation": "hybrid"}, True),
+                    ({"draft_vocab": "adaptive"}, True)]
+        for overrides, candidate_retain in controls:
+            control = tool.valid_control(overrides)
+            for binary in ("A", "B"):
+                with self.subTest(overrides=overrides, binary=binary):
+                    run = tool.run_spec(inputs, "code", "fixture", control, binary, 2, 0)
+                    wanted = binary == "B" and candidate_retain
+                    self.assertEqual(run["command"].count("--fair-retain-controller"), int(wanted))
+                    self.assertEqual(run["controller_protocol"],
+                                     "retained_across_fresh_conversations" if wanted else "fresh_chat_per_sample")
+                    value = {k: v for k, v in run.items() if k != "run_sha256"}
+                    self.assertEqual(run["run_sha256"], tool.digest(value))
 
     def test_control_validation_rejects_invalid_shapes_and_values(self):
         for value in ([], {"unknown": 1}, {"draft_tokens": True}, {"draft_tokens": 17},
@@ -280,6 +306,45 @@ class RuntimeProtocolTests(unittest.TestCase):
         bad = tool.summary(manifest, records)
         self.assertFalse(bad["comparisons"][0]["complete_and_output_verified"])
         self.assertIsNone(bad["comparisons"][0]["candidate_to_baseline_median_rate_ratio"])
+
+    def test_controller_setup_and_sample_metadata_must_match_actual_protocol(self):
+        manifest = tool.build_plan(self.args(extra=["--candidate-case", "cycle-mtp4"]), self.inputs())
+        run = manifest["contract"]["plan"][1]
+        records = self.records(run)
+        self.assertEqual(tool.validate_records(records, run), [])
+        for field, value in (("fair_retain_controller", False),
+                             ("fair_controller_protocol", "fresh_chat_per_sample"),
+                             ("conversation_cache_reuse", True),
+                             ("history_index_scope", "previous_conversation"),
+                             ("target_sampler_seed_scope", "continued")):
+            bad = copy.deepcopy(records)
+            bad[0][field] = value
+            with self.subTest(field=field):
+                self.assertTrue(tool.validate_records(bad, run))
+            del bad[0][field]
+            self.assertTrue(tool.validate_records(bad, run))
+        bad = copy.deepcopy(records)
+        bad[1]["fair_controller_protocol"] = "fresh_chat_per_sample"
+        self.assertTrue(tool.validate_records(bad, run))
+        del bad[1]["fair_controller_protocol"]
+        self.assertTrue(tool.validate_records(bad, run))
+
+    def test_frozen_baseline_allows_absent_controller_fields_but_not_false_claims(self):
+        run = tool.build_plan(self.args(), self.inputs())["contract"]["plan"][0]
+        records = self.records(run)
+        self.assertEqual(tool.validate_records(records, run), [])
+        for field, value in (("fair_retain_controller", True),
+                             ("fair_controller_protocol", "retained_across_fresh_conversations"),
+                             ("conversation_cache_reuse", True),
+                             ("history_index_scope", "previous_conversation"),
+                             ("target_sampler_seed_scope", "continued")):
+            bad = copy.deepcopy(records)
+            bad[0][field] = value
+            with self.subTest(field=field):
+                self.assertTrue(tool.validate_records(bad, run))
+        bad = copy.deepcopy(records)
+        bad[1]["fair_controller_protocol"] = "retained_across_fresh_conversations"
+        self.assertTrue(tool.validate_records(bad, run))
 
 
 if __name__ == "__main__":

@@ -311,6 +311,11 @@ def prepare_inputs(args):
 
 def run_spec(inputs, workload, case, control, label, rounds, sequence):
     control = valid_control(control)
+    retain_controller = label == "B" and (
+        control["spec_planner"] == "cycle" or control["speculation"] == "hybrid" or
+        control["draft_vocab"] == "adaptive")
+    controller_protocol = ("retained_across_fresh_conversations" if retain_controller
+                           else "fresh_chat_per_sample")
     binary = inputs["baseline" if label == "A" else "candidate"]
     model, mtp = (m["path"] for m in inputs["models"])
     command = [binary["path"], model, "--speculation", control["speculation"],
@@ -322,8 +327,11 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
     if label == "B":
         command += ["--spec-planner", control["spec_planner"], "--spec-explore", str(control["spec_explore"]),
                     "--draft-vocab", control["draft_vocab"], "--draft-vocab-rows", str(control["draft_vocab_rows"])]
+        if retain_controller:
+            command += ["--fair-retain-controller"]
     value = {"id": f"{sequence:02d}-{workload}-{label}-{case}", "workload": workload, "case": case,
              "binary": label, "binary_sha256": binary["sha256"], "warm_rounds": rounds,
+              "controller_protocol": controller_protocol,
              "control": control, "performance_controls": performance_controls(control), "command": command,
              "expected": inputs["prompts"][workload]}
     return dict(value, run_sha256=digest(value))
@@ -337,6 +345,7 @@ def make_manifest(args, protocol, runs, inputs):
                     "prefetch": "off", "gpu": False, "npu": False,
                     "kv_and_attention": "architecture defaults; inherited overrides cleared"},
                 "sampling": {"new_chat_each_sample": True, "prompt_kv_reuse": False,
+                    "controller_state": "per-run controller_protocol; retained handles still begin fresh conversations",
                     "same_process_private_cache_reuse": "warm rounds only; fresh cache directory per process",
                     "os_file_cache": "uncontrolled across sequential processes; fresh does not mean cold SSD",
                     "phase_profiling": False, "physical_ssd_bandwidth_measured": False},
@@ -370,8 +379,23 @@ def validate_records(records, run):
             "context_tokens": 2048, "generation_limit": 128, "draft_tokens_cap": c["draft_tokens"],
             "speculation": c["speculation"], "speculation_resolved": "mtp" if c["speculation"] == "auto" else c["speculation"],
             "cache_bytes_requested": 32 << 30, "reserve_bytes": 12 << 30, "gpu": "", "npu": ""}
+        protocol = run["controller_protocol"]
+        controller_fields = {
+            "fair_retain_controller": protocol == "retained_across_fresh_conversations",
+            "fair_controller_protocol": protocol,
+            "conversation_cache_reuse": False,
+            "history_index_scope": "canonical_tokens_of_current_sample",
+            "target_sampler_seed_scope": "reset_each_sample"}
         if run["binary"] == "B":
             expected.update({k: c[k] for k in ("spec_planner", "spec_explore", "draft_vocab", "draft_vocab_rows")})
+            expected.update(controller_fields)
+        else:
+            # Frozen baselines predate these fields. If a newer explicit
+            # baseline reports them, it must still use the fresh protocol.
+            expected.update({k: v for k, v in controller_fields.items() if k in setup[0]})
+        for key in ("fair_retain_controller", "conversation_cache_reuse"):
+            if key in expected and type(setup[0].get(key)) is not bool:
+                errors.append("setup " + key + " must be a boolean")
         for key, value in expected.items():
             if setup[0].get(key) != value:
                 errors.append(f"setup {key} differs from protocol")
@@ -387,6 +411,9 @@ def validate_records(records, run):
                 errors.append("sample " + key + " mismatch")
         if s.get("index") != index or s.get("cached_tokens") != 0 or s.get("prompt_tokens") != expected["input_tokens"]:
             errors.append("sample index/prompt length/KV reuse mismatch")
+        if run["binary"] == "B" or "fair_controller_protocol" in s:
+            if s.get("fair_controller_protocol") != run["controller_protocol"]:
+                errors.append("sample controller protocol mismatch")
         if s.get("input_threads") != 8 or s.get("output_threads") != 8:
             errors.append("sample compute thread count mismatch")
         resolved = "mtp" if c["speculation"] == "auto" else c["speculation"]

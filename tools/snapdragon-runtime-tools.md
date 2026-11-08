@@ -82,6 +82,19 @@ binary receives five warm samples per workload, split
 3+2 across its two processes. A fresh process does not establish a cold SSD
 or Windows file cache.
 
+The native benchmark defaults to a fresh chat and controller for every
+sample. Its opt-in `--fair-retain-controller` keeps planner measurements
+across samples while resetting the conversation and target sampler seed.
+The public driver requests this flag for candidate cycle, hybrid and adaptive
+head cases. Baseline, legacy and DeltaNet-only commands keep the established
+fresh-controller protocol. Setup and sample records identify the protocol;
+every sample must still report zero cached prompt tokens. Lookup uses only
+the current sample's canonical history.
+
+Earlier screen captures made before this flag measured cold controllers,
+including their samples labelled warm for expert-cache residency. Preserve
+those captures as the original protocol rather than relabelling them.
+
 `--cases` selects screen cases; `--workloads` selects an ordered subset of
 `code,prose,long`. Paired runs accept `--candidate-case` or a validated JSON
 object through `--candidate-controls`. `--bench-exe`, `--model`, `--mtp` and
