@@ -254,6 +254,117 @@ static void test_q6k_planes(void)
     free(pf);
 }
 
+/* Plane kernels must keep the scalar block FMA order at short/long widths,
+   across the eight-vector dispatch boundary and through matvec's row path.
+   Padded activation/output strides also exercise nonpacked row bindings. */
+static void test_q6k_planes_strided(void)
+{
+    enum { NB = 9, NV = 17, ROWS = 3, XS = NB + 2, YS = ROWS + 2 };
+    static const int blocks[] = {1, 2, 8, 9};
+    static const int vectors[] = {1, 2, 4, 8, 16, 17};
+    static const uint16_t scales[] = {0x0000, 0x8000, 0x0001, 0x03ff,
+                                      0x0400, 0x3c00, 0xbc00, 0x7bff};
+    struct janas_block_q6k *w = malloc(ROWS * NB * sizeof(*w));
+    struct janas_block_q6kp *base = malloc(ROWS * NB * sizeof(*base));
+    uint8_t *p1 = malloc(ROWS * NB * JANAS_Q6KP_PLANE);
+    uint8_t *p0 = malloc(ROWS * NB * JANAS_Q6KP_PLANE);
+    struct janas_block_q8k *x = calloc(NV * XS, sizeof(*x));
+    float *xf = malloc(NB * JANAS_QK * sizeof(*xf));
+    float out[NV * YS], ref[NV][ROWS];
+    struct janas_pool *pool = janas_pool_create(2, NULL);
+    CHECK(w && base && p1 && p0 && x && xf && pool,
+          "planes strided: allocation");
+    if (!w || !base || !p1 || !p0 || !x || !xf || !pool)
+        goto done;
+    for (int trial = 0; trial < 8; trial++) {
+        unsigned char *raw = (unsigned char *)w;
+        for (size_t i = 0; i < ROWS * NB * sizeof(*w); i++)
+            raw[i] = (unsigned char)rnd();
+        for (int b = 0; b < ROWS * NB; b++) {
+            w[b].d = scales[(b + trial) % 8];
+            for (int g = 0; g < 16; g++)
+                if ((g + trial) % 3 != 0)
+                    w[b].scales[g] = (g & 1) ? 127 : -128;
+        }
+        janas_q6k_to_planes(w, ROWS * NB, base, p1, p0);
+        for (int v = 0; v < NV; v++) {
+            for (int i = 0; i < NB * JANAS_QK; i++)
+                xf[i] = rndf(-1.0f, 1.0f);
+            janas_q8k_quantize(xf, x + v * XS, NB * JANAS_QK);
+        }
+        for (size_t bi = 0; bi < sizeof blocks / sizeof *blocks; bi++) {
+            int nb = blocks[bi];
+            for (int level = 1; level <= 3; level++) {
+                const uint8_t *a1 = level >= 2 ? p1 : NULL;
+                const uint8_t *a0 = level >= 3 ? p0 : NULL;
+                for (int v = 0; v < NV; v++)
+                    for (int r = 0; r < ROWS; r++) {
+                        ref[v][r] = janas_q6kp_dot_ref(
+                            base + r * nb,
+                            a1 ? a1 + r * nb * JANAS_Q6KP_PLANE : NULL,
+                            a0 ? a0 + r * nb * JANAS_Q6KP_PLANE : NULL,
+                            x + v * XS, (size_t)nb);
+                        float one = janas_q6kp_dot(
+                            base + r * nb,
+                            a1 ? a1 + r * nb * JANAS_Q6KP_PLANE : NULL,
+                            a0 ? a0 + r * nb * JANAS_Q6KP_PLANE : NULL,
+                            x + v * XS, (size_t)nb);
+                        CHECK(!memcmp(&one, &ref[v][r], sizeof one),
+                              "planes scalar bits: nb %d level %d v %d row %d",
+                              nb, level, v, r);
+                    }
+                for (size_t vi = 0; vi < sizeof vectors / sizeof *vectors;
+                     vi++) {
+                    int nv = vectors[vi];
+                    for (int route = 0; route < 2; route++) {
+                        for (int i = 0; i < NV * YS; i++)
+                            out[i] = -12345.0f;
+                        if (route == 0) {
+                            for (int r = 0; r < ROWS; r++)
+                                janas_q6kp_dot_multi(
+                                    base + r * nb,
+                                    a1 ? a1 + r * nb * JANAS_Q6KP_PLANE : NULL,
+                                    a0 ? a0 + r * nb * JANAS_Q6KP_PLANE : NULL,
+                                    x, XS, (size_t)nv, (size_t)nb, out + r, YS);
+                        } else {
+                            struct janas_matvec_task t = {.type = JANAS_Q6_K_P,
+                                                          .w = base,
+                                                          .plane = {a1, a0},
+                                                          .x = x,
+                                                          .y = out,
+                                                          .rows = ROWS,
+                                                          .cols = (size_t)nb *
+                                                                  JANAS_QK,
+                                                          .n_vec = (size_t)nv,
+                                                          .x_stride = XS,
+                                                          .y_stride = YS};
+                            janas_matvec_q4k_group(pool, &t, 1);
+                        }
+                        for (int v = 0; v < NV; v++)
+                            for (int r = 0; r < YS; r++) {
+                                float want =
+                                    v < nv && r < ROWS ? ref[v][r] : -12345.0f;
+                                CHECK(
+                                    !memcmp(&out[v * YS + r], &want,
+                                            sizeof want),
+                                    "planes strided: route %d nb %d level %d nv %d v %d row %d",
+                                    route, nb, level, nv, v, r);
+                            }
+                    }
+                }
+            }
+        }
+    }
+done:
+    janas_pool_destroy(pool);
+    free(w);
+    free(base);
+    free(p1);
+    free(p0);
+    free(x);
+    free(xf);
+}
+
 /*
  * Q6_K and Q6_K_P as tiles of eight rows (janas_q6k_tile_rows), and of
  * sixteen on 512 bits where AVX-512 VNNI is: 27 rows, 9 blocks (past the eight
@@ -2339,6 +2450,7 @@ int main(void)
     test_dot();
     test_dot_q6k();
     test_q6k_planes();
+    test_q6k_planes_strided();
     test_q6kpn_axpy();
     test_q6kpn_chunk();
     test_matvec();

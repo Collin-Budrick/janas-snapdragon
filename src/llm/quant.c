@@ -1910,6 +1910,7 @@ __attribute__((constructor)) static void dot_kernels_init(void)
     kernels_ref = k && !strcmp(k, "ref");
     if (janas_cpu_arm_dotprod() && !kernels_ref) {
         dot6_impl = q6k_dot_neon;
+        dot6p_impl = q6kp_dotn_neon;
         dot80_impl = q8_0_dot_neon;
         dotnl_impl = iq4nl_dot_neon;
         dot40_impl = q4_0_dot_neon;
