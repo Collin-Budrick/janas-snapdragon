@@ -537,6 +537,8 @@ void janas_m_gtok_host(struct janas_llm_model *m, int write)
     if (!m->gtok_dev)
         return;
     if (m->gtok_where == JANAS_GT_DEV) {
+        /* Device-produced recurrent state has no matching CPU delta log. */
+        janas_m_gdn_invalidate(m);
         m->gtok_pull++;
         if (sync_state(m, 0) != 0) {
             /* the GPU's copy cannot come back: the CPU's state is not

@@ -69,6 +69,57 @@ struct janas_llm_options {
 
 struct janas_llm_model;
 
+/* Cumulative drafting costs, independent of target forward timings. */
+struct janas_mtp_costs {
+    double maintenance_seconds, head_seconds, repack_seconds;
+    uint64_t head_calls, repacks, vocab_fallbacks;
+    uint32_t vocab_rows, vocab_policy;
+    uint64_t vocab_epoch;
+};
+void janas_llm_mtp_costs(const struct janas_llm_model *m,
+                        struct janas_mtp_costs *out);
+/* Draft-only row selection. Never restricts the target vocabulary. A valid
+   target logit row must precede the next proposal, not follow a rejection. */
+int janas_llm_mtp_vocab_prepare(struct janas_llm_model *m, int policy,
+                               uint32_t rows, const float *valid_logits,
+                               const int32_t *history, uint32_t n_history,
+                               const int32_t *special, uint32_t n_special);
+void janas_llm_mtp_vocab_feedback(struct janas_llm_model *m, uint32_t policy,
+                                 uint32_t rows, uint32_t drafted,
+                                 uint32_t accepted, double cycle_seconds);
+void janas_llm_mtp_vocab_feedback_epoch(struct janas_llm_model *m, uint64_t epoch,
+                                       uint32_t policy, uint32_t rows,
+                                       uint32_t drafted, uint32_t accepted,
+                                       double cycle_seconds);
+void janas_llm_mtp_vocab_legacy(struct janas_llm_model *m);
+void janas_llm_mtp_vocab_new_reply(struct janas_llm_model *m);
+uint32_t janas_llm_mtp_vocab_rows(const struct janas_llm_model *m);
+int janas_llm_mtp_vocab_policy(const struct janas_llm_model *m);
+int32_t janas_llm_mtp_vocab_token(const struct janas_llm_model *m, uint32_t row);
+int janas_llm_mtp_vocab_cpu_only(const struct janas_llm_model *m);
+void janas_llm_mtp_vocab_free(struct janas_llm_model *m);
+
+struct janas_llm_runtime_stats {
+    uint64_t expert_assignments, expert_groups, expert_group_widths[18];
+    uint64_t gdn_chain_tokens, gdn_journal_replay_tokens;
+    uint64_t gdn_scalar_replay_tokens, gdn_konly_replay_tokens;
+    double gdn_core_seconds, gdn_conv_seconds;
+    uint64_t gdn_delta_bytes;
+    uint64_t cpu_groups, cpu_tasks;
+    uint64_t cpu_prepared_rows, cpu_prepared_row_vectors;
+    uint64_t cpu_established_rows, cpu_established_row_vectors;
+    uint64_t cpu_panel_views, cpu_panel_unique, cpu_panel_dedup_hits;
+    uint64_t cpu_panel_bytes, cpu_panel_peak_bytes;
+    double cpu_panel_prepare_seconds;
+};
+void janas_llm_model_runtime_stats(const struct janas_llm_model *m,
+                                  struct janas_llm_runtime_stats *out);
+struct janas_matvec_task;
+/* CPU-only dispatches, including main/MTP heads. GPU-managed CPU fallback
+   remains outside these counters until that backend provides a callback. */
+void janas_m_products_cpu(struct janas_llm_model *m,
+                           const struct janas_matvec_task *tasks, size_t n);
+
 struct janas_llm_model *janas_llm_model_load(const char *path,
                                              const struct janas_llm_options *o,
                                              char *err, size_t err_len);

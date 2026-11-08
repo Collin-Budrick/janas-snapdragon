@@ -26,6 +26,109 @@ def row(case, rate=10, signature=None, prompts=None):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_new_controls_are_explicit_recorded_and_do_not_mutate_parent(self):
+        args = argparse.Namespace(bench=Path("bench.exe"), model=Path("model.jns"),
+            mtp=Path("mtp.jns"), seed=1, gen=64, ctx=2048, rounds=1,
+            warmups=0, reserve_gib=12, timeout=30, n_prompts=1)
+        response = subprocess.CompletedProcess([], 1, "", "model-free fixture")
+        hostile = {name: "inherited-hostile" for name in bench.EXPERIMENT_ENV}
+        hostile["JANAS_CPU_TILES"] = "1"
+        base = bench.Case("cpu", "none", 8, 32, 4)
+        selected = dataclasses.replace(base, speculation="hybrid", spec_planner="cycle",
+            spec_explore=0, draft_vocab="adaptive", draft_vocab_rows=16384,
+            gdn_chain=1, gdn_journal=1, gdn_k_only=1)
+        for case in (base, selected):
+            for panels, tile_value in (("auto", None), ("off", "0"), ("experimental", "1")):
+                with self.subTest(case=case, panels=panels), tempfile.TemporaryDirectory() as tmp, \
+                     patch.dict(os.environ, hostile), \
+                     patch.object(bench.subprocess, "run", return_value=response) as run:
+                    case = dataclasses.replace(case, panels=panels)
+                    result = bench.run_case(args, case, Path("prompt.txt"), Path(tmp), "screen")
+                    env = run.call_args.kwargs["env"]
+                    expected = dict(zip(bench.EXPERIMENT_ENV, (
+                        case.spec_planner, str(case.spec_explore), case.draft_vocab,
+                        str(case.draft_vocab_rows), str(case.gdn_chain),
+                        str(case.gdn_journal), str(case.gdn_k_only))))
+                    expected["JANAS_CPU_TILES"] = tile_value
+                    for name, value in expected.items():
+                        self.assertEqual(env.get(name), value)
+                        self.assertEqual(result["performance_environment"][name], value)
+                        self.assertEqual(os.environ[name], hostile[name])
+                    command = result["command"]
+                    for name, value in (("--spec-planner", case.spec_planner),
+                                        ("--spec-explore", str(case.spec_explore)),
+                                        ("--draft-vocab", case.draft_vocab),
+                                        ("--draft-vocab-rows", str(case.draft_vocab_rows))):
+                        self.assertEqual(command[command.index(name) + 1], value)
+                    self.assertEqual("--mtp" in command, case.speculation == "hybrid")
+                    self.assertEqual("--no-mtp" in command, case.speculation == "none")
+                    self.assertEqual((env["JANAS_EXPERT_BITS"], env["JANAS_HEAD_BITS"],
+                                      env["JANAS_MISS_SKIP"]), ("6", "0", "0"))
+
+    def test_controls_preserve_refinement_but_never_change_cpu_reference(self):
+        args = argparse.Namespace(profiles=["cpu"], speculations=["hybrid"],
+            threads=[8, 12], cache_gib=[24, 32], draft_tokens=[4, 8],
+            spec_planner="fixed", spec_explore=100, draft_vocab="adaptive",
+            draft_vocab_rows=8192, gdn_chain=1, gdn_journal=1, gdn_k_only=1,
+            panels="experimental")
+        cases = bench.screen_cases(args)
+        self.assertEqual(len(cases), 2)
+        ref, candidate = cases
+        self.assertEqual((ref.speculation, ref.spec_planner, ref.spec_explore,
+            ref.draft_vocab, ref.draft_vocab_rows, ref.gdn_chain, ref.gdn_journal,
+            ref.gdn_k_only, ref.panels),
+            ("none", "legacy", 20, "legacy", 0, 0, 0, 0, "auto"))
+        self.assertEqual(candidate.speculation, "hybrid")
+        names = ("spec_planner", "spec_explore", "draft_vocab", "draft_vocab_rows",
+                 "gdn_chain", "gdn_journal", "gdn_k_only", "panels")
+        refined = bench.refinement_cases(args, [candidate], 2)
+        for case in refined:
+            if case.speculation == "none":
+                self.assertEqual(case, case.cpu_reference())
+            else:
+                self.assertEqual(tuple(getattr(case, n) for n in names),
+                                 tuple(getattr(candidate, n) for n in names))
+        for name in names[:4] + ("panels",):
+            self.assertNotEqual(candidate.key(),
+                dataclasses.replace(candidate, **{name: getattr(ref, name)}).key())
+        self.assertNotEqual(ref.key(), dataclasses.replace(ref, gdn_chain=1).key())
+        self.assertNotEqual(candidate.key(), dataclasses.replace(candidate, gdn_k_only=0).key())
+        self.assertNotEqual(candidate.key(),
+            dataclasses.replace(candidate, gdn_journal=0, gdn_k_only=0).key())
+
+    def test_invalid_controls_and_gdn_dependencies_are_rejected(self):
+        base = bench.Case("cpu", "mtp", 8, 32, 4)
+        invalid = [{"spec_planner": "other"}, {"spec_explore": -1},
+            {"spec_explore": 101}, {"spec_explore": True}, {"spec_explore": 1.5},
+            {"draft_vocab": "other"}, {"draft_vocab_rows": 1},
+            {"draft_vocab_rows": False}, {"gdn_chain": True}, {"gdn_chain": 2},
+            {"gdn_journal": 1}, {"gdn_chain": 1, "gdn_k_only": 1},
+            {"panels": "on"}, {"speculation": "other"}]
+        for changes in invalid:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                dataclasses.replace(base, **changes)
+        for explore in (0, 100):
+            self.assertEqual(dataclasses.replace(base, spec_explore=explore).spec_explore, explore)
+        for rows in (0, 8192, 16384, 32768):
+            self.assertEqual(dataclasses.replace(base, draft_vocab_rows=rows).draft_vocab_rows, rows)
+
+    def test_cli_accepts_hybrid_controls_and_rejects_invalid_plan(self):
+        from contextlib import redirect_stdout
+        import io
+        options = ["bench", "--plan", "--profiles", "cpu", "--speculations", "hybrid",
+            "--spec-planner", "cycle", "--spec-explore", "0", "--draft-vocab", "adaptive",
+            "--draft-vocab-rows", "32768", "--gdn-chain", "1", "--gdn-journal", "1",
+            "--gdn-k-only", "1", "--panels", "experimental"]
+        output = io.StringIO()
+        with patch.object(sys, "argv", options), redirect_stdout(output):
+            self.assertEqual(bench.main(), 0)
+        plan = json.loads(output.getvalue())
+        self.assertEqual(plan["candidate_cases"], 2)
+        self.assertEqual(plan["cases"][1]["panels"], "experimental")
+        for extra in (["--spec-explore", "101"], ["--gdn-chain", "0"]):
+            with patch.object(sys, "argv", options + extra), self.assertRaises(ValueError):
+                bench.main()
+
     def test_hexagon_work_threshold_is_explicit_recorded_and_never_inherited(self):
         args = argparse.Namespace(bench=Path("bench.exe"), model=Path("model.jns"),
             mtp=Path("mtp.jns"), seed=1, gen=64, ctx=2048, rounds=1,
@@ -80,6 +183,9 @@ class BenchmarkTests(unittest.TestCase):
         legacy.pop("gpu_min_tokens")
         legacy.pop("npu_min_tokens")
         legacy.pop("npu_min_macs")
+        for name in ("spec_planner", "spec_explore", "draft_vocab", "draft_vocab_rows",
+                     "gdn_chain", "gdn_journal", "gdn_k_only", "panels"):
+            legacy.pop(name)
         self.assertEqual(bench.Case(**legacy), old)
         self.assertEqual(old.prefetch, "auto")
         self.assertEqual((old.gpu_min_tokens, old.npu_min_tokens), (0, 0))
@@ -244,6 +350,13 @@ class BenchmarkTests(unittest.TestCase):
         with patch.object(bench.subprocess, "run", return_value=response):
             with self.assertRaisesRegex(RuntimeError, "Rebuild"):
                 bench.validate_cli(Path("old.exe"))
+
+    def test_cli_flag_prefix_cannot_satisfy_new_control(self):
+        flags = bench.REQUIRED_FLAGS - {"--draft-vocab"}
+        response = subprocess.CompletedProcess([], 0, " ".join(sorted(flags)), "")
+        with patch.object(bench.subprocess, "run", return_value=response):
+            with self.assertRaisesRegex(RuntimeError, r"missing: --draft-vocab$"):
+                bench.validate_cli(Path("partial.exe"))
 
     def test_cpu_fallback_is_not_reported_as_gpu(self):
         case = bench.Case("cpu+gpu", "none", 12, 0, 4,

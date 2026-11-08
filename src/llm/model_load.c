@@ -1684,6 +1684,8 @@ void janas_llm_model_free(struct janas_llm_model *m)
     free(m->mtp_hid);
     free(m->cat);
     free(m->catq);
+    janas_m_gdn_free(m);
+    janas_llm_mtp_vocab_free(m);
     free(m->dh_w);
     free(m->dh_in);
     free(m->dh_ids);

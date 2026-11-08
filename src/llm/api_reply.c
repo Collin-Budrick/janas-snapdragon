@@ -347,6 +347,9 @@ int32_t janas_llm_chat_next(janas_llm_chat *c, char *buf, int32_t cap,
             t = c->forced[c->i_forced++]; /* in the session already */
             got = 1;
         } else {
+            uint32_t remaining = c->p.max_reply > 0
+                ? (uint32_t)c->p.max_reply - c->reply_tokens : UINT32_MAX;
+            janas_llm_session_reply_remaining(c->s, remaining);
             r = janas_llm_session_next(c->s, &t);
             got = r == 0;
         }

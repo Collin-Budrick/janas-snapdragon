@@ -54,4 +54,21 @@ struct janas_matvec_task {
 void janas_matvec_q4k_group(struct janas_pool *pool,
                             const struct janas_matvec_task *tasks, size_t n);
 
+/* Optional per-call CPU execution evidence. Rows count matrix output rows;
+   row_vectors count rows * n_vec. Established rows include existing SIMD
+   kernels, including the older Q6KP tiles. Panel views/unique/bytes describe
+   allocated preparation, not execution. bytes includes metadata, and
+   prepare_seconds covers allocation/dedup/packing, excluding pool work/free.
+   The output is reset each call. NULL skips clocks and worker accounting. */
+struct janas_matvec_stats {
+    uint64_t groups, tasks;
+    uint64_t prepared_rows, prepared_row_vectors;
+    uint64_t established_rows, established_row_vectors;
+    uint64_t panel_views, panel_unique, panel_dedup_hits, panel_bytes;
+    double panel_prepare_seconds;
+};
+void janas_matvec_q4k_group_stats(struct janas_pool *pool,
+                                  const struct janas_matvec_task *tasks,
+                                  size_t n, struct janas_matvec_stats *stats);
+
 #endif

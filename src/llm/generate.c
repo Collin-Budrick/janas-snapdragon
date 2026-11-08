@@ -5,6 +5,8 @@
  * generate.h).
  */
 #include "generate.h"
+#include "history_index.h"
+#include "spec_controller.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -210,23 +212,37 @@ static int plan_drafts(const struct planner *p, const float *survs, int avail)
  * block's own hidden state. MTP positions past the accepted ones are
  * overwritten by the next call, as in the main KV cache.
  */
+struct mtp_times { double maintenance, head, chain; };
 static int mtp_step(struct janas_llm_model *m, const int32_t *hist,
                     uint32_t pos, uint32_t acc, int k, int drafting,
                     float min_conf, struct planner *pl, float *hrow,
-                    int32_t *draft, float *survs, int *n_draft)
+                    int32_t *draft, float *survs, int *n_draft,
+                    struct mtp_times *times)
 {
+    struct janas_mtp_costs before, first, after;
+    janas_llm_mtp_costs(m, &before);
+    double first_start = now();
+    if (times) memset(times, 0, sizeof(*times));
     /* a row of hidden state: d_model, or qwen4exp's streams */
     uint32_t dm = janas_llm_model_hidden_width(m);
     *n_draft = 0;
     janas_llm_mtp_note_tokens(m, hist + pos + 1, acc + 1);
-    if (!drafting)
-        return janas_llm_mtp_forward(m, hist + pos + 1,
+    if (!drafting) {
+        int rc = janas_llm_mtp_forward(m, hist + pos + 1,
                                      janas_llm_model_hidden(m), acc + 1, pos,
                                      NULL, 0);
+        if (times) times->maintenance = now() - first_start;
+        return rc;
+    }
     float conf;
     if (janas_llm_mtp_draft(m, hist + pos + 1, janas_llm_model_hidden(m),
                             acc + 1, pos, &draft[0], &conf) != 0)
         return -1;
+    janas_llm_mtp_costs(m, &first);
+    if (times) {
+        times->head = first.head_seconds - before.head_seconds;
+        times->maintenance = fmax(0, now() - first_start - times->head);
+    }
     /* a chained draft counts only if every one before it is accepted too:
        the chain goes on while the product of the probabilities, the
        chance that the draft survives, stays above min_conf */
@@ -237,6 +253,7 @@ static int mtp_step(struct janas_llm_model *m, const int32_t *hist,
     memcpy(hrow, janas_llm_mtp_hidden(m) + (size_t)acc * dm,
            dm * sizeof(float));
     int got = 1;
+    double chain_start = now();
     for (; got < k; got++) {
         /* planning: chain on only while the last draft is worth verifying
            (the chances only fall along the chain) */
@@ -255,6 +272,12 @@ static int mtp_step(struct janas_llm_model *m, const int32_t *hist,
             double d = now() - tc;
             pl->chain = pl->chain > 0 ? 0.8 * pl->chain + 0.2 * d : d;
         }
+    }
+    janas_llm_mtp_costs(m, &after);
+    if (times) {
+        double heads = after.head_seconds - first.head_seconds;
+        times->head += heads;
+        times->chain = fmax(0, now() - chain_start - heads);
     }
     *n_draft = got;
     return 0;
@@ -296,15 +319,98 @@ struct janas_llm_session {
     float *dlogits;
     struct planner pl;
     struct janas_gen_stats st;
+    struct janas_history_index *index;
+    struct janas_cycle_controller cycle;
+    struct janas_gen_metrics metrics;
+    struct janas_gen_cycle pending;
+    uint64_t next_proposal_id;
+    uint64_t pending_vocab_epoch;
+    uint32_t reply_remaining;
+    int observation_pending, has_filter;
+    unsigned last_reuse, pending_reuse, observation_reuse;
 };
+
+static int cycle_mode(const struct janas_llm_session *s)
+{
+    return s->o.spec_planner != 0 || s->o.spec_mode == JANAS_SPEC_HYBRID ||
+           s->o.draft_vocab_policy != 0;
+}
+
+static void finish_cycle(struct janas_llm_session *s)
+{
+    if (!s->observation_pending) return;
+    const struct janas_gen_cycle *c = &s->metrics.last;
+    if (s->o.spec_planner == 1) {
+        janas_cycle_observe_reuse(&s->cycle, c->planner_source, c->warm,
+            janas_cycle_vocab_key(c->draft_vocab_policy, c->draft_vocab_rows),
+            c->requested_depth, c->total_seconds, c->delivered, s->observation_reuse);
+        /* Lookup depth zero means use the MTP fallback. Its real reward
+           and full cost must be observed even when MTP chose a nonzero
+           depth, including when the first lookup hit occurs late. */
+        if (s->o.spec_mode == JANAS_SPEC_HYBRID && c->lookup_suffix &&
+            c->planner_source == JANAS_GEN_SOURCE_MTP)
+            janas_cycle_observe_reuse(&s->cycle, JANAS_GEN_SOURCE_LOOKUP, c->warm, 0,
+                                 0, c->total_seconds, c->delivered, s->observation_reuse);
+    }
+    s->observation_pending = 0;
+}
+
+static void abandon_proposal(struct janas_llm_session *s)
+{
+    const struct janas_gen_cycle *p = &s->pending;
+    if (p->proposal_id && p->preparation_seconds > 0 && s->o.spec_planner == 1) {
+        /* This action already spent its preparation but never reached a
+           target pass. Price it once as zero useful output, independently
+           of the previous cycle's delivered-token observation. */
+        janas_cycle_observe_reuse(&s->cycle, p->planner_source, p->warm,
+            janas_cycle_vocab_key(p->draft_vocab_policy, p->draft_vocab_rows),
+            p->requested_depth, p->preparation_seconds, 0, s->pending_reuse);
+        if (s->o.spec_mode == JANAS_SPEC_HYBRID && p->lookup_suffix &&
+            p->planner_source == JANAS_GEN_SOURCE_MTP)
+            janas_cycle_observe_reuse(&s->cycle, JANAS_GEN_SOURCE_LOOKUP, p->warm, 0,
+                                      0, p->preparation_seconds, 0, s->pending_reuse);
+    }
+    s->metrics.abandoned_preparation_seconds += s->pending.preparation_seconds;
+    memset(&s->pending, 0, sizeof(s->pending));
+    s->n_mdraft = 0;
+}
+
+static void delivered(struct janas_llm_session *s)
+{
+    s->metrics.delivered_tokens++;
+    s->metrics.source_delivered[s->metrics.last.source]++;
+    s->metrics.last.delivered++;
+    s->metrics.last.buffered = s->n - s->ret;
+    if (s->reply_remaining != UINT32_MAX && s->reply_remaining)
+        s->reply_remaining--;
+    if (s->ret == s->n) finish_cycle(s);
+}
+
+static void discard_buffered(struct janas_llm_session *s)
+{
+    uint32_t n = s->n - s->ret;
+    s->metrics.discarded_tokens += n;
+    s->metrics.source_discarded[s->metrics.last.source] += n;
+    s->metrics.last.discarded += n;
+    s->metrics.last.buffered = 0;
+    finish_cycle(s);
+    abandon_proposal(s);
+}
 
 static int valid_options(const struct janas_llm_model *m,
                          const struct janas_gen_options *o)
 {
-    return o->spec_k >= 1 && o->spec_k <= MAX_SPEC_K && o->n_stop >= 0 &&
+    return o && o->spec_mode >= JANAS_SPEC_OFF && o->spec_mode <= JANAS_SPEC_HYBRID &&
+           o->spec_planner >= 0 && o->spec_planner <= 2 &&
+           o->spec_explore_percent >= 0 && o->spec_explore_percent <= 100 &&
+           o->draft_vocab_policy >= 0 && o->draft_vocab_policy <= 1 &&
+           (!o->draft_vocab_rows || o->draft_vocab_rows == 8192 ||
+            o->draft_vocab_rows == 16384 || o->draft_vocab_rows == 32768) &&
+           o->spec_k >= 1 && o->spec_k <= MAX_SPEC_K && o->n_stop >= 0 &&
            o->n_stop <= JANAS_GEN_MAX_STOP && o->temperature >= 0 &&
            o->top_k >= 0 && o->top_p >= 0 && o->min_p >= 0 &&
-           (o->spec_mode != JANAS_SPEC_MTP || janas_llm_model_has_mtp(m)) &&
+           ((o->spec_mode != JANAS_SPEC_MTP && o->spec_mode != JANAS_SPEC_HYBRID) ||
+            janas_llm_model_has_mtp(m)) &&
            (o->spec_mode != JANAS_SPEC_DRAFT ||
             (o->draft &&
              janas_llm_model_n_vocab(o->draft) == janas_llm_model_n_vocab(m)));
@@ -372,7 +478,7 @@ int janas_llm_session_slide(struct janas_llm_session *s, uint32_t keep,
     s->n_kv -= drop;
     s->ret = s->ret > keep + drop ? s->ret - drop : keep;
     s->call_start = s->n; /* positions moved: no rolling back across this */
-    s->n_mdraft = 0;      /* the drafts were for the old positions */
+    abandon_proposal(s); /* the drafts were for the old positions */
     return 0;
 }
 
@@ -403,8 +509,18 @@ int janas_llm_session_set_options(struct janas_llm_session *s,
 {
     if (!valid_options(s->m, o))
         return -1;
+    /* Unread tokens were drawn by the old sampler. Reconcile that suffix
+       before resetting the random sequence to the new seed. */
+    if (s->ret < s->n && janas_llm_session_append(s, NULL, 0) != 0)
+        return -1;
     int was_mtp = s->mtp;
+    abandon_proposal(s);
+    finish_cycle(s);
     s->o = *o;
+    if ((s->o.spec_mode == JANAS_SPEC_HYBRID || s->o.draft_vocab_policy) &&
+        !s->o.spec_planner)
+        s->o.spec_planner = 1;
+    if (!o->draft_vocab_policy) janas_llm_mtp_vocab_legacy(s->m);
     if (sampler_setup(s) != 0)
         return -1;
     /*
@@ -419,7 +535,7 @@ int janas_llm_session_set_options(struct janas_llm_session *s,
      * switch, 20.6 after, with no draft in between).
      */
     s->mtp = janas_llm_model_has_mtp(s->m) && (was_mtp || s->n_kv == 0);
-    if (!s->mtp || o->spec_mode != JANAS_SPEC_MTP)
+    if (!s->mtp || (o->spec_mode != JANAS_SPEC_MTP && o->spec_mode != JANAS_SPEC_HYBRID))
         s->n_mdraft = 0;
     else if (s->n_mdraft > o->spec_k)
         s->n_mdraft = o->spec_k;
@@ -456,11 +572,18 @@ janas_llm_session_create(struct janas_llm_model *m,
     }
     s->mtp = janas_llm_model_has_mtp(m);
     s->o = *o;
+    if ((s->o.spec_mode == JANAS_SPEC_HYBRID || s->o.draft_vocab_policy) &&
+        !s->o.spec_planner)
+        s->o.spec_planner = 1;
     if (sampler_setup(s) != 0) {
         janas_llm_session_destroy(s);
         return NULL;
     }
     s->retry = AUTO_RETRY_MIN;
+    s->reply_remaining = UINT32_MAX;
+    s->last_reuse = s->pending_reuse = s->observation_reuse = 2;
+    janas_cycle_init(&s->cycle, o->seed);
+    if (!o->draft_vocab_policy) janas_llm_mtp_vocab_legacy(m);
     planner_load(s);
     return s;
 }
@@ -472,6 +595,7 @@ void janas_llm_session_destroy(struct janas_llm_session *s)
     if (!s)
         return;
     planner_save(s);
+    janas_history_index_destroy(s->index);
     free(s->hist);
     free(s->logits);
     free(s->hrow);
@@ -482,11 +606,15 @@ void janas_llm_session_destroy(struct janas_llm_session *s)
 
 void janas_llm_session_reset(struct janas_llm_session *s)
 {
+    discard_buffered(s);
     janas_llm_model_media_drop(s->m, 0); /* the pictures go with it */
     s->dpos_set = 0;
     s->n = s->n_kv = s->ret = s->call_start = 0;
     s->n_mdraft = 0;
     s->mtp = janas_llm_model_has_mtp(s->m);
+    s->reply_remaining = UINT32_MAX;
+    s->last_reuse = 2;
+    janas_llm_mtp_vocab_new_reply(s->m);
     memset(s->lp_pos, 0, sizeof(s->lp_pos));
 }
 
@@ -536,12 +664,15 @@ int janas_llm_session_restore(struct janas_llm_session *s,
     if (!sv->st || sv->n > s->cap ||
         janas_llm_model_state_load(s->m, sv->st) != 0)
         return -1;
+    discard_buffered(s);
     memcpy(s->hist, sv->hist, sv->n * sizeof(int32_t));
     s->n = s->ret = sv->n;
     s->n_kv = s->call_start = sv->n_kv;
     s->n_mdraft = 0;
     memset(s->lp_pos, 0, sizeof(s->lp_pos));
     s->dpos_set = 0;
+    s->reply_remaining = UINT32_MAX;
+    janas_llm_mtp_vocab_new_reply(s->m);
     if (sv->dst && s->o.draft &&
         janas_llm_model_state_load(s->o.draft, sv->dst) == 0) {
         s->dpos = janas_llm_state_length(sv->dst) - 1;
@@ -654,6 +785,7 @@ int janas_llm_session_truncate(struct janas_llm_session *s, uint32_t n)
     uint32_t kv = n > 0 ? n - 1 : 0;
     if (kv < s->n_kv && janas_llm_model_recurrent(s->m))
         return -1;
+    discard_buffered(s);
     janas_sampler_rewind(s->smp, s->n - s->ret); /* drawn, never returned */
     s->n = s->ret = n;
     janas_llm_model_media_drop(s->m, n); /* pictures past the cut */
@@ -678,6 +810,22 @@ void janas_llm_session_stats(const struct janas_llm_session *s,
     }
 }
 
+void janas_llm_session_metrics(const struct janas_llm_session *s,
+                               struct janas_gen_metrics *out)
+{
+    if (!out) return;
+    if (!s) { memset(out, 0, sizeof(*out)); return; }
+    *out = s->metrics;
+    out->buffered_tokens = s->n - s->ret;
+    out->pending_preparation_seconds = s->pending.preparation_seconds;
+}
+
+void janas_llm_session_reply_remaining(struct janas_llm_session *s,
+                                       uint32_t remaining)
+{
+    if (s) s->reply_remaining = remaining;
+}
+
 static int is_stop(const struct janas_gen_options *o, int32_t t)
 {
     if (o->eos >= 0 && t == o->eos)
@@ -692,6 +840,7 @@ int janas_llm_session_append(struct janas_llm_session *s, const int32_t *tokens,
                              uint32_t n)
 {
     if (s->ret < s->n) {
+        discard_buffered(s);
         /* drop the generated tokens nobody has seen; if the last kept one
            already ran, run it again: its MTP row paired it with a dropped
            token. Each was drawn, so the random sequence goes back as many:
@@ -715,6 +864,9 @@ int janas_llm_session_append(struct janas_llm_session *s, const int32_t *tokens,
     s->n += n;
     s->ret = s->n;
     s->n_mdraft = 0; /* they followed the old last token */
+    abandon_proposal(s);
+    s->reply_remaining = UINT32_MAX;
+    janas_llm_mtp_vocab_new_reply(s->m);
     if (s->mtp)
         janas_llm_mtp_note_tokens(s->m, tokens, n);
     return 0;
@@ -764,6 +916,8 @@ void janas_llm_session_filter(struct janas_llm_session *s,
                               const struct janas_sample_filter *f)
 {
     janas_sampler_filter(s->smp, f);
+    s->has_filter = f != NULL;
+    if (s->has_filter && cycle_mode(s)) abandon_proposal(s);
 }
 
 void janas_llm_session_mark(struct janas_llm_session *s)
@@ -857,10 +1011,148 @@ static int draft_step(struct janas_llm_session *s, uint32_t pos, int k,
     return n;
 }
 
+/* Prepare the next cycle from canonical tokens only. In hybrid mode the
+   history index is consulted before any MTP projection or chained state. */
+static int prepare_cycle(struct janas_llm_session *s, uint32_t pos,
+                          uint32_t acc, int32_t final_token,
+                          double *maintenance)
+{
+    const struct janas_gen_options *o = &s->o;
+    uint32_t made = acc + 1;
+    uint32_t remaining = s->reply_remaining;
+    if (remaining != UINT32_MAX) remaining = remaining > made ? remaining - made : 0;
+    int ongoing = !is_stop(o, final_token) && remaining != 0 && s->n <= s->cap;
+    unsigned cap = (unsigned)drafts_cap(s->m, o->spec_k);
+    /* Stateful filter callbacks and penalty counts have no rollback API.
+       Width one preserves their transcript even after an arbitrary caller
+       cancellation, rather than advancing state for unread draft outputs. */
+    if (s->has_filter || o->presence_penalty != 0 || o->frequency_penalty != 0)
+        cap = 0;
+    if (cap > s->cap - (s->n <= s->cap ? s->n : s->cap))
+        cap = s->cap - (s->n <= s->cap ? s->n : s->cap);
+    if (remaining != UINT32_MAX && cap >= remaining) cap = remaining ? remaining - 1 : 0;
+    unsigned source = JANAS_GEN_SOURCE_PLAIN, want = 0, matched_suffix = 0;
+    unsigned warm = !janas_llm_model_settling(s->m), policy = 0, rows = 0;
+    uint64_t vocab_epoch = 0;
+    double start = now(), lookup_time = 0, controller_time = 0, repack_time = 0;
+    int32_t proposal[MAX_SPEC_K];
+    if (ongoing && cap && o->spec_mode != JANAS_SPEC_OFF) {
+        if (o->spec_mode == JANAS_SPEC_LOOKUP || o->spec_mode == JANAS_SPEC_HYBRID) {
+            double tl = now();
+            if (!s->index) s->index = janas_history_index_create(8u * 1024u * 1024u);
+            int avail = 0, suffix = 0;
+            /* Lazy synchronization also handles append/truncate/slide/load;
+               rebuilding is charged to this proposal, not hidden in a turn. */
+            if (s->index && janas_history_index_sync(s->index, s->hist, s->n, 0) == 0)
+                avail = janas_history_index_lookup(s->index, s->hist, s->n,
+                                                   (int)cap, proposal, &suffix);
+            matched_suffix = (unsigned)suffix;
+            lookup_time = now() - tl;
+            s->metrics.lookup_seconds += lookup_time;
+            if (avail > 0) s->metrics.lookup_hits++; else s->metrics.lookup_misses++;
+            source = JANAS_GEN_SOURCE_LOOKUP;
+            double tc = now();
+            want = o->spec_planner == 1
+                ? janas_cycle_choose_reuse(&s->cycle, source, warm, 0, (unsigned)avail,
+                                     (unsigned)o->spec_explore_percent, s->last_reuse)
+                : (unsigned)avail;
+            controller_time += now() - tc;
+        }
+        if (cap && (o->spec_mode == JANAS_SPEC_MTP ||
+            (o->spec_mode == JANAS_SPEC_HYBRID && want == 0))) {
+            source = JANAS_GEN_SOURCE_MTP;
+            int32_t special[JANAS_GEN_MAX_STOP + 1];
+            uint32_t ns = 0;
+            if (o->eos >= 0) special[ns++] = o->eos;
+            for (int i = 0; i < o->n_stop; i++) special[ns++] = o->stop[i];
+            struct janas_mtp_costs before, after;
+            janas_llm_mtp_costs(s->m, &before);
+            /* acc is the last VALID target-logit row, including a first
+               mismatch. Later rows condition on rejected tokens. */
+            (void)janas_llm_mtp_vocab_prepare(s->m, o->draft_vocab_policy,
+                o->draft_vocab_rows, s->logits + (size_t)acc * s->nv,
+                s->hist, s->n, special, ns);
+            janas_llm_mtp_costs(s->m, &after);
+            repack_time = after.repack_seconds - before.repack_seconds;
+            policy = (unsigned)janas_llm_mtp_vocab_policy(s->m);
+            rows = janas_llm_mtp_vocab_rows(s->m);
+            double tc = now();
+            want = o->spec_planner == 1
+                ? janas_cycle_choose_reuse(&s->cycle, source, warm,
+                    janas_cycle_vocab_key(policy, rows), cap,
+                    (unsigned)o->spec_explore_percent, s->last_reuse) : cap;
+            controller_time += now() - tc;
+        } else if (o->spec_mode == JANAS_SPEC_DRAFT) {
+            source = JANAS_GEN_SOURCE_DRAFT;
+            double tc = now();
+            want = o->spec_planner == 1
+                ? janas_cycle_choose_reuse(&s->cycle, source, warm, 0, cap,
+                                     (unsigned)o->spec_explore_percent, s->last_reuse) : cap;
+            controller_time += now() - tc;
+            if (want) {
+                double spent = 0;
+                int count = 0;
+                double td = now();
+                int got = draft_step(s, s->n - 1, (int)want, proposal, &spent, &count);
+                if (got < 0) return -1;
+                want = (unsigned)got;
+                s->metrics.draft_seconds += now() - td;
+                s->st.draft_seconds += spent;
+            }
+        }
+    }
+    double preparation = now() - start;
+    struct mtp_times mt = {0};
+    if (s->mtp && mtp_step(s->m, s->hist, pos, acc, (int)want,
+            source == JANAS_GEN_SOURCE_MTP && want > 0, 0, NULL,
+            s->hrow, s->mdraft, s->msurv, &s->n_mdraft, &mt) != 0)
+        return -1;
+    *maintenance = mt.maintenance;
+    s->metrics.mtp_maintenance_seconds += mt.maintenance;
+    s->metrics.mtp_head_seconds += mt.head;
+    s->metrics.mtp_chain_seconds += mt.chain;
+    s->metrics.mtp_repack_seconds += repack_time;
+    s->metrics.controller_seconds += controller_time;
+    if (source == JANAS_GEN_SOURCE_MTP) {
+        /* note_tokens in mtp_step may have extended the legacy row set. */
+        struct janas_mtp_costs resolved;
+        janas_llm_mtp_costs(s->m, &resolved);
+        policy = (unsigned)janas_llm_mtp_vocab_policy(s->m);
+        rows = janas_llm_mtp_vocab_rows(s->m);
+        vocab_epoch = resolved.vocab_epoch;
+    }
+    if (source != JANAS_GEN_SOURCE_MTP) {
+        s->n_mdraft = (int)want;
+        if (want) memcpy(s->mdraft, proposal, want * sizeof(*proposal));
+    }
+    for (int i = 0; i < s->n_mdraft; i++)
+        if (is_stop(o, s->mdraft[i])) { s->n_mdraft = i + 1; break; }
+    memset(&s->pending, 0, sizeof(s->pending));
+    if (ongoing) {
+        s->pending.proposal_id = ++s->next_proposal_id;
+        s->pending.source = s->n_mdraft ? source : JANAS_GEN_SOURCE_PLAIN;
+        s->pending.lookup_suffix = matched_suffix; /* offered, even if MTP won */
+        s->pending.planner_source = source;
+        s->pending.requested_depth = want;
+        s->pending.warm = warm;
+        s->pending.draft_vocab_policy = policy;
+        s->pending.draft_vocab_rows = rows;
+        s->pending.preparation_seconds = preparation + mt.head + mt.chain;
+        s->pending.controller_seconds = controller_time;
+        s->pending_reuse = s->last_reuse;
+        s->pending_vocab_epoch = vocab_epoch;
+        s->metrics.proposals += s->n_mdraft > 0;
+    } else {
+        s->n_mdraft = 0;
+    }
+    return 0;
+}
+
 int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
 {
     if (s->ret < s->n) {
         *token = s->hist[s->ret++];
+        delivered(s);
         return 0;
     }
     if (s->n == 0)
@@ -874,98 +1166,157 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     const struct janas_gen_options *o = &s->o;
     uint32_t nv = s->nv, pos = s->n - 1;
     double t0 = now();
-    int drafts_wanted = o->spec_mode == JANAS_SPEC_MTP;
-    int plan = s->mtp && drafts_wanted && o->spec_auto;
+    int measured = cycle_mode(s);
+    int drafts_wanted = o->spec_mode == JANAS_SPEC_MTP || o->spec_mode == JANAS_SPEC_HYBRID;
+    int plan = !measured && s->mtp && drafts_wanted && o->spec_auto;
     int32_t block[MAX_SPEC_K + 1];
     block[0] = s->hist[pos];
     int nd = 0;
-    /*
-     * spec_auto needs the cost of a plain pass to compare the drafts with,
-     * and it must be a pass of the same work: one in AUTO_PROBE makes no
-     * draft, so the baseline follows the context as it grows and the cache
-     * as it changes. Measured once at the start of a session, as it was, it
-     * was the cost of the shortest context and the warmest cache, and the
-     * comparison leaned against the drafts for the rest of the session.
-     * Only where the drafts come from the text itself: with an MTP block
-     * the planner decides how many to use and this judgement never runs.
-     */
-    int probe =
-        o->spec_auto && !plan &&
-        (s->single_cost == 0 || s->st.passes - s->single_at >= AUTO_PROBE);
-    /* drafting again after a spell without it: what was learned then was
-       learned of other work, and judging on it is how the drafts used to
-       switch themselves off for good */
-    int can_draft = o->spec_mode != JANAS_SPEC_OFF && s->off_left == 0;
-    if (can_draft && !s->could_draft) {
-        s->spec_cost = s->gain = 0;
-        s->spec_seen = 0;
-        s->strikes = 0;
-        /* and the planner's table of pass costs: those were measured before
-           the pause, and the machine has moved since - the expert cache
-           warms as a conversation goes on, so a plain pass timed now against
-           a block pass timed then is no comparison at all. Left as they
-           were, the drafts came back about one time in three (seven runs of
-           the sequence on 21 Sep 2026). */
-        memset(s->pl.t, 0, sizeof(s->pl.t));
-        s->pl.chain = 0;
+    int copies = 0;
+    struct janas_gen_cycle current = s->pending;
+    uint64_t current_vocab_epoch = current.proposal_id ? s->pending_vocab_epoch : 0;
+    unsigned current_reuse = current.proposal_id ? s->pending_reuse : 2;
+    if (!current.proposal_id) {
+        current.proposal_id = ++s->next_proposal_id;
+        current.source = JANAS_GEN_SOURCE_PLAIN;
+        current.planner_source = drafts_wanted ? JANAS_GEN_SOURCE_MTP
+            : o->spec_mode == JANAS_SPEC_LOOKUP ? JANAS_GEN_SOURCE_LOOKUP
+            : o->spec_mode == JANAS_SPEC_DRAFT ? JANAS_GEN_SOURCE_DRAFT
+            : JANAS_GEN_SOURCE_PLAIN;
+        current.warm = !janas_llm_model_settling(m);
+        current.draft_vocab_policy = (uint32_t)janas_llm_mtp_vocab_policy(m);
+        current.draft_vocab_rows = janas_llm_mtp_vocab_rows(m);
     }
-    s->could_draft = can_draft;
-    /* drafts that are copied or predicted by another model: both are judged
-       on the rate at which each position has been surviving, and one pass in
-       sixteen drafts anyway, because refusing every draft would stop those
-       counts from ever moving again */
-    int copies =
-        o->spec_mode == JANAS_SPEC_LOOKUP || o->spec_mode == JANAS_SPEC_DRAFT;
-    if (o->spec_mode == JANAS_SPEC_LOOKUP && s->off_left == 0 && !probe) {
-        nd = lookup_draft(s->hist, s->n, drafts_cap(m, o->spec_k), block + 1);
-        if (nd > 0) {
-            int want = plan_lookup(&s->pl, nd, 0.0);
-            if (!want && s->st.passes % 16 == 0)
-                want = 1;
-            nd = want;
+    memset(&s->pending, 0, sizeof(s->pending));
+    if (measured) {
+        nd = s->n_mdraft;
+        if (s->has_filter || o->presence_penalty != 0 || o->frequency_penalty != 0)
+            nd = 0;
+        memcpy(block + 1, s->mdraft, (size_t)nd * sizeof(int32_t));
+        copies = current.source == JANAS_GEN_SOURCE_LOOKUP ||
+                 current.source == JANAS_GEN_SOURCE_DRAFT;
+    } else {
+        /*
+         * spec_auto needs the cost of a plain pass to compare the drafts with,
+         * and it must be a pass of the same work: one in AUTO_PROBE makes no
+         * draft, so the baseline follows the context as it grows and the cache
+         * as it changes. Measured once at the start of a session, as it was, it
+         * was the cost of the shortest context and the warmest cache, and the
+         * comparison leaned against the drafts for the rest of the session.
+         * Only where the drafts come from the text itself: with an MTP block
+         * the planner decides how many to use and this judgement never runs.
+         */
+        int probe =
+            o->spec_auto && !plan &&
+            (s->single_cost == 0 || s->st.passes - s->single_at >= AUTO_PROBE);
+        /* drafting again after a spell without it: what was learned then was
+           learned of other work, and judging on it is how the drafts used to
+           switch themselves off for good */
+        int can_draft = o->spec_mode != JANAS_SPEC_OFF && s->off_left == 0;
+        if (can_draft && !s->could_draft) {
+            s->spec_cost = s->gain = 0;
+            s->spec_seen = 0;
+            s->strikes = 0;
+            /* and the planner's table of pass costs: those were measured before
+               the pause, and the machine has moved since - the expert cache
+               warms as a conversation goes on, so a plain pass timed now against
+               a block pass timed then is no comparison at all. Left as they
+               were, the drafts came back about one time in three (seven runs of
+               the sequence on 21 Sep 2026). */
+            memset(s->pl.t, 0, sizeof(s->pl.t));
+            s->pl.chain = 0;
         }
-    }
-    if (o->spec_mode == JANAS_SPEC_DRAFT && s->off_left == 0 && !probe) {
-        int want = plan_lookup(&s->pl, drafts_cap(m, o->spec_k), s->pl.dcost);
-        if (!want && s->st.passes % 16 == 0)
-            want = 1;
-        if (want > 0) {
-            double spent = 0;
-            int cost_n = 0;
-            int got = draft_step(s, pos, want, block + 1, &spent, &cost_n);
-            if (got < 0)
-                return -1;
-            nd = got;
-            s->st.draft_seconds += spent;
-            if (cost_n > 0) {
-                double per = spent / cost_n;
-                s->pl.dcost = s->pl.dcost ? 0.8 * s->pl.dcost + 0.2 * per : per;
+        s->could_draft = can_draft;
+        /* drafts that are copied or predicted by another model: both are judged
+           on the rate at which each position has been surviving, and one pass in
+           sixteen drafts anyway, because refusing every draft would stop those
+           counts from ever moving again */
+        copies = o->spec_mode == JANAS_SPEC_LOOKUP || o->spec_mode == JANAS_SPEC_DRAFT;
+        if (o->spec_mode == JANAS_SPEC_LOOKUP && s->off_left == 0 && !probe) {
+            double tl = now();
+            nd = lookup_draft(s->hist, s->n, drafts_cap(m, o->spec_k), block + 1);
+            s->metrics.lookup_seconds += now() - tl;
+            if (nd > 0) s->metrics.lookup_hits++; else s->metrics.lookup_misses++;
+            if (nd > 0) {
+                int want = plan_lookup(&s->pl, nd, 0.0);
+                if (!want && s->st.passes % 16 == 0)
+                    want = 1;
+                nd = want;
             }
         }
-    }
-    if (s->mtp && drafts_wanted && s->off_left == 0 && !probe) {
-        nd = plan ? plan_drafts(&s->pl, s->msurv, drafts_cap(m, s->n_mdraft))
-                  : s->n_mdraft;
-        /* one pass in sixteen drafts anyway, as the copies do: a pass of
-           two tokens timed once while the disk was busy made the planner
-           refuse every draft, and with none its cost was never timed again
-           - Qwen3-Next-80B with a 4 GiB cache drafted 33 times in a
-           session and then never (1 Oct 2026) */
-        if (plan && nd == 0 && s->n_mdraft > 0 && s->st.passes % 16 == 0)
-            nd = 1;
-        memcpy(block + 1, s->mdraft, (size_t)nd * sizeof(int32_t));
+        if (o->spec_mode == JANAS_SPEC_DRAFT && s->off_left == 0 && !probe) {
+            int want = plan_lookup(&s->pl, drafts_cap(m, o->spec_k), s->pl.dcost);
+            if (!want && s->st.passes % 16 == 0)
+                want = 1;
+            if (want > 0) {
+                double spent = 0;
+                int cost_n = 0;
+                double td = now();
+                int got = draft_step(s, pos, want, block + 1, &spent, &cost_n);
+                if (got < 0)
+                    return -1;
+                s->metrics.draft_seconds += now() - td;
+                nd = got;
+                s->st.draft_seconds += spent;
+                if (cost_n > 0) {
+                    double per = spent / cost_n;
+                    s->pl.dcost = s->pl.dcost ? 0.8 * s->pl.dcost + 0.2 * per : per;
+                }
+            }
+        }
+        if (s->mtp && drafts_wanted && s->off_left == 0 && !probe) {
+            nd = plan ? plan_drafts(&s->pl, s->msurv, drafts_cap(m, s->n_mdraft))
+                      : s->n_mdraft;
+            /* one pass in sixteen drafts anyway, as the copies do: a pass of
+               two tokens timed once while the disk was busy made the planner
+               refuse every draft, and with none its cost was never timed again
+               - Qwen3-Next-80B with a 4 GiB cache drafted 33 times in a
+               session and then never (1 Oct 2026) */
+            if (plan && nd == 0 && s->n_mdraft > 0 && s->st.passes % 16 == 0)
+                nd = 1;
+            memcpy(block + 1, s->mdraft, (size_t)nd * sizeof(int32_t));
+        }
+        current.preparation_seconds += now() - t0;
+        current.requested_depth = (uint32_t)nd;
+        current.source = nd == 0 ? JANAS_GEN_SOURCE_PLAIN
+            : o->spec_mode == JANAS_SPEC_LOOKUP ? JANAS_GEN_SOURCE_LOOKUP
+            : o->spec_mode == JANAS_SPEC_DRAFT ? JANAS_GEN_SOURCE_DRAFT : JANAS_GEN_SOURCE_MTP;
+        if (copies && nd > 0) s->metrics.proposals++;
     }
     if ((uint32_t)nd > s->cap - s->n)
         nd = (int)(s->cap - s->n); /* the context ends */
+    if (s->reply_remaining != UINT32_MAX && s->reply_remaining > 0 &&
+        (uint32_t)nd >= s->reply_remaining)
+        nd = (int)s->reply_remaining - 1;
+    if (!nd) current.source = JANAS_GEN_SOURCE_PLAIN;
+    if (measured && s->has_filter) current.guard_reason |= JANAS_GEN_GUARD_FILTER;
+    if (measured && (o->presence_penalty != 0 || o->frequency_penalty != 0))
+        current.guard_reason |= JANAS_GEN_GUARD_PENALTY;
     if (s->off_left > 0) {
         s->off_left--;
         s->st.auto_off_passes++;
     }
+    struct janas_llm_runtime_stats runtime_before, runtime_after;
+    double tr = now();
+    janas_llm_model_runtime_stats(m, &runtime_before);
+    double runtime_control = now() - tr;
     double tp = now();
     if (janas_llm_model_forward(m, block, (uint32_t)nd + 1, pos, s->logits,
                                 1) != 0)
         return -1;
     double dt = now() - tp;
+    tr = now();
+    janas_llm_model_runtime_stats(m, &runtime_after);
+    if (runtime_after.expert_groups > runtime_before.expert_groups &&
+        runtime_after.expert_assignments >= runtime_before.expert_assignments) {
+        uint64_t groups = runtime_after.expert_groups - runtime_before.expert_groups;
+        uint64_t assignments = runtime_after.expert_assignments - runtime_before.expert_assignments;
+        /* Observational only: no future routers/IDs are queried. The next
+           proposal uses the group reuse actually seen in this target pass. */
+        s->last_reuse = assignments / groups >= 2 ? 1 : 0;
+    }
+    runtime_control += now() - tr;
+    s->metrics.controller_seconds += runtime_control;
     /* what the planner and spec_auto learn: the pass without its waits for
        the disk, and nothing from a pass the tuner ran on an alternative it
        was trying. In a new conversation it tries each configuration in turn
@@ -982,11 +1333,14 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     /* accept the drafts the model would have produced, then its token; a
        stop token ends the pass (and is never counted as accepted) */
     int acc = 0;
+    double sampled = 0;
     int32_t t;
     for (;;) {
         double ts = now();
         t = sample(s, s->logits + (size_t)acc * nv, s->n);
-        s->st.sample_seconds += now() - ts;
+        double sampling_time = now() - ts;
+        s->st.sample_seconds += sampling_time;
+        sampled += sampling_time;
         if (t < 0)
             return -1; /* the filter allows nothing: a broken grammar */
         if (acc < nd && t == block[acc + 1] && !is_stop(o, t)) {
@@ -1030,10 +1384,11 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     /* what a draft of that guessed chance was worth, whoever asked for it:
        the planner only learns about the bins it tries, so drafts made under
        a fixed threshold teach it too */
-    for (int i = 0; i < nd; i++) {
-        s->pl.tried[cal_bin(s->msurv[i])] += 1;
-        s->pl.won[cal_bin(s->msurv[i])] += i < acc;
-    }
+    if (!measured && current.source == JANAS_GEN_SOURCE_MTP && !o->draft_vocab_policy)
+        for (int i = 0; i < nd; i++) {
+            s->pl.tried[cal_bin(s->msurv[i])] += 1;
+            s->pl.won[cal_bin(s->msurv[i])] += i < acc;
+        }
     /* a pass run while the expert cache is still filling in the background
        measures the disk, not the drafts: it teaches nothing */
     int settling = settling_now;
@@ -1049,7 +1404,7 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
         }
         /* worth it only if tokens per second beat single passes, and only
            on evidence fresh enough to be about the same work (see above) */
-        if (o->spec_auto && !plan && !settling && s->single_cost > 0 &&
+        if (!measured && o->spec_auto && !plan && !settling && s->single_cost > 0 &&
             s->spec_seen >= AUTO_WARM &&
             s->st.passes - s->single_at <= AUTO_FRESH) {
             if (s->gain / s->spec_cost < AUTO_MARGIN / s->single_cost) {
@@ -1073,17 +1428,91 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     }
     /* the MTP rows of the new tokens always (the block's KV cache must stay
        complete for later turns), drafts only when generation goes on */
-    if (s->mtp) {
-        if (mtp_step(m, s->hist, pos, (uint32_t)acc,
-                     plan ? drafts_cap(m, o->spec_k) : o->spec_k,
-                     drafts_wanted && s->off_left == 0 && !is_stop(o, t),
+    double maintenance = 0;
+    if (measured) {
+        if (prepare_cycle(s, pos, (uint32_t)acc, t, &maintenance) != 0)
+            return -1;
+    } else if (s->mtp) {
+        struct janas_mtp_costs before_prepare, after_prepare;
+        janas_llm_mtp_costs(m, &before_prepare);
+        double tv = now();
+        if (drafts_wanted && !is_stop(o, t)) {
+            int32_t special[JANAS_GEN_MAX_STOP + 1];
+            uint32_t ns = 0;
+            if (o->eos >= 0) special[ns++] = o->eos;
+            for (int i = 0; i < o->n_stop; i++) special[ns++] = o->stop[i];
+            (void)janas_llm_mtp_vocab_prepare(m, o->draft_vocab_policy,
+                o->draft_vocab_rows, s->logits + (size_t)acc * nv,
+                s->hist, s->n, special, ns);
+        }
+        double vocab_preparation = now() - tv;
+        janas_llm_mtp_costs(m, &after_prepare);
+        s->metrics.mtp_repack_seconds += after_prepare.repack_seconds - before_prepare.repack_seconds;
+        struct mtp_times mt;
+        int future_k = plan ? drafts_cap(m, o->spec_k) : o->spec_k;
+        uint32_t future = s->reply_remaining;
+        if (future != UINT32_MAX) {
+            future = future > (uint32_t)acc + 1 ? future - (uint32_t)acc - 1 : 0;
+            if ((uint32_t)future_k >= future) future_k = future ? (int)future - 1 : 0;
+        }
+        if (mtp_step(m, s->hist, pos, (uint32_t)acc, future_k,
+                      future_k > 0 && drafts_wanted && s->off_left == 0 && !is_stop(o, t),
                      o->spec_min_conf,
                      plan ? &s->pl : NULL, s->hrow, s->mdraft, s->msurv,
-                     &s->n_mdraft) != 0)
+                      &s->n_mdraft, &mt) != 0)
             return -1;
+        maintenance = mt.maintenance;
+        s->metrics.mtp_maintenance_seconds += mt.maintenance;
+        s->metrics.mtp_head_seconds += mt.head;
+        s->metrics.mtp_chain_seconds += mt.chain;
+        s->pending.preparation_seconds = vocab_preparation + mt.head + mt.chain;
+        s->pending.proposal_id = ++s->next_proposal_id;
+        s->pending.source = JANAS_GEN_SOURCE_MTP;
+        s->pending.planner_source = JANAS_GEN_SOURCE_MTP;
+        s->pending.draft_vocab_policy = (uint32_t)janas_llm_mtp_vocab_policy(m);
+        s->pending.draft_vocab_rows = janas_llm_mtp_vocab_rows(m);
+        s->pending_vocab_epoch = after_prepare.vocab_epoch;
+        s->metrics.proposals += s->n_mdraft > 0;
     }
+    current.pass_width = (uint32_t)nd + 1;
+    current.resolved_planner = (uint32_t)o->spec_planner;
+    current.accepted_prefix = (uint32_t)acc;
+    current.produced = (uint32_t)acc + 1;
+    current.buffered = current.produced;
+    current.rejected_rows = (uint32_t)(nd - acc);
+    current.verification_seconds = dt;
+    current.sample_seconds = sampled;
+    current.maintenance_seconds = maintenance;
+    current.controller_seconds += runtime_control;
+    current.total_seconds = current.preparation_seconds + dt + sampled + maintenance + runtime_control;
+    if (current.source == JANAS_GEN_SOURCE_MTP && nd > 0)
+        janas_llm_mtp_vocab_feedback_epoch(m, current_vocab_epoch, current.draft_vocab_policy,
+            current.draft_vocab_rows, (uint32_t)nd, (uint32_t)acc,
+            current.total_seconds);
+    s->metrics.last = current;
+    s->observation_pending = measured;
+    s->observation_reuse = current_reuse;
+    s->metrics.cycles++;
+    s->metrics.verification_rows += current.pass_width;
+    s->metrics.accepted_prefix += (uint32_t)acc;
+    s->metrics.produced_tokens += current.produced;
+    s->metrics.rejected_rows += current.rejected_rows;
+    s->metrics.filter_guard_cycles += !!(current.guard_reason & JANAS_GEN_GUARD_FILTER);
+    s->metrics.penalty_guard_cycles += !!(current.guard_reason & JANAS_GEN_GUARD_PENALTY);
+    s->metrics.source_cycles[current.source]++;
+    s->metrics.source_drafted[current.source] += (uint32_t)nd;
+    s->metrics.source_accepted[current.source] += (uint32_t)acc;
+    s->metrics.source_seconds[current.source] += current.total_seconds;
+    if (current.source == JANAS_GEN_SOURCE_LOOKUP && current.lookup_suffix <= 8)
+        s->metrics.lookup_suffix_count[current.lookup_suffix]++;
+    s->metrics.pass_width_count[nd + 1]++;
+    s->metrics.prefix_count[acc]++;
+    s->metrics.verification_seconds += dt;
+    s->metrics.sample_seconds += sampled;
+    s->metrics.cycle_seconds += current.total_seconds;
     s->st.decode_seconds += now() - t0;
     *token = s->hist[s->ret++];
+    delivered(s);
     return 0;
 }
 
@@ -1101,6 +1530,7 @@ int janas_llm_generate(struct janas_llm_model *m, const int32_t *prompt,
     int produced = 0;
     if (janas_llm_session_append(s, prompt, n_prompt) != 0)
         produced = -1;
+    janas_llm_session_reply_remaining(s, max_new);
     while (produced >= 0 && (uint32_t)produced < max_new) {
         int r = janas_llm_session_next(s, &out[produced]);
         if (r < 0)

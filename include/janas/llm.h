@@ -321,6 +321,7 @@ enum {
     JANAS_LLM_SPEC_AUTO = 1,
     JANAS_LLM_SPEC_LOOKUP = 2,
     JANAS_LLM_SPEC_MTP = 3,
+    JANAS_LLM_SPEC_HYBRID = 4, /* history lookup, then the existing MTP head */
 };
 
 struct janas_llm_chat_params {
@@ -394,6 +395,80 @@ JANAS_LLM_API int32_t janas_llm_chat_set_params(
 JANAS_LLM_API int32_t janas_llm_chat_speculation(janas_llm_chat *c,
                                                  int32_t mode,
                                                  int32_t max_drafts);
+
+#define JANAS_LLM_SPEC_CONFIG_VERSION 1
+#define JANAS_LLM_SPEC_METRICS_VERSION 1
+#define JANAS_LLM_SPEC_PLANNER_LEGACY 0
+#define JANAS_LLM_SPEC_PLANNER_CYCLE 1
+#define JANAS_LLM_SPEC_PLANNER_FIXED 2
+#define JANAS_LLM_DRAFT_VOCAB_LEGACY 0
+#define JANAS_LLM_DRAFT_VOCAB_ADAPTIVE 1
+/* Independent of existing parameter/statistics layouts. Version 1 requires
+   this complete configuration. Invalid settings leave the chat unchanged. */
+struct janas_llm_speculation_config {
+    uint32_t size, version;
+    int32_t mode, max_drafts, planner, explore_percent;
+    int32_t draft_vocab_policy;
+    uint32_t draft_vocab_rows; /* 0 auto; 8192/16384/32768 otherwise */
+};
+JANAS_LLM_API void janas_llm_speculation_config_default(
+    struct janas_llm_speculation_config *config);
+JANAS_LLM_API int32_t janas_llm_chat_set_speculation_config(
+    janas_llm_chat *c, const struct janas_llm_speculation_config *config);
+
+struct janas_llm_speculation_cycle {
+    uint64_t proposal_id;
+    uint32_t source, planner_source, requested_depth, pass_width, accepted_prefix;
+    uint32_t produced, delivered, buffered, discarded, rejected_rows;
+    uint32_t draft_vocab_policy, draft_vocab_rows, warm, guard_reason, lookup_suffix;
+    uint32_t resolved_planner;
+    double preparation_seconds, verification_seconds, sample_seconds;
+    double maintenance_seconds, controller_seconds, total_seconds;
+};
+
+struct janas_llm_speculation_metrics {
+    uint32_t size, version;
+    uint64_t cycles, proposals, verification_rows, accepted_prefix;
+    uint64_t produced_tokens, delivered_tokens, discarded_tokens;
+    uint64_t rejected_rows, lookup_hits, lookup_misses;
+    uint64_t filter_guard_cycles, penalty_guard_cycles;
+    uint64_t source_cycles[4];
+    uint64_t source_drafted[4], source_accepted[4];
+    uint64_t source_delivered[4], source_discarded[4];
+    uint64_t pass_width_count[18];
+    uint64_t prefix_count[17];
+    uint64_t lookup_suffix_count[9];
+    double source_seconds[4];
+    double cycle_seconds, lookup_seconds, mtp_maintenance_seconds;
+    double mtp_head_seconds, mtp_chain_seconds, mtp_repack_seconds, draft_seconds;
+    double verification_seconds, sample_seconds, controller_seconds;
+    double abandoned_preparation_seconds, pending_preparation_seconds;
+    uint32_t buffered_tokens;
+    struct janas_llm_speculation_cycle last;
+    /* Sum of per-layer/per-pass groups, including a distinct MTP head. */
+    uint64_t expert_assignments, expert_groups, expert_group_widths[18];
+    uint64_t gdn_chain_tokens, gdn_journal_replay_tokens;
+    uint64_t gdn_scalar_replay_tokens, gdn_konly_replay_tokens;
+    double gdn_core_seconds, gdn_conv_seconds;
+    uint64_t gdn_delta_bytes; /* current allocated journal bytes, a gauge */
+    uint64_t head_repacks, head_vocab_fallbacks, head_vocab_epoch;
+    uint32_t head_vocab_policy, head_vocab_rows;
+    /* Whole-chat CPU groups over main plus MTP. Rows are logical matrix
+       rows; row_vectors counts rows * vectors. Established rows can include
+       the existing Q6 I8MM path. Eligible panel views alone do not establish
+       kernel execution; cpu_prepared_rows counts rows actually dispatched. */
+    uint64_t cpu_groups, cpu_tasks;
+    uint64_t cpu_prepared_rows, cpu_prepared_row_vectors;
+    uint64_t cpu_established_rows, cpu_established_row_vectors;
+    uint64_t cpu_panel_views, cpu_panel_unique, cpu_panel_dedup_hits;
+    /* bytes sums each group's allocated workspace, including metadata.
+       peak_bytes is a model-load lifetime maximum gauge, not a chat delta. */
+    uint64_t cpu_panel_bytes, cpu_panel_peak_bytes;
+    double cpu_panel_prepare_seconds; /* allocation plus packing wall time */
+};
+JANAS_LLM_API int32_t janas_llm_chat_speculation_metrics(
+    const janas_llm_chat *c, struct janas_llm_speculation_metrics *metrics);
+
 
 /* Sets the system message. Only before the first message (see reset). */
 JANAS_LLM_API int32_t janas_llm_chat_system(janas_llm_chat *c, const char *text,

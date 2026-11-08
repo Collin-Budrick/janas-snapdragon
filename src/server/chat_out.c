@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "llm/spec_json.h"
+
 yyjson_mut_val *out_head(yyjson_mut_doc *d, const struct out *o,
                          const char *object)
 {
@@ -44,6 +46,21 @@ void out_usage(yyjson_mut_doc *d, yyjson_mut_val *obj, const struct srv_job *j)
     yyjson_mut_obj_add_uint(d, jn, "context_size", j->st.context_size);
     yyjson_mut_obj_add_real(d, jn, "input_seconds", j->st.input_seconds);
     yyjson_mut_obj_add_real(d, jn, "output_seconds", j->st.output_seconds);
+    if (j->speculation_valid) {
+        struct janas_buf text = {0};
+        janas_spec_metrics_json(&text, &j->speculation);
+        yyjson_doc *metrics = text.oom ? NULL : yyjson_read(text.p, text.n, 0);
+        if (metrics) {
+            yyjson_mut_val *copy =
+                yyjson_val_mut_copy(d, yyjson_doc_get_root(metrics));
+            if (copy) {
+                yyjson_mut_obj_add_str(d, copy, "reply_scope", "first_choice");
+                yyjson_mut_obj_add_val(d, jn, "speculation", copy);
+            }
+            yyjson_doc_free(metrics);
+        }
+        janas_buf_free(&text);
+    }
 }
 
 const char *out_finish(const struct srv_choice *c)

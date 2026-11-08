@@ -5,6 +5,8 @@ Run --plan anywhere to inspect the bounded screen/refinement design. Actual
 runs require native ARM64 Windows Python and a rebuilt janas-bench.exe.
 Fresh-process results do not claim that Windows's file cache or the SSD is
 cold. Warm samples retain model/expert caches but recreate the chat history.
+Experimental planner, draft-head, GDN and panel controls are explicit case
+settings; defaults retain the established runtime policy and CPU reference.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import statistics
 import subprocess
 import sys
@@ -45,9 +48,15 @@ PROMPTS = [
 REQUIRED_FLAGS = {
     "--speculation", "--draft-tokens", "--prompt-file", "--seed", "--threads",
     "--warmups", "--json", "--prompt-on", "--drafts-on", "--reply-on",
+    "--spec-planner", "--spec-explore", "--draft-vocab", "--draft-vocab-rows",
 }
 PREFETCH_POLICIES = {"auto": {}, "off": {"JANAS_PREFETCH": "0", "JANAS_PREFETCH_PREFILL": "0"},
     "decode-off": {"JANAS_PREFETCH": "0"}, "prompt-off": {"JANAS_PREFETCH_PREFILL": "0"}}
+PANEL_POLICIES = {"auto": {}, "off": {"JANAS_CPU_TILES": "0"},
+                  "experimental": {"JANAS_CPU_TILES": "1"}}
+EXPERIMENT_ENV = ("JANAS_SPEC_PLANNER", "JANAS_SPEC_EXPLORE",
+    "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS", "JANAS_GDN_CHAIN",
+    "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY")
 RECORDED_PERFORMANCE_ENV = (
     "JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG", "JANAS_TUNE",
     "JANAS_TUNE_THREADS", "JANAS_WARM", "JANAS_MISS_SKIP", "JANAS_EXPERT_BITS",
@@ -57,7 +66,8 @@ RECORDED_PERFORMANCE_ENV = (
     "JANAS_URING_DEEP", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS", "JANAS_NPU_MAX_MB", "JANAS_NPU_SPIN",
     "JANAS_NPU_A8", "JANAS_NPU_LAYERS", "JANAS_GPU_ALWAYS", "JANAS_NPU_ALWAYS",
     "JANAS_GPU_TOKEN", "JANAS_GPU_WHOLE", "JANAS_GPU_FAST_PROMPT",
-    "JANAS_GPU_EXPERT_SHARE", "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_GPU_ALLOC")
+    "JANAS_GPU_EXPERT_SHARE", "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_GPU_ALLOC",
+    *EXPERIMENT_ENV)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +85,35 @@ class Case:
     gpu_min_tokens: int = 0
     npu_min_tokens: int = 0
     npu_min_macs: int = 0
+    spec_planner: str = "legacy"
+    spec_explore: int = 20
+    draft_vocab: str = "legacy"
+    draft_vocab_rows: int = 0
+    gdn_chain: int = 0
+    gdn_journal: int = 0
+    gdn_k_only: int = 0
+    panels: str = "auto"
+
+    def __post_init__(self) -> None:
+        if self.speculation not in ("none", "lookup", "mtp", "auto", "hybrid"):
+            raise ValueError("Invalid speculation mode")
+        if self.spec_planner not in ("legacy", "cycle", "fixed"):
+            raise ValueError("Invalid speculation planner")
+        if type(self.spec_explore) is not int or not 0 <= self.spec_explore <= 100:
+            raise ValueError("Speculation exploration must be an integer in 0..100")
+        if self.draft_vocab not in ("legacy", "adaptive"):
+            raise ValueError("Invalid draft vocabulary policy")
+        if type(self.draft_vocab_rows) is not int or self.draft_vocab_rows not in (0, 8192, 16384, 32768):
+            raise ValueError("Draft vocabulary rows must be 0, 8192, 16384 or 32768")
+        if any(type(x) is not int or x not in (0, 1)
+               for x in (self.gdn_chain, self.gdn_journal, self.gdn_k_only)):
+            raise ValueError("GDN controls must be integer 0 or 1")
+        if self.gdn_journal and not self.gdn_chain:
+            raise ValueError("GDN journal requires GDN chain")
+        if self.gdn_k_only and not self.gdn_journal:
+            raise ValueError("GDN K-only requires GDN journal")
+        if self.panels not in PANEL_POLICIES:
+            raise ValueError("Invalid CPU panel policy")
 
     def key(self) -> str:
         data = json.dumps(dataclasses.asdict(self), sort_keys=True).encode()
@@ -83,7 +122,11 @@ class Case:
     def cpu_reference(self) -> Case:
         return dataclasses.replace(self, profile="cpu", speculation="none",
                                    draft_tokens=4, prompt_on="cpu",
-                                   drafts_on="cpu", reply_on="cpu")
+                                   drafts_on="cpu", reply_on="cpu",
+                                   spec_planner="legacy", spec_explore=20,
+                                   draft_vocab="legacy", draft_vocab_rows=0,
+                                   gdn_chain=0, gdn_journal=0, gdn_k_only=0,
+                                   panels="auto")
 
 
 def csv_values(value: str, convert: Any = str) -> list[Any]:
@@ -104,7 +147,12 @@ def screen_cases(args: argparse.Namespace) -> list[Case]:
                           prefetch=getattr(args, "prefetch", "auto"),
                           gpu_min_tokens=getattr(args, "gpu_min_tokens", 0),
                           npu_min_tokens=getattr(args, "npu_min_tokens", 0),
-                          npu_min_macs=getattr(args, "npu_min_macs", 0)))
+                           npu_min_macs=getattr(args, "npu_min_macs", 0),
+                           **{name: getattr(args, name, field.default)
+                              for name, field in Case.__dataclass_fields__.items()
+                              if name in ("spec_planner", "spec_explore", "draft_vocab",
+                                          "draft_vocab_rows", "gdn_chain", "gdn_journal",
+                                          "gdn_k_only", "panels")}))
     return with_references(cases)
 
 
@@ -154,7 +202,8 @@ def validate_cli(bench: Path) -> str:
     r = subprocess.run([str(bench), "--help"], capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=30)
     help_text = r.stdout + r.stderr
-    missing = sorted(x for x in REQUIRED_FLAGS if x not in help_text)
+    missing = sorted(x for x in REQUIRED_FLAGS
+                     if not re.search(r"(?<![\w-])" + re.escape(x) + r"(?![\w-])", help_text))
     if missing:
         raise RuntimeError("Rebuild janas-bench; required CLI flags missing: " + ", ".join(missing))
     return help_text
@@ -186,9 +235,18 @@ def run_case(args: argparse.Namespace, case: Case, prompt_path: Path,
                  "JANAS_BLOCK_THREADS", "JANAS_GPU_TOKEN", "JANAS_GPU_WHOLE",
                  "JANAS_GPU_FAST_PROMPT", "JANAS_GPU_EXPERT_SHARE",
                  "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS", "JANAS_PREFETCH",
-                 "JANAS_PREFETCH_PREFILL", "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES"):
+                 "JANAS_PREFETCH_PREFILL", "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES",
+                 *EXPERIMENT_ENV):
         env.pop(name, None)
     env.update(PREFETCH_POLICIES[case.prefetch])
+    env.update(PANEL_POLICIES[case.panels])
+    env.update({"JANAS_SPEC_PLANNER": case.spec_planner,
+                "JANAS_SPEC_EXPLORE": str(case.spec_explore),
+                "JANAS_DRAFT_VOCAB_POLICY": case.draft_vocab,
+                "JANAS_DRAFT_VOCAB_ROWS": str(case.draft_vocab_rows),
+                "JANAS_GDN_CHAIN": str(case.gdn_chain),
+                "JANAS_GDN_JOURNAL": str(case.gdn_journal),
+                "JANAS_GDN_K_ONLY": str(case.gdn_k_only)})
     for name, value in (("JANAS_GPU_MIN_N", case.gpu_min_tokens),
                         ("JANAS_NPU_MIN_N", case.npu_min_tokens)):
         if type(value) is not int or not 0 <= value <= 256:
@@ -212,8 +270,10 @@ def run_case(args: argparse.Namespace, case: Case, prompt_path: Path,
                "--gen", str(args.gen), "--ctx", str(args.ctx), "--rounds", str(args.rounds),
                "--warmups", str(args.warmups), "--cache", str(case.cache_gib),
                "--reserve", str(args.reserve_gib), "--prompt-on", case.prompt_on,
-               "--drafts-on", case.drafts_on, "--reply-on", case.reply_on, "--json"]
-    if case.speculation in ("mtp", "auto"):
+               "--drafts-on", case.drafts_on, "--reply-on", case.reply_on,
+               "--spec-planner", case.spec_planner, "--spec-explore", str(case.spec_explore),
+               "--draft-vocab", case.draft_vocab, "--draft-vocab-rows", str(case.draft_vocab_rows), "--json"]
+    if case.speculation in ("mtp", "auto", "hybrid"):
         command += ["--mtp", str(args.mtp)]
     else:
         command.append("--no-mtp")
@@ -354,6 +414,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--threads", default="4,8,12")
     p.add_argument("--cache-gib", default="8,24,0", help="last value is used for screening; 0 is auto")
     p.add_argument("--draft-tokens", default="2,4,8")
+    p.add_argument("--spec-planner", choices=("legacy", "cycle", "fixed"), default="legacy")
+    p.add_argument("--spec-explore", type=int, default=20, help="planner exploration percent 0..100")
+    p.add_argument("--draft-vocab", choices=("legacy", "adaptive"), default="legacy")
+    p.add_argument("--draft-vocab-rows", type=int, choices=(0, 8192, 16384, 32768), default=0)
+    for name in ("chain", "journal", "k-only"):
+        p.add_argument("--gdn-" + name, type=int, choices=(0, 1), default=0)
+    p.add_argument("--panels", choices=tuple(PANEL_POLICIES), default="auto",
+                   help="CPU tiles: existing auto policy, disabled, or experimental prepared panels")
     p.add_argument("--prefetch", choices=tuple(PREFETCH_POLICIES), default="auto",
                    help="screen policy; refinement retains each winning case's policy (default auto)")
     p.add_argument("--gpu-min-tokens", type=int, default=0,
@@ -384,12 +452,14 @@ def main() -> int:
     args.cache_gib = csv_values(args.cache_gib, float)
     args.draft_tokens = csv_values(args.draft_tokens, int)
     if (not args.profiles or any(x not in PROFILES for x in args.profiles)
-        or not args.speculations or any(x not in ("none", "lookup", "mtp", "auto") for x in args.speculations)
+        or not args.speculations or any(x not in ("none", "lookup", "mtp", "auto", "hybrid") for x in args.speculations)
         or not args.threads or any(x < 1 or x > 256 for x in args.threads)
         or not args.cache_gib or any(not math.isfinite(x) or x < 0 for x in args.cache_gib)
         or not args.draft_tokens or any(x < 1 or x > 16 for x in args.draft_tokens)
         or not 0 <= args.gpu_min_tokens <= 256 or not 0 <= args.npu_min_tokens <= 256
         or not 0 <= args.npu_min_macs <= (1 << 63) - 1
+        or not 0 <= args.spec_explore <= 100
+        or (args.gdn_journal and not args.gdn_chain) or (args.gdn_k_only and not args.gdn_journal)
         or args.gen < 1 or args.gen > (1 << 31) - 1 or args.ctx <= args.gen
         or args.rounds < 1 or args.rounds > 1000 or args.warmups < 0 or args.warmups > 1000
         or args.top < 1 or args.max_cases < 1 or args.seed < 1 or args.seed > (1 << 63) - 1
@@ -419,8 +489,8 @@ def main() -> int:
         setattr(args, name, getattr(args, name).resolve())
     if not args.bench.is_file() or not args.model.is_file():
         raise FileNotFoundError("The native benchmark executable and complete model must exist")
-    if any(x in ("mtp", "auto") for x in args.speculations) and not args.mtp.is_file():
-        raise FileNotFoundError("The requested MTP/auto cases require the MTP sidecar")
+    if any(x in ("mtp", "auto", "hybrid") for x in args.speculations) and not args.mtp.is_file():
+        raise FileNotFoundError("The requested MTP/auto/hybrid cases require the MTP sidecar")
     help_text = validate_cli(args.bench)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".cache"))) / "Janas/benchmarks"

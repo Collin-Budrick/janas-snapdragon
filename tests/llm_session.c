@@ -10,7 +10,11 @@
  *      without speculation.
  *
  * Usage: llm_session <model.jns> <tokens.int32> [mtp=<mtp.jns>]
+ *   [planner=legacy|cycle|fixed] [speculation=mtp|hybrid] [drafts=1..16]
+ *   [draft_vocab=legacy|adaptive] [rows=0|8192|16384|32768]
  */
+#include <inttypes.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,10 +29,26 @@
 #define G1 12
 #define G2 24
 
+static int unsigned_value(const char *text, unsigned *value)
+{
+    unsigned n = 0;
+    if (!*text) return 0;
+    for (; *text; text++) {
+        if (*text < '0' || *text > '9' ||
+            n > (UINT_MAX - (unsigned)(*text - '0')) / 10)
+            return 0;
+        n = n * 10 + (unsigned)(*text - '0');
+    }
+    *value = n;
+    return 1;
+}
+
 static int run_turns(struct janas_llm_model *m,
                      const struct janas_gen_options *o, const int32_t *text,
                      int32_t *g1, int32_t *g2)
 {
+    struct janas_mtp_costs before, after;
+    janas_llm_mtp_costs(m, &before);
     struct janas_llm_session *s = janas_llm_session_create(m, o);
     if (!s || janas_llm_session_append(s, text, NA) != 0)
         return -1;
@@ -41,6 +61,30 @@ static int run_turns(struct janas_llm_model *m,
         if (janas_llm_session_next(s, &g2[i]) != 0)
             return -1;
     int ok = janas_llm_session_length(s) == NA + G1 + NB + G2;
+    struct janas_gen_metrics metrics;
+    janas_llm_session_metrics(s, &metrics);
+    janas_llm_mtp_costs(m, &after);
+    ok &= metrics.cycles > 0 && metrics.delivered_tokens == G1 + G2;
+    ok &= metrics.last.resolved_planner == (uint32_t)o->spec_planner;
+    if (o->spec_mode == JANAS_SPEC_HYBRID)
+        ok &= metrics.lookup_hits + metrics.lookup_misses > 0;
+    if (o->draft_vocab_policy && metrics.source_drafted[JANAS_GEN_SOURCE_MTP])
+        ok &= after.repacks > before.repacks && after.head_calls > before.head_calls;
+    unsigned max_width = 0;
+    for (unsigned width = 1; width <= JANAS_GEN_MAX_K + 1; width++)
+        if (metrics.pass_width_count[width]) max_width = width;
+    printf("runtime: mode=%d planner=%u cycles=%" PRIu64
+           " max_width=%u lookup_attempts=%" PRIu64 " mtp_drafts=%" PRIu64
+           " head_calls=%" PRIu64 " repacks=%" PRIu64
+           " head_policy=%u head_rows=%u head_epoch=%" PRIu64 " %s\n",
+           o->spec_mode, metrics.last.resolved_planner, metrics.cycles, max_width,
+           metrics.lookup_hits + metrics.lookup_misses,
+           metrics.source_drafted[JANAS_GEN_SOURCE_MTP],
+           after.head_calls - before.head_calls, after.repacks - before.repacks,
+           after.vocab_policy, after.vocab_rows, after.vocab_epoch,
+           ok ? "verified" : "FAILED");
+    if (o->draft_vocab_policy && !metrics.source_drafted[JANAS_GEN_SOURCE_MTP])
+        printf("adaptive head not exercised: no MTP proposal executed\n");
     janas_llm_session_destroy(s);
     return ok ? 0 : -1;
 }
@@ -70,17 +114,39 @@ int main(int argc, char **argv)
 {
     if (argc < 3) {
         fprintf(stderr, "usage: llm_session <model.jns> <tokens.int32> "
-                        "[mtp=<mtp.jns>]\n");
+                        "[mtp=<mtp.jns>] [planner=legacy|cycle|fixed] "
+                        "[speculation=mtp|hybrid] [drafts=1..16] "
+                        "[draft_vocab=legacy|adaptive] "
+                        "[rows=0|8192|16384|32768]\n");
         return 2;
+    }
+    const char *mtp_path = NULL;
+    int planner = 0, speculation = -1, vocab_policy = 0;
+    unsigned drafts = 4, rows = 0;
+    for (int i = 3; i < argc; i++) {
+        const char *a = argv[i];
+        if (!strncmp(a, "mtp=", 4) && a[4]) mtp_path = a + 4;
+        else if (!strcmp(a, "planner=legacy")) planner = 0;
+        else if (!strcmp(a, "planner=cycle")) planner = 1;
+        else if (!strcmp(a, "planner=fixed")) planner = 2;
+        else if (!strcmp(a, "speculation=mtp")) speculation = JANAS_SPEC_MTP;
+        else if (!strcmp(a, "speculation=hybrid")) speculation = JANAS_SPEC_HYBRID;
+        else if (!strcmp(a, "draft_vocab=legacy")) vocab_policy = 0;
+        else if (!strcmp(a, "draft_vocab=adaptive")) vocab_policy = 1;
+        else if (!strncmp(a, "drafts=", 7) && unsigned_value(a + 7, &drafts) &&
+                 drafts >= 1 && drafts <= JANAS_GEN_MAX_K) { }
+        else if (!strncmp(a, "rows=", 5) && unsigned_value(a + 5, &rows) &&
+                 (!rows || rows == 8192 || rows == 16384 || rows == 32768)) { }
+        else {
+            fprintf(stderr, "invalid llm_session option: %s\n", a);
+            return 2;
+        }
     }
     int32_t text[NA + NB];
     FILE *f = fopen(argv[2], "rb");
     if (!f || fread(text, sizeof(int32_t), NA + NB, f) != NA + NB)
         return 2;
     fclose(f);
-    const char *mtp_path = NULL;
-    if (argc > 3 && strncmp(argv[3], "mtp=", 4) == 0)
-        mtp_path = argv[3] + 4;
     struct janas_cpu_layout layout;
     if (janas_cpu_layout(NULL, 0, &layout) != 0 || layout.n < 1) {
         fprintf(stderr, "cannot identify available compute CPUs\n");
@@ -105,8 +171,8 @@ int main(int argc, char **argv)
         ni = 4;
     if (ni > 255)
         ni = 255;
-    if (layout.n > 255)
-        layout.n = 255;
+    if (layout.n > 8)
+        layout.n = 8;
     if (setenv("JANAS_EXPERT_BITS", "6", 1) ||
         setenv("JANAS_HEAD_BITS", "0", 1) ||
         setenv("JANAS_MISS_SKIP", "0", 1)) {
@@ -133,11 +199,30 @@ int main(int argc, char **argv)
                 io_pin ? ", pinned" : ", unpinned");
         return 1;
     }
+    int mode = speculation >= 0 ? speculation
+                               : mtp_path ? JANAS_SPEC_MTP : JANAS_SPEC_LOOKUP;
+    if ((mode == JANAS_SPEC_HYBRID || vocab_policy) && planner == 0)
+        planner = 1; /* match the generator's resolved hybrid default */
+    if (((mode == JANAS_SPEC_MTP || mode == JANAS_SPEC_HYBRID) &&
+         !janas_llm_model_has_mtp(m)) ||
+        (vocab_policy && mode != JANAS_SPEC_MTP && mode != JANAS_SPEC_HYBRID)) {
+        fprintf(stderr, "selected speculation/adaptive head requires an MTP head\n");
+        janas_llm_model_free(m);
+        return 2;
+    }
+    printf("settings: compute=%d io=%d planner=%s speculation=%s drafts=%u "
+           "draft_vocab=%s rows=%u quality=HIGH expert_bits=6 head_bits=0\n",
+           layout.n, ni, planner == 1 ? "cycle" : planner == 2 ? "fixed" : "legacy",
+           mode == JANAS_SPEC_HYBRID ? "hybrid" : mode == JANAS_SPEC_MTP ? "mtp" : "lookup",
+           drafts, vocab_policy ? "adaptive" : "legacy", rows);
     struct janas_gen_options greedy = {.spec_k = 1, .eos = -1};
-    struct janas_gen_options spec = {.spec_mode = mtp_path ? JANAS_SPEC_MTP
-                                                           : JANAS_SPEC_LOOKUP,
-                                     .spec_k = 4,
-                                     .eos = -1};
+    struct janas_gen_options spec = {.spec_mode = mode,
+                                     .spec_k = (int)drafts,
+                                     .eos = -1,
+                                     .spec_planner = planner,
+                                     .spec_explore_percent = 20,
+                                     .draft_vocab_policy = vocab_policy,
+                                     .draft_vocab_rows = rows};
     int32_t g1[G1], g2[G2], h1[G1], h2[G2], once[G2];
     int32_t seq[NA + G1 + NB];
     int ok = 1;

@@ -347,6 +347,9 @@ static int32_t load_ids(janas_llm_chat *c, uint32_t reply_off)
         same = 0;
     }
     janas_llm_session_stats(c->s, &c->st0);
+    janas_llm_session_metrics(c->s, &c->gm0);
+    janas_llm_model_runtime_stats(c->llm->m, &c->rt0);
+    janas_llm_mtp_costs(c->llm->m, &c->mt0);
     janas_expert_cache_stats(janas_llm_model_cache(c->llm->m), &c->cs0);
     c->t_send = janas_api_now();
     uint32_t from = janas_api_keep_system(c, same);

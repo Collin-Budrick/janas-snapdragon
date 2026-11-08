@@ -18,6 +18,7 @@
 #include "llm/bf16.h"
 #include "llm/matvec.h"
 #include "llm/quant.h"
+#include "llm/quant_panel.h"
 #include "llm/vmath.h"
 
 static int failures;
@@ -579,6 +580,205 @@ static void test_q6kp_row_tiles_strided(void)
 done:
     janas_pool_destroy(pool);
     free(raw);
+    free(x);
+    free(xf);
+}
+
+/* Prepared panels are optional, but a forced eligible call must use the
+   prepared kernel. Padding for direct calls differs from the matrix API's
+   contiguous weight rows; both routes share padded activation/output strides. */
+static void test_prepared_rows(void)
+{
+    enum {
+        NB = 9, NV = 9, ROWS = 5, CASES = 5, XS = NB + 2,
+        YS = ROWS + 3, GUARD = 4, OUT = 2 * GUARD + (NV + 1) * YS,
+        WROW = ((NB * sizeof(struct janas_block_q6k) + 15) / 16 + 1) * 16,
+        PB = NB * JANAS_Q6KP_PLANE + 7, PACK = 4 * NB * 512
+    };
+    static const size_t blocks[] = {1, 2, 8, 9};
+    static const uint16_t scales[] = {0x0000, 0x8000, 0x0001, 0x03ff,
+                                      0x0400, 0x3c00, 0xbc00, 0x7bff};
+    static const int types[CASES] = {JANAS_Q4_K, JANAS_Q6_K, JANAS_Q6_K_P,
+                                      JANAS_Q6_K_P, JANAS_Q6_K_P};
+    static const int levels[CASES] = {0, 0, 1, 2, 3};
+    struct janas_block_q4k *q4 = malloc(ROWS * NB * sizeof(*q4));
+    struct janas_block_q6k *q6 = malloc(ROWS * NB * sizeof(*q6));
+    struct janas_block_q6kp *base = malloc(ROWS * NB * sizeof(*base));
+    uint8_t *p1 = malloc(ROWS * NB * JANAS_Q6KP_PLANE);
+    uint8_t *p0 = malloc(ROWS * NB * JANAS_Q6KP_PLANE);
+    struct janas_block_q8k *x = calloc(NV * XS, sizeof(*x));
+    float *xf = malloc(NB * JANAS_QK * sizeof(*xf));
+    _Alignas(16) uint8_t pad4[ROWS * WROW + 16];
+    _Alignas(16) uint8_t pad6[ROWS * WROW + 16];
+    _Alignas(16) uint8_t padbase[ROWS * WROW + 16];
+    _Alignas(16) uint8_t pad1[ROWS * PB + 16], pad0[ROWS * PB + 16];
+    _Alignas(16) int8_t storage[PACK];
+    float out[CASES][OUT], ref[CASES][NV][ROWS];
+    struct janas_pool *pool = janas_pool_create(2, NULL);
+    int enabled = 0;
+#if defined(__aarch64__)
+    const char *kernel = getenv("JANAS_KERNELS"),
+               *tiles = getenv("JANAS_CPU_TILES");
+    enabled = janas_cpu_arm_dotprod() && janas_cpu_arm_i8mm() &&
+              !(kernel && strcmp(kernel, "ref") == 0) &&
+              tiles && atoi(tiles) > 0;
+#endif
+    CHECK(janas_quant_panels_enabled() == enabled,
+          "prepared dispatch disagrees with hardware/environment");
+    CHECK(q4 && q6 && base && p1 && p0 && x && xf && pool,
+          "prepared fixture allocation");
+    if (!q4 || !q6 || !base || !p1 || !p0 || !x || !xf || !pool)
+        goto done;
+    for (size_t bi = 0; bi < sizeof blocks / sizeof *blocks; bi++) {
+        size_t nb = blocks[bi];
+        size_t rb4 = (nb * sizeof(*q4) + 15) / 16 * 16 + 16;
+        size_t rb6 = (nb * sizeof(*q6) + 15) / 16 * 16 + 16;
+        size_t rbp = (nb * sizeof(*base) + 15) / 16 * 16 + 16;
+        size_t pb = nb * JANAS_Q6KP_PLANE + 7;
+        for (int trial = 0; trial < 2; trial++) {
+            random_q4k(q4, ROWS * nb);
+            for (size_t i = 0; i < ROWS * nb * sizeof(*q6); i++)
+                ((uint8_t *)q6)[i] = (uint8_t)rnd();
+            for (size_t b = 0; b < ROWS * nb; b++) {
+                q4[b].d = scales[b % 8];
+                q4[b].dmin = scales[(3 * b + 1) % 8];
+                q6[b].d = scales[(b + 4 * (size_t)trial) % 8];
+                for (int g = 0; g < 16; g++)
+                    if ((g + b + (size_t)trial) % 3 != 0)
+                        q6[b].scales[g] = (g & 1) ? 127 : -128;
+                if (trial) {
+                    /* q=1, scale=min=63 gives identical large chains in
+                       block 0. Later positive, tiny terms disappear in acc,
+                       whereas folding the minima per block retains them. */
+                    memset(q4[b].qs, 0x11, sizeof q4[b].qs);
+                    memset(q4[b].scales, 0xff, sizeof q4[b].scales);
+                    q4[b].d = b % nb == 0 ? 0x7bff : 0x0001;
+                    q4[b].dmin = b % nb == 0 ? 0x7bff : 0;
+                }
+            }
+            janas_q6k_to_planes(q6, ROWS * nb, base, p1, p0);
+            memset(pad4, 0xa5, sizeof pad4);
+            memset(pad6, 0xa5, sizeof pad6);
+            memset(padbase, 0xa5, sizeof padbase);
+            memset(pad1, 0xa5, sizeof pad1);
+            memset(pad0, 0xa5, sizeof pad0);
+            for (size_t r = 0; r < ROWS; r++) {
+                memcpy(pad4 + 2 + r * rb4, q4 + r * nb, nb * sizeof(*q4));
+                memcpy(pad6 + 2 + r * rb6, q6 + r * nb, nb * sizeof(*q6));
+                memcpy(padbase + 2 + r * rbp, base + r * nb,
+                       nb * sizeof(*base));
+                memcpy(pad1 + 1 + r * pb, p1 + r * nb * JANAS_Q6KP_PLANE,
+                       nb * JANAS_Q6KP_PLANE);
+                memcpy(pad0 + 3 + r * pb, p0 + r * nb * JANAS_Q6KP_PLANE,
+                       nb * JANAS_Q6KP_PLANE);
+            }
+            memset(x, 0, NV * XS * sizeof(*x));
+            for (size_t v = 0; v < NV; v++) {
+                for (size_t i = 0; i < nb * JANAS_QK; i++)
+                    xf[i] = trial
+                                ? 0.05f + (float)((i + 13 * v) % 31) / 31.0f
+                                : rndf(-1.0f, 1.0f);
+                janas_q8k_quantize(xf, x + v * XS, nb * JANAS_QK);
+            }
+            for (size_t c = 0; c < CASES; c++)
+                for (size_t v = 0; v < NV; v++)
+                    for (size_t r = 0; r < ROWS; r++) {
+                        const uint8_t *a1 =
+                            levels[c] >= 2
+                                ? p1 + r * nb * JANAS_Q6KP_PLANE : NULL;
+                        const uint8_t *a0 =
+                            levels[c] >= 3
+                                ? p0 + r * nb * JANAS_Q6KP_PLANE : NULL;
+                        ref[c][v][r] = c == 0
+                            ? janas_q4k_dot_ref(q4 + r * nb, x + v * XS, nb)
+                            : c == 1
+                                ? janas_q6k_dot_ref(q6 + r * nb,
+                                                   x + v * XS, nb)
+                                : janas_q6kp_dot_ref(base + r * nb, a1, a0,
+                                                      x + v * XS, nb);
+                        CHECK(isfinite(ref[c][v][r]),
+                              "prepared finite fixture: case %zu nb %zu", c,
+                              nb);
+                    }
+            if (trial && nb >= 2)
+                CHECK(ref[0][0][0] == 0.0f &&
+                          janas_q4k_dot_ref(q4 + 1, x + 1, 1) > 0.0f,
+                      "prepared Q4 cancellation fixture ineffective");
+            for (size_t nv = 1; nv <= NV; nv++) {
+                struct janas_q8k_panel panel = {0};
+                size_t bytes = janas_q8k_panel_bytes(nb, nv);
+                int rc = janas_q8k_panel_pack(&panel, bytes ? storage : NULL,
+                                              bytes, x, XS, nb, nv);
+                CHECK(rc == 0, "prepared panel: nb %zu nv %zu", nb, nv);
+                if (rc != 0)
+                    continue;
+                struct janas_matvec_task tasks[CASES];
+                for (size_t c = 0; c < CASES; c++) {
+                    const void *packed = c == 0 ? (const void *)q4
+                                         : c == 1 ? (const void *)q6 : base;
+                    const uint8_t *weight = c == 0 ? pad4 + 2
+                                             : c == 1 ? pad6 + 2 : padbase + 2;
+                    size_t rb = c == 0 ? rb4 : c == 1 ? rb6 : rbp;
+                    const uint8_t *a1 = levels[c] >= 2 ? pad1 + 1 : NULL;
+                    const uint8_t *a0 = levels[c] >= 3 ? pad0 + 3 : NULL;
+                    for (size_t i = 0; i < OUT; i++)
+                        out[c][i] = -12345.0f;
+                    size_t nr = janas_dot_prepared_rows(
+                        types[c], weight, rb, a1, a0, pb, &panel, ROWS,
+                        out[c] + GUARD, YS);
+                    CHECK(nr == (enabled ? 4u : 0u),
+                          "prepared path unused/wrong rows: case %zu nb %zu nv %zu rows %zu",
+                          c, nb, nv, nr);
+                    size_t safe = nr <= ROWS ? nr : 0;
+                    size_t bad = q6kp_tile_bad(out[c], OUT, GUARD, YS, nv,
+                                              safe, &ref[c][0][0], ROWS);
+                    CHECK(bad == OUT,
+                          "prepared direct bits/guard: trial %d case %zu nb %zu nv %zu index %zu",
+                          trial, c, nb, nv, bad);
+                    for (size_t r = safe; r < ROWS; r++) {
+                        const void *row = weight + r * rb;
+                        if (c < 2)
+                            janas_dot_multi(types[c], row, x, XS, nv, nb,
+                                            out[c] + GUARD + r, YS);
+                        else
+                            janas_q6kp_dot_multi(
+                                row, a1 ? a1 + r * pb : NULL,
+                                a0 ? a0 + r * pb : NULL, x, XS, nv, nb,
+                                out[c] + GUARD + r, YS);
+                    }
+                    bad = q6kp_tile_bad(out[c], OUT, GUARD, YS, nv, ROWS,
+                                       &ref[c][0][0], ROWS);
+                    CHECK(bad == OUT,
+                          "prepared row tail bits: case %zu nb %zu nv %zu index %zu",
+                          c, nb, nv, bad);
+                    for (size_t i = 0; i < OUT; i++)
+                        out[c][i] = -12345.0f;
+                    tasks[c] = (struct janas_matvec_task){
+                        .type = types[c], .w = packed,
+                        .plane = {levels[c] >= 2 ? p1 : NULL,
+                                  levels[c] >= 3 ? p0 : NULL},
+                        .x = x, .y = out[c] + GUARD, .rows = ROWS,
+                        .cols = nb * JANAS_QK, .n_vec = nv,
+                        .x_stride = XS, .y_stride = YS};
+                }
+                janas_matvec_q4k_group(pool, tasks, CASES);
+                for (size_t c = 0; c < CASES; c++) {
+                    size_t bad = q6kp_tile_bad(out[c], OUT, GUARD, YS, nv,
+                                              ROWS, &ref[c][0][0], ROWS);
+                    CHECK(bad == OUT,
+                          "prepared grouped bits/guard: trial %d case %zu nb %zu nv %zu index %zu",
+                          trial, c, nb, nv, bad);
+                }
+            }
+        }
+    }
+done:
+    janas_pool_destroy(pool);
+    free(q4);
+    free(q6);
+    free(base);
+    free(p1);
+    free(p0);
     free(x);
     free(xf);
 }
@@ -2672,6 +2872,7 @@ int main(void)
     test_q6k_planes();
     test_q6k_planes_strided();
     test_q6kp_row_tiles_strided();
+    test_prepared_rows();
     test_q6kpn_axpy();
     test_q6kpn_chunk();
     test_matvec();

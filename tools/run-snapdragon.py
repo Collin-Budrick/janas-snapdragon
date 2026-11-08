@@ -7,18 +7,25 @@ use that host's syntax or be project-relative; Windows paths are not mapped.
 This tool never chooses a benchmark winner or claims accelerator execution.
 Inherited JANAS_KV and JANAS_ATTN overrides are cleared to retain the model's
 architecture defaults; HIGH preserves weight precision, not FP32 cache storage.
-Inherited JANAS_CPU_TILES is cleared to retain automatic CPU tiling policy.
+Inherited CPU tiling overrides are cleared before case.panels selects its policy.
 
 Profile schema 1: model and optional mtp identities contain path, size and
 first_mib_sha256 (mtime_ns is optional). case contains profile (cpu, cpu+gpu,
-cpu+npu, cpu+gpu+npu), speculation (none, lookup, mtp, auto), threads,
+cpu+npu, cpu+gpu+npu), speculation (none, lookup, mtp, hybrid, auto), threads,
 cache_gib, draft_tokens, prompt_on, drafts_on and reply_on. Optional case.prefetch
 is auto (default), off, decode-off or prompt-off; inherited prefetch overrides
 are cleared. Optional case.gpu_min_tokens and case.npu_min_tokens are manual
 thresholds in 0..256; default 0 clears inherited overrides and uses the runtime
 policy. Optional case.npu_min_macs is 0..2^63-1 (default 0); a positive value
 filters Hexagon matrices by rows*columns*batch before preparing device weights.
-settings optionally
+Optional case.spec_planner is legacy/cycle/fixed (default legacy), spec_explore
+is an integer in 0..100 (default 20), draft_vocab is legacy/adaptive (default
+legacy), and draft_vocab_rows is 0/8192/16384/32768 (default 0). MTP and hybrid
+modes require a frozen mtp identity. Optional integer gdn_chain, gdn_journal
+and gdn_k_only are 0/1 (default 0); journal requires chain, and k_only requires
+journal. Optional panels is auto/off/experimental (default auto), selecting
+an unset/0/1 JANAS_CPU_TILES override. Controlled settings replace inherited
+overrides and appear in the dry-run environment report. settings optionally
 contains ctx, reserve_gib, seed, temperature, max_reply and preload. NPU
 profiles require runtime.hexagon_root and may name host_bin and an
 adsp_library_path list; defaults are <hexagon_root>/bin and /htp. Paths are
@@ -36,6 +43,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
 import subprocess
 import sys
 from typing import Any
@@ -44,19 +52,27 @@ ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {"cpu": (False, False), "cpu+gpu": (True, False),
             "cpu+npu": (False, True), "cpu+gpu+npu": (True, True)}
 DEVICES = {"cpu", "gpu", "npu", "npu+gpu"}
-MODES = {"none", "lookup", "mtp", "auto"}
+MODES = {"none", "lookup", "mtp", "hybrid", "auto"}
+SPEC_PLANNERS = {"legacy", "cycle", "fixed"}
+DRAFT_VOCAB_POLICIES = {"legacy", "adaptive"}
+DRAFT_VOCAB_ROWS = {0, 8192, 16384, 32768}
+PANEL_POLICIES = {"auto": None, "off": "0", "experimental": "1"}
 PREFETCH_POLICIES = {"auto": {}, "off": {"JANAS_PREFETCH": "0", "JANAS_PREFETCH_PREFILL": "0"},
     "decode-off": {"JANAS_PREFETCH": "0"}, "prompt-off": {"JANAS_PREFETCH_PREFILL": "0"}}
 PERFORMANCE_ENV = ("JANAS_KERNELS", "JANAS_EXPERTS", "JANAS_GPU_ALWAYS",
     "JANAS_NPU_ALWAYS", "JANAS_BLOCK_THREADS", "JANAS_GPU_TOKEN",
     "JANAS_GPU_WHOLE", "JANAS_GPU_FAST_PROMPT", "JANAS_GPU_EXPERT_SHARE",
     "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS", "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL",
-    "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES")
+    "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES", "JANAS_SPEC_PLANNER",
+    "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
+    "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY")
 PROFILE_ENV = {"JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG",
     "JANAS_TUNE", "JANAS_TUNE_THREADS", "JANAS_WARM", "JANAS_MISS_SKIP",
     "JANAS_EXPERT_BITS", "JANAS_HEAD_BITS", "JANAS_HEXAGON_ROOT", "ADSP_LIBRARY_PATH",
     "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS",
-    "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES"}
+    "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES", "JANAS_SPEC_PLANNER",
+    "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
+    "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY"}
 
 
 def number(value: Any, name: str, low: float, high: float, integer: bool = False) -> Any:
@@ -109,6 +125,25 @@ def load_profile(path: Path, root: Path = ROOT) -> dict[str, Any]:
         or case["speculation"] not in MODES):
         raise ValueError("case must select a known hardware profile and speculation mode")
     case = case.copy()
+    for key, default, choices in (("spec_planner", "legacy", SPEC_PLANNERS),
+                                  ("draft_vocab", "legacy", DRAFT_VOCAB_POLICIES),
+                                  ("panels", "auto", PANEL_POLICIES)):
+        case.setdefault(key, default)
+        if not isinstance(case[key], str) or case[key] not in choices:
+            raise ValueError(f"case.{key} must be one of: " + ", ".join(sorted(choices)))
+    case.setdefault("spec_explore", 20)
+    number(case["spec_explore"], "case.spec_explore", 0, 100, True)
+    case.setdefault("draft_vocab_rows", 0)
+    number(case["draft_vocab_rows"], "case.draft_vocab_rows", 0, 32768, True)
+    if case["draft_vocab_rows"] not in DRAFT_VOCAB_ROWS:
+        raise ValueError("case.draft_vocab_rows must be 0, 8192, 16384 or 32768")
+    for key in ("gdn_chain", "gdn_journal", "gdn_k_only"):
+        case.setdefault(key, 0)
+        number(case[key], f"case.{key}", 0, 1, True)
+    if case["gdn_journal"] and not case["gdn_chain"]:
+        raise ValueError("case.gdn_journal requires case.gdn_chain=1")
+    if case["gdn_k_only"] and not case["gdn_journal"]:
+        raise ValueError("case.gdn_k_only requires case.gdn_journal=1")
     case.setdefault("prefetch", "auto")
     if not isinstance(case["prefetch"], str) or case["prefetch"] not in PREFETCH_POLICIES:
         raise ValueError("case.prefetch must be auto, off, decode-off or prompt-off")
@@ -126,8 +161,8 @@ def load_profile(path: Path, root: Path = ROOT) -> dict[str, Any]:
         if (not isinstance(device, str) or device not in DEVICES
             or ("gpu" in device and not gpu) or ("npu" in device and not npu)):
             raise ValueError(f"case.{phase} is incompatible with the hardware profile")
-    if case["speculation"] == "mtp" and mtp is None:
-        raise ValueError("MTP speculation requires a frozen mtp identity")
+    if case["speculation"] in ("mtp", "hybrid") and mtp is None:
+        raise ValueError("MTP and hybrid speculation require a frozen mtp identity")
     settings = profile.get("settings", {})
     if not isinstance(settings, dict):
         raise ValueError("settings must be an object")
@@ -166,6 +201,19 @@ def launch_environment(profile: dict[str, Any], inherited: dict[str, str]) -> di
     env = inherited.copy()
     for key in PERFORMANCE_ENV:
         env.pop(key, None)
+    case = profile["case"]
+    for key, name, default in (
+            ("spec_planner", "JANAS_SPEC_PLANNER", "legacy"),
+            ("spec_explore", "JANAS_SPEC_EXPLORE", 20),
+            ("draft_vocab", "JANAS_DRAFT_VOCAB_POLICY", "legacy"),
+            ("draft_vocab_rows", "JANAS_DRAFT_VOCAB_ROWS", 0),
+            ("gdn_chain", "JANAS_GDN_CHAIN", 0),
+            ("gdn_journal", "JANAS_GDN_JOURNAL", 0),
+            ("gdn_k_only", "JANAS_GDN_K_ONLY", 0)):
+        env[name] = str(case.get(key, default))
+    panel = PANEL_POLICIES[case.get("panels", "auto")]
+    if panel is not None:
+        env["JANAS_CPU_TILES"] = panel
     env.update(PREFETCH_POLICIES[profile["case"].get("prefetch", "auto")])
     for key, name in (("gpu_min_tokens", "JANAS_GPU_MIN_N"),
                       ("npu_min_tokens", "JANAS_NPU_MIN_N"),
@@ -193,9 +241,14 @@ def launch_command(profile: dict[str, Any], app: str, executable: Path,
     command = [str(executable), str(profile["model"]), "--quality", "high",
         "--mode", "max", "--cache", str(c["cache_gib"]), "--reserve", str(s["reserve_gib"]),
         "--ctx", str(s["ctx"]), "--speculation", c["speculation"],
-        "--draft-tokens", str(c["draft_tokens"]), "--prompt-on", c["prompt_on"],
+        "--draft-tokens", str(c["draft_tokens"]),
+        "--spec-planner", c.get("spec_planner", "legacy"),
+        "--spec-explore", str(c.get("spec_explore", 20)),
+        "--draft-vocab", c.get("draft_vocab", "legacy"),
+        "--draft-vocab-rows", str(c.get("draft_vocab_rows", 0)),
+        "--prompt-on", c["prompt_on"],
         "--drafts-on", c["drafts_on"], "--reply-on", c["reply_on"], "--think", "off"]
-    if profile["mtp"] is not None and c["speculation"] in ("mtp", "auto"):
+    if profile["mtp"] is not None and c["speculation"] in ("mtp", "hybrid", "auto"):
         command += ["--mtp", str(profile["mtp"])]
     else:
         command.append("--no-mtp")
@@ -218,8 +271,10 @@ def validate_cli(executable: Path, env: dict[str, str]) -> None:
                             text=True, encoding="utf-8", errors="replace", timeout=30, env=env)
     help_text = result.stdout + result.stderr
     required = ("--speculation", "--draft-tokens", "--quality", "--prompt-on",
-                "--drafts-on", "--reply-on")
-    missing = [x for x in required if x not in help_text]
+                "--drafts-on", "--reply-on", "--spec-planner", "--spec-explore",
+                "--draft-vocab", "--draft-vocab-rows")
+    missing = [x for x in required
+               if not re.search(r"(?<![\w-])" + re.escape(x) + r"(?![\w-])", help_text)]
     if missing:
         raise ValueError("Rebuild the selected app; missing CLI options: " + ", ".join(missing))
 

@@ -70,6 +70,8 @@
 #include "llm/quant.h"
 #include "common/words.h"
 #include "janas/llm.h"
+#include "llm/spec_config.h"
+#include "llm/spec_json.h"
 #include "llm/api_internal.h"
 #include "llm/expert_cache.h"
 #include "llm/generate.h"
@@ -226,8 +228,8 @@ struct fair_options {
 
 static const char *spec_name(int mode)
 {
-    static const char *const names[] = {"none", "auto", "lookup", "mtp"};
-    return mode >= 0 && mode <= 3 ? names[mode] : "unknown";
+    static const char *const names[] = {"none", "auto", "lookup", "mtp", "hybrid"};
+    return mode >= 0 && mode <= 4 ? names[mode] : "unknown";
 }
 
 static int fair_threads(int n)
@@ -646,6 +648,16 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
         json_text(&b, "model", path);
         json_text(&b, "speculation", spec_name(f->speculation));
         json_text(&b, "speculation_resolved", spec_name(resolved));
+        struct janas_llm_speculation_config sc;
+        janas_llm_speculation_config_default(&sc);
+        char config_error[160];
+        if (janas_spec_config_env(&sc, config_error, sizeof config_error) != 0) {
+            fprintf(stderr, "janas-bench: %s\n", config_error); goto failed;
+        }
+        const char *const planners[] = {"legacy", "cycle", "fixed"};
+        json_text(&b, "spec_planner", planners[sc.planner]);
+        json_text(&b, "draft_vocab", sc.draft_vocab_policy ? "adaptive" : "legacy");
+        janas_buf_printf(&b, "\"spec_explore\":%d,\"draft_vocab_rows\":%u,", sc.explore_percent, sc.draft_vocab_rows);
         json_text(&b, "gpu", gpu ? janas_gpu_name(gpu) : "");
         json_text(&b, "gpu_unavailable_reason",
                   gpu ? "" : janas_llm_model_gpu_why(m));
@@ -816,6 +828,13 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
                 janas_llm_model_gpu_used(m), janas_llm_model_npu_used(m));
             fair_caches_json(&b, &cache_delta, p->cache_bytes, 1);
             fair_accel_json(&b, &accel1, &accel0);
+            struct janas_llm_speculation_metrics sm = {
+                .size = sizeof sm, .version = JANAS_LLM_SPEC_METRICS_VERSION};
+            if (janas_llm_chat_speculation_metrics(c, &sm) != JANAS_LLM_OK) {
+                janas_llm_chat_destroy(c); goto failed;
+            }
+            janas_buf_puts(&b, ",\"speculation_metrics\":");
+            janas_spec_metrics_json(&b, &sm);
             if (f->profile_phases)
                 fair_profile_json(&b, &profile, st.output_tokens);
             if (json_line(&b) != 0) {
@@ -880,10 +899,11 @@ int main(int argc, char **argv)
                 "[--reserve <GiB>] [--rounds <n>] [--settle <seconds>] "
                 "[--no-npu] [--prompt-on <devices>] [--drafts-on <devices>] "
                 "[--reply-on <devices>] [--npu-int8] [--gpu-profile]\n"
-                "fair chat mode: --speculation none|lookup|mtp|auto "
+                "fair chat mode: --speculation none|lookup|mtp|hybrid|auto "
                 "[--draft-tokens <1..16>] [--prompt-file <utf8>] "
                 "[--seed <n>] [--threads <n>] [--warmups <n>] [--json] "
                 "[--profile-phases]\n"
+                JANAS_SPEC_RUNTIME_HELP
                 "--profile-phases: diagnostic phase wall times per chat and "
                 "reply tail (first output call excluded); JANAS_POOLTRACE=1 "
                 "and JANAS_EXPTRACE=1 add nested detail on stderr. "
@@ -911,7 +931,8 @@ int main(int argc, char **argv)
         "--reserve",   "--settle",   "--no-npu",   "--prompt-on",
         "--drafts-on", "--reply-on", "--npu-int8", "--gpu-profile",
         "--speculation", "--draft-tokens", "--prompt-file", "--seed",
-        "--threads", "--warmups", "--json", "--profile-phases"};
+        "--threads", "--warmups", "--json", "--profile-phases",
+        "--spec-planner", "--spec-explore", "--draft-vocab", "--draft-vocab-rows"};
     for (int i = 1; i < argc; i += 2) {
         const char *a = argv[i], *v = i + 1 < argc ? argv[i + 1] : NULL;
         char why[200] = "";
@@ -920,6 +941,13 @@ int main(int argc, char **argv)
         if (a[0] != '-' && !model) {
             model = a;
             i--;
+            continue;
+        }
+        if (janas_spec_runtime_is_option(a)) {
+            if (janas_spec_runtime_option(a, v, why, sizeof why) < 0) {
+                fprintf(stderr, "janas-bench: %s\n", why); return 2;
+            }
+            fair.enabled = 1;
             continue;
         }
         if (strcmp(a, "--no-mtp") == 0) {
@@ -969,8 +997,10 @@ int main(int argc, char **argv)
                 fair.speculation = JANAS_LLM_SPEC_LOOKUP;
             else if (strcmp(v, "mtp") == 0)
                 fair.speculation = JANAS_LLM_SPEC_MTP;
+            else if (strcmp(v, "hybrid") == 0)
+                fair.speculation = JANAS_LLM_SPEC_HYBRID;
             else
-                snprintf(why, sizeof why, "expected none, lookup, mtp or auto");
+                snprintf(why, sizeof why, "expected none, lookup, mtp, hybrid or auto");
         } else if (strcmp(a, "--prompt-file") == 0 && v) {
             fair.enabled = 1;
             fair.prompt_file = v;

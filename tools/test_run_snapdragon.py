@@ -71,6 +71,101 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn("JANAS_CPU_TILES", env)
         self.assertEqual(inherited, before)
 
+    def test_old_profile_uses_explicit_legacy_controls_and_preserves_parent_env(self):
+        profile = self.load()
+        expected = {"spec_planner": "legacy", "spec_explore": 20,
+            "draft_vocab": "legacy", "draft_vocab_rows": 0,
+            "gdn_chain": 0, "gdn_journal": 0, "gdn_k_only": 0, "panels": "auto"}
+        for key, value in expected.items():
+            self.assertEqual(profile["case"][key], value)
+        controlled = {"JANAS_SPEC_PLANNER": "legacy", "JANAS_SPEC_EXPLORE": "20",
+            "JANAS_DRAFT_VOCAB_POLICY": "legacy", "JANAS_DRAFT_VOCAB_ROWS": "0",
+            "JANAS_GDN_CHAIN": "0", "JANAS_GDN_JOURNAL": "0", "JANAS_GDN_K_ONLY": "0"}
+        inherited = {key: "hostile inherited value" for key in controlled}
+        inherited.update(JANAS_CPU_TILES="1", KEEP_ME="parent value",
+                         JANAS_API_KEY="unreported parent credential")
+        before = inherited.copy()
+        env = launcher.launch_environment(profile, inherited)
+        for key, value in controlled.items():
+            self.assertEqual(env[key], value)
+            self.assertIn(key, launcher.PERFORMANCE_ENV)
+            self.assertIn(key, launcher.PROFILE_ENV)
+        self.assertNotIn("JANAS_CPU_TILES", env)
+        self.assertEqual(env["KEEP_ME"], "parent value")
+        self.assertEqual(env["JANAS_API_KEY"], "unreported parent credential")
+        self.assertEqual(inherited, before)
+
+    def test_planner_controls_are_bounded_and_replayed_in_environment_and_cli(self):
+        for planner in ("legacy", "cycle", "fixed"):
+            for explore in (0, 20, 100):
+                with self.subTest(planner=planner, explore=explore):
+                    self.profile["case"].update(spec_planner=planner, spec_explore=explore)
+                    profile = self.load()
+                    env = launcher.launch_environment(profile,
+                        {"JANAS_SPEC_PLANNER": "other", "JANAS_SPEC_EXPLORE": "99"})
+                    self.assertEqual(env["JANAS_SPEC_PLANNER"], planner)
+                    self.assertEqual(env["JANAS_SPEC_EXPLORE"], str(explore))
+                    command = launcher.launch_command(profile, "server", Path("server.exe"),
+                                                      "127.0.0.1", 8081, False)
+                    self.assertEqual(command[command.index("--spec-planner") + 1], planner)
+                    self.assertEqual(command[command.index("--spec-explore") + 1], str(explore))
+
+    def test_draft_vocab_policies_and_rows_replay_exactly(self):
+        for policy in ("legacy", "adaptive"):
+            for rows in (0, 8192, 16384, 32768):
+                with self.subTest(policy=policy, rows=rows):
+                    self.profile["case"].update(draft_vocab=policy, draft_vocab_rows=rows)
+                    profile = self.load()
+                    env = launcher.launch_environment(profile,
+                        {"JANAS_DRAFT_VOCAB_POLICY": "other", "JANAS_DRAFT_VOCAB_ROWS": "1"})
+                    self.assertEqual(env["JANAS_DRAFT_VOCAB_POLICY"], policy)
+                    self.assertEqual(env["JANAS_DRAFT_VOCAB_ROWS"], str(rows))
+                    command = launcher.launch_command(profile, "chat", Path("chat.exe"),
+                                                      "127.0.0.1", 8080, False)
+                    self.assertEqual(command[command.index("--draft-vocab") + 1], policy)
+                    self.assertEqual(command[command.index("--draft-vocab-rows") + 1], str(rows))
+
+    def test_new_control_validation_rejects_wrong_types_and_unknown_values(self):
+        invalid = {"spec_planner": ("unknown", [], None, True),
+            "spec_explore": (-1, 101, True, 20.0, "20", float("nan")),
+            "draft_vocab": ("unknown", [], None, True),
+            "draft_vocab_rows": (1, 8193, 65536, True, 8192.0, "8192"),
+            "panels": ("unknown", [], None, True)}
+        for key in ("gdn_chain", "gdn_journal", "gdn_k_only"):
+            invalid[key] = (-1, 2, True, 1.0, "1", None)
+        for key, values in invalid.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    self.profile["case"][key] = value
+                    with self.assertRaisesRegex(ValueError, "case." + key):
+                        self.load()
+                    del self.profile["case"][key]
+
+    def test_recurrent_controls_enforce_dependencies(self):
+        keys = ("gdn_chain", "gdn_journal", "gdn_k_only")
+        for values in ((0, 0, 0), (1, 0, 0), (1, 1, 0), (1, 1, 1)):
+            with self.subTest(values=values):
+                self.profile["case"].update(zip(keys, values))
+                env = launcher.launch_environment(self.load(),
+                    {"JANAS_GDN_CHAIN": "9", "JANAS_GDN_JOURNAL": "9", "JANAS_GDN_K_ONLY": "9"})
+                self.assertEqual(tuple(env["JANAS_" + key.upper()] for key in keys),
+                                 tuple(str(value) for value in values))
+        for values in ((0, 1, 0), (0, 1, 1), (0, 0, 1), (1, 0, 1)):
+            with self.subTest(values=values):
+                self.profile["case"].update(zip(keys, values))
+                with self.assertRaisesRegex(ValueError, "requires"):
+                    self.load()
+
+    def test_panel_policies_replace_inherited_tiling(self):
+        for policy, value in (("auto", None), ("off", "0"), ("experimental", "1")):
+            with self.subTest(policy=policy):
+                self.profile["case"]["panels"] = policy
+                inherited = {"JANAS_CPU_TILES": "hostile", "UNCHANGED": "yes"}
+                env = launcher.launch_environment(self.load(), inherited)
+                self.assertEqual(env.get("JANAS_CPU_TILES"), value)
+                self.assertEqual(inherited["JANAS_CPU_TILES"], "hostile")
+                self.assertEqual(env["UNCHANGED"], "yes")
+
     def test_manual_accelerator_thresholds_override_only_when_positive(self):
         self.profile["case"].update(gpu_min_tokens=1, npu_min_tokens=8)
         env = launcher.launch_environment(self.load(),
@@ -116,8 +211,26 @@ class LauncherTests(unittest.TestCase):
                 self.profile["case"][key] = old
 
     def test_forced_mtp_requires_a_frozen_head(self):
-        self.profile["case"]["speculation"] = "mtp"
-        with self.assertRaisesRegex(ValueError, "mtp identity"):
+        for mode in ("mtp", "hybrid"):
+            self.profile["case"]["speculation"] = mode
+            with self.subTest(mode=mode), self.assertRaisesRegex(ValueError, "mtp identity"):
+                self.load()
+
+    def test_hybrid_requires_and_loads_the_frozen_mtp_head_for_each_app(self):
+        mtp = self.root / "model-mtp.jns"
+        mtp.write_bytes(b"mtp fixture\n")
+        self.profile["mtp"] = self.identity(mtp)
+        self.profile["case"]["speculation"] = "hybrid"
+        profile = self.load()
+        for app in ("chat", "server"):
+            with self.subTest(app=app):
+                command = launcher.launch_command(profile, app, Path(app + ".exe"),
+                                                  "127.0.0.1", 8080, False)
+                self.assertEqual(command[command.index("--speculation") + 1], "hybrid")
+                self.assertEqual(command[command.index("--mtp") + 1], str(mtp))
+                self.assertNotIn("--no-mtp", command)
+        mtp.write_bytes(b"bad fixture\n")
+        with self.assertRaises(ValueError):
             self.load()
 
     def test_chat_command_reproduces_explicit_settings(self):
@@ -125,7 +238,9 @@ class LauncherTests(unittest.TestCase):
         command = launcher.launch_command(profile, "chat", self.root / "chat.exe", "127.0.0.1", 8080, False)
         for key, value in (("--speculation", "lookup"), ("--draft-tokens", "2"),
                            ("--cache", "24"), ("--quality", "high"), ("--bits", "6"),
-                           ("--head", "6"), ("--ctx", "4096"), ("--seed", "123")):
+                           ("--head", "6"), ("--ctx", "4096"), ("--seed", "123"),
+                           ("--spec-planner", "legacy"), ("--spec-explore", "20"),
+                           ("--draft-vocab", "legacy"), ("--draft-vocab-rows", "0")):
             self.assertEqual(command[command.index(key) + 1], value)
         self.assertIn("--no-mtp", command)
         self.assertIn("--no-tune", command)
@@ -177,6 +292,46 @@ class LauncherTests(unittest.TestCase):
         with patch.object(launcher.subprocess, "run", return_value=response):
             with self.assertRaisesRegex(ValueError, "Rebuild"):
                 launcher.validate_cli(Path("old.exe"), {})
+
+    def test_apps_with_only_old_profile_flags_are_rejected(self):
+        old = "--speculation --draft-tokens --quality --prompt-on --drafts-on --reply-on"
+        response = subprocess.CompletedProcess([], 0, old, "")
+        with patch.object(launcher.subprocess, "run", return_value=response):
+            with self.assertRaisesRegex(ValueError, "spec-planner"):
+                launcher.validate_cli(Path("old.exe"), {})
+        updated = old + " --spec-planner --spec-explore --draft-vocab --draft-vocab-rows"
+        response.stdout = updated
+        with patch.object(launcher.subprocess, "run", return_value=response):
+            launcher.validate_cli(Path("updated.exe"), {})
+        response.stdout = updated.replace(" --draft-vocab ", " ")
+        with patch.object(launcher.subprocess, "run", return_value=response):
+            with self.assertRaisesRegex(ValueError, "--draft-vocab$"):
+                launcher.validate_cli(Path("missing-policy.exe"), {})
+
+    def test_dry_run_records_selected_controls_without_inherited_values(self):
+        self.profile["case"].update(spec_planner="cycle", spec_explore=0,
+            draft_vocab="adaptive", draft_vocab_rows=8192,
+            gdn_chain=1, gdn_journal=1, gdn_k_only=1, panels="off")
+        self.load()
+        exe = self.root / "not-an-executable.exe"
+        exe.write_text("No child app is launched.", encoding="utf-8")
+        env = os.environ.copy()
+        env.update({key: "inherited-secret-test" for key in (
+            "JANAS_SPEC_PLANNER", "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY",
+            "JANAS_DRAFT_VOCAB_ROWS", "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL",
+            "JANAS_GDN_K_ONLY", "JANAS_CPU_TILES", "JANAS_API_KEY")})
+        result = subprocess.run([sys.executable, "-B", str(Path(launcher.__file__)),
+            "--profile", str(self.path), "--exe", str(exe), "--dry-run"],
+            env=env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("inherited-secret-test", result.stdout)
+        recorded = json.loads(result.stdout)["environment"]
+        expected = {"JANAS_SPEC_PLANNER": "cycle", "JANAS_SPEC_EXPLORE": "0",
+            "JANAS_DRAFT_VOCAB_POLICY": "adaptive", "JANAS_DRAFT_VOCAB_ROWS": "8192",
+            "JANAS_GDN_CHAIN": "1", "JANAS_GDN_JOURNAL": "1", "JANAS_GDN_K_ONLY": "1",
+            "JANAS_CPU_TILES": "0"}
+        for key, value in expected.items():
+            self.assertEqual(recorded[key], value)
 
 
 if __name__ == "__main__":

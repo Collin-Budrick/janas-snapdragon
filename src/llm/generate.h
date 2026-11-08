@@ -22,6 +22,7 @@ enum janas_spec_mode {
     JANAS_SPEC_LOOKUP = 1, /* drafts copied from the context (n-gram match) */
     JANAS_SPEC_MTP = 2,    /* drafts from the model's MTP block, chained */
     JANAS_SPEC_DRAFT = 3,  /* drafts from a second, smaller model */
+    JANAS_SPEC_HYBRID = 4, /* indexed history first, otherwise the MTP head */
 };
 
 #define JANAS_GEN_MAX_STOP 4
@@ -60,6 +61,58 @@ struct janas_gen_options {
        stop token) */
     int32_t stop[JANAS_GEN_MAX_STOP];
     int n_stop;
+    /* Additive internal controls. Zero preserves the historical planner. */
+    int spec_planner; /* 0: legacy, 1: measured complete cycles, 2: fixed cap */
+    int spec_explore_percent; /* cycle planner probes, 0..100 */
+    int draft_vocab_policy; /* 0: legacy, 1: adaptive draft-only head */
+    uint32_t draft_vocab_rows; /* 0: auto, or 8192/16384/32768 */
+};
+
+enum janas_gen_source {
+    JANAS_GEN_SOURCE_PLAIN = 0,
+    JANAS_GEN_SOURCE_LOOKUP = 1,
+    JANAS_GEN_SOURCE_MTP = 2,
+    JANAS_GEN_SOURCE_DRAFT = 3,
+    JANAS_GEN_SOURCES = 4
+};
+enum janas_gen_guard {
+    JANAS_GEN_GUARD_FILTER = 1,
+    JANAS_GEN_GUARD_PENALTY = 2
+};
+
+/* Decode wall times include waits and setup (prefill remains in gen_stats).
+   Preparation follows its proposal ID
+   into the later verification; target forwards are never charged twice.
+   A rejected verification row is counted as wasted work, not a separately
+   timed replay: the next ordinary target forward already contains that work. */
+struct janas_gen_cycle {
+    uint64_t proposal_id;
+    uint32_t source, planner_source, requested_depth, pass_width, accepted_prefix;
+    uint32_t produced, delivered, buffered, discarded, rejected_rows;
+    uint32_t draft_vocab_policy, draft_vocab_rows, warm, guard_reason, lookup_suffix;
+    uint32_t resolved_planner;
+    double preparation_seconds, verification_seconds, sample_seconds;
+    double maintenance_seconds, controller_seconds, total_seconds;
+};
+
+struct janas_gen_metrics {
+    uint64_t cycles, proposals, verification_rows, accepted_prefix; /* proposals: nonempty */
+    uint64_t produced_tokens, delivered_tokens, discarded_tokens;
+    uint64_t rejected_rows, lookup_hits, lookup_misses;
+    uint64_t filter_guard_cycles, penalty_guard_cycles;
+    uint64_t source_cycles[JANAS_GEN_SOURCES];
+    uint64_t source_drafted[JANAS_GEN_SOURCES], source_accepted[JANAS_GEN_SOURCES];
+    uint64_t source_delivered[JANAS_GEN_SOURCES], source_discarded[JANAS_GEN_SOURCES];
+    uint64_t pass_width_count[JANAS_GEN_MAX_K + 2];
+    uint64_t prefix_count[JANAS_GEN_MAX_K + 1];
+    uint64_t lookup_suffix_count[9];
+    double source_seconds[JANAS_GEN_SOURCES];
+    double cycle_seconds, lookup_seconds, mtp_maintenance_seconds;
+    double mtp_head_seconds, mtp_chain_seconds, mtp_repack_seconds, draft_seconds;
+    double verification_seconds, sample_seconds, controller_seconds;
+    double abandoned_preparation_seconds, pending_preparation_seconds;
+    uint32_t buffered_tokens;
+    struct janas_gen_cycle last;
 };
 
 struct janas_gen_stats {
@@ -215,6 +268,12 @@ struct janas_llm_saved *janas_llm_saved_read(const struct janas_llm_session *s,
 /* Counters since the session was created. */
 void janas_llm_session_stats(const struct janas_llm_session *s,
                              struct janas_gen_stats *st);
+void janas_llm_session_metrics(const struct janas_llm_session *s,
+                               struct janas_gen_metrics *out);
+/* Remaining outputs requested by the caller, including buffered tokens.
+   UINT32_MAX means unknown (the session default). This is only a work hint. */
+void janas_llm_session_reply_remaining(struct janas_llm_session *s,
+                                       uint32_t remaining);
 
 /*
  * Runs the prompt, then appends up to max_new tokens to out (stopping after

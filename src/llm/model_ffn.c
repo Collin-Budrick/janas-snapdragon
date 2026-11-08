@@ -282,6 +282,9 @@ static void run_experts(struct janas_llm_model *m,
     int nf_run = -1;
     for (uint32_t r = 0; r < n_runs; r++) {
         uint32_t a = runs[r].a, cnt = runs[r].b - runs[r].a;
+        m->runtime_stats.expert_assignments += cnt;
+        m->runtime_stats.expert_groups++;
+        m->runtime_stats.expert_group_widths[cnt < 18 ? cnt : 0]++;
         for (uint32_t g = a; g < runs[r].b; g++)
             memcpy(m->xg + (size_t)g * nbd,
                    xs + (size_t)m->pair_tok[m->order[g]] * nbd,

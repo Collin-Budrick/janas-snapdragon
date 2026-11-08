@@ -312,6 +312,23 @@ struct janas_llm_model {
     uint16_t *ssm_buf;
     float *conv_buf;
     float *log_mixed, *log_beta, *log_decay;
+    /* Optional exact GDN recovery journal. Token-major FP32 d values, at
+       most 16 MiB per model; derived scratch, never part of a snapshot.
+       The old prefix is consumed row by row before new deltas overwrite it.
+       Only finish publishes validity after the complete forward succeeds. */
+    float *gdn_delta;
+    size_t gdn_delta_bytes, gdn_delta_stride;
+    uint32_t gdn_delta_capacity, gdn_journal_pos, gdn_journal_n;
+    int gdn_journal_base, gdn_journal_valid;
+    uint64_t gdn_journal_fpcr, gdn_written_mask;
+    uint32_t gdn_pending_pos, gdn_pending_n;
+    int gdn_chain_active, gdn_journal_active, gdn_recover_active,
+        gdn_konly_active;
+    /* Layer-token counts; core_seconds is the combined recurrence pool
+       wall time, not an estimate of isolated recovery when work is fused. */
+    uint64_t gdn_chain_tokens, gdn_journal_replay_tokens,
+        gdn_scalar_replay_tokens, gdn_konly_replay_tokens;
+    double gdn_core_seconds, gdn_conv_seconds;
     int base; /* buffer holding the base */
     int src;  /* this call: buffer the tokens start from */
     uint32_t base_pos, log_n, replay;
@@ -371,6 +388,10 @@ struct janas_llm_model {
     uint32_t dh_n, dh_cap;
     size_t dh_row;
     float *dh_logits;
+    struct janas_draft_vocab *dh_adaptive; /* ephemeral; dh_w is reused */
+    double mtp_maintenance_s, mtp_head_s, mtp_repack_s;
+    uint64_t mtp_head_calls, mtp_repacks, mtp_vocab_fallbacks;
+    struct janas_llm_runtime_stats runtime_stats;
     /* The vocabulary of the replies (janas_llm_model_set_vocab): the head's
        rows of those tokens alone, copied as the draft head's, computed in
        place of the whole head, the other logits -inf; vs_n 0: the whole */
@@ -685,6 +706,13 @@ void janas_m_apply_candidate(struct janas_llm_model *m, int cand, uint32_t nv);
 #define JANAS_GT_DEV 1
 #define JANAS_GT_HOST 2
 void janas_m_gtok_host(struct janas_llm_model *m, int write);
+/* model_rec.c: forward lifecycle for the optional, derived GDN journal.
+   prepare precedes base_pos invalidation; finish follows successful state
+   publication. Invalidate on restore/reset/shift/failure/device overwrite. */
+void janas_m_gdn_prepare(struct janas_llm_model *m, uint32_t pos, uint32_t n);
+void janas_m_gdn_finish(struct janas_llm_model *m);
+void janas_m_gdn_invalidate(struct janas_llm_model *m);
+void janas_m_gdn_free(struct janas_llm_model *m);
 /* Whether the whole token is asked of the GPU (JANAS_GPU_TOKEN=1). */
 int janas_m_gpu_token_asked(void);
 /* model_npu.c: the NPU for the products of blocks (JANAS_NPU=1), opened

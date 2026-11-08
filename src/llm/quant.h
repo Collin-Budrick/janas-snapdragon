@@ -26,6 +26,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct janas_q8k_panel;
+/* Private CPU group-call preparation; automatic new-shape allowlist empty.
+   Returned rows (pairs on ARM) cover every vector, including an odd token. */
+int janas_quant_panels_enabled(void);
+size_t janas_dot_prepared_rows(
+    int type, const void *w, size_t row_bytes, const uint8_t *p1,
+    const uint8_t *p0, size_t pb, const struct janas_q8k_panel *panel,
+    size_t rows, float *y, size_t ys);
+
 #define JANAS_QK 256 /* weights per super-block */
 
 struct janas_block_q4k {

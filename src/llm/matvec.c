@@ -4,10 +4,13 @@
  * matvec.c - quantized matrix-vector product on a thread pool (see matvec.h).
  */
 #include "matvec.h"
+#include "quant_panel.h"
 #include "common/sysinfo.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 /*
  * Rows are claimed in chunks: large enough that each thread streams a long
@@ -114,17 +117,50 @@ void janas_matvec_q4k(struct janas_pool *pool, const struct janas_block_q4k *w,
     janas_pool_run(pool, matvec_worker, &job);
 }
 
+struct group_partial {
+    uint64_t prepared_rows, prepared_row_vectors;
+    uint64_t established_rows, established_row_vectors;
+    uint64_t padding[4]; /* each worker writes its own cache line */
+};
+
 struct group_job {
     const struct janas_matvec_task *tasks;
+    const struct janas_q8k_panel *panels;
     size_t n;
     size_t *first_row; /* first global row of each task, n + 1 entries */
     size_t div;        /* the chunk is 1/div of the rows still to claim */
     atomic_size_t next;
+    int collect;
+    struct group_partial *partial;
+    atomic_uint_fast64_t prepared_rows, prepared_row_vectors;
+    atomic_uint_fast64_t established_rows, established_row_vectors;
 };
+
+static inline void group_count(struct group_job *job, int tid, size_t rows,
+                               size_t nv, int prepared)
+{
+    if (!job->collect || !rows)
+        return;
+    if (job->partial) {
+        struct group_partial *p = job->partial + tid;
+        if (prepared) {
+            p->prepared_rows += rows;
+            p->prepared_row_vectors += (uint64_t)rows * nv;
+        } else {
+            p->established_rows += rows;
+            p->established_row_vectors += (uint64_t)rows * nv;
+        }
+    } else {
+        /* Pools above the bounded stack workspace still report accurately. */
+        atomic_fetch_add_explicit(prepared ? &job->prepared_rows : &job->established_rows,
+                                  rows, memory_order_relaxed);
+        atomic_fetch_add_explicit(prepared ? &job->prepared_row_vectors : &job->established_row_vectors,
+                                  (uint64_t)rows * nv, memory_order_relaxed);
+    }
+}
 
 static void group_worker(void *arg, int tid, int n_threads)
 {
-    (void)tid;
     (void)n_threads;
     struct group_job *job = arg;
     size_t total = job->first_row[job->n];
@@ -153,6 +189,23 @@ static void group_worker(void *arg, int tid, int n_threads)
             size_t nv = k->n_vec ? k->n_vec : 1;
             size_t xs = k->x_stride ? k->x_stride : nb + (tail != 0);
             size_t ys = k->y_stride ? k->y_stride : k->rows;
+            if (job->panels && job->panels[t].x) {
+                size_t pb = nb * JANAS_Q6KP_PLANE;
+                const uint8_t *p1 = k->plane[0], *p0 = k->plane[1];
+                size_t done = janas_dot_prepared_rows(
+                    k->type, w0, row_bytes, p1 ? p1 + r0 * pb : NULL,
+                    p0 ? p0 + r0 * pb : NULL, pb, job->panels + t, nr,
+                    k->y + r0, ys);
+                group_count(job, tid, done, nv, 1);
+                r0 += done;
+                nr -= done;
+                w0 += done * row_bytes;
+                if (!nr) {
+                    g0 = end;
+                    continue;
+                }
+            }
+            group_count(job, tid, nr, nv, 0);
             if (k->type == JANAS_Q6_K_P) {
                 size_t pb = nb * JANAS_Q6KP_PLANE;
                 /* eight rows at a time as tiles, where they serve */
@@ -197,6 +250,25 @@ static void group_worker(void *arg, int tid, int n_threads)
 void janas_matvec_q4k_group(struct janas_pool *pool,
                             const struct janas_matvec_task *tasks, size_t n)
 {
+    janas_matvec_q4k_group_stats(pool, tasks, n, NULL);
+}
+
+static double group_now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+void janas_matvec_q4k_group_stats(struct janas_pool *pool,
+                                  const struct janas_matvec_task *tasks,
+                                  size_t n, struct janas_matvec_stats *stats)
+{
+    if (stats) {
+        memset(stats, 0, sizeof(*stats));
+        stats->groups = 1;
+        stats->tasks = n;
+    }
     size_t first_row_small[65];
     size_t *first_row = first_row_small;
     if (n + 1 > sizeof(first_row_small) / sizeof(first_row_small[0])) {
@@ -208,10 +280,52 @@ void janas_matvec_q4k_group(struct janas_pool *pool,
     for (size_t i = 0; i < n; i++)
         first_row[i + 1] = first_row[i] + tasks[i].rows;
 
-    struct group_job job = {.tasks = tasks, .n = n, .first_row = first_row};
-    job.div = (size_t)janas_pool_active(pool) * 2;
+    struct janas_q8k_panels panels = {0};
+    if (janas_quant_panels_enabled()) {
+        double begin = stats ? group_now() : 0;
+        janas_q8k_panels_create(tasks, n, JANAS_Q8K_PANEL_CAP, &panels);
+        if (stats) {
+            stats->panel_prepare_seconds = group_now() - begin;
+            stats->panel_bytes = panels.bytes;
+            stats->panel_unique = panels.unique;
+            for (size_t i = 0; panels.views && i < n; i++)
+                stats->panel_views += panels.views[i].x != NULL;
+            if (stats->panel_views >= stats->panel_unique)
+                stats->panel_dedup_hits = stats->panel_views - stats->panel_unique;
+        }
+    }
+    _Alignas(64) struct group_partial partial[64];
+    int active = janas_pool_active(pool);
+    struct group_job job = {.tasks = tasks, .panels = panels.views,
+                            .n = n, .first_row = first_row,
+                            .collect = stats != NULL};
+    if (stats && active <= (int)(sizeof partial / sizeof partial[0])) {
+        memset(partial, 0, (size_t)active * sizeof partial[0]);
+        job.partial = partial;
+    }
+    job.div = (size_t)active * 2;
     atomic_init(&job.next, 0);
+    atomic_init(&job.prepared_rows, 0);
+    atomic_init(&job.prepared_row_vectors, 0);
+    atomic_init(&job.established_rows, 0);
+    atomic_init(&job.established_row_vectors, 0);
     janas_pool_run(pool, group_worker, &job);
+    if (stats) {
+        if (job.partial) {
+            for (int i = 0; i < active; i++) {
+                stats->prepared_rows += partial[i].prepared_rows;
+                stats->prepared_row_vectors += partial[i].prepared_row_vectors;
+                stats->established_rows += partial[i].established_rows;
+                stats->established_row_vectors += partial[i].established_row_vectors;
+            }
+        } else {
+            stats->prepared_rows = atomic_load_explicit(&job.prepared_rows, memory_order_relaxed);
+            stats->prepared_row_vectors = atomic_load_explicit(&job.prepared_row_vectors, memory_order_relaxed);
+            stats->established_rows = atomic_load_explicit(&job.established_rows, memory_order_relaxed);
+            stats->established_row_vectors = atomic_load_explicit(&job.established_row_vectors, memory_order_relaxed);
+        }
+    }
+    janas_q8k_panels_free(&panels);
     if (first_row != first_row_small)
         free(first_row);
 }

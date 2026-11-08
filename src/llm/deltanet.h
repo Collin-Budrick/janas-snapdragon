@@ -49,6 +49,33 @@ void janas_gdn_step_h_ref(uint16_t *M, const float *q, const float *k,
                           const float *v, float decay, float beta, float scale,
                           float *o, size_t dim, size_t rows);
 
+/* An exact, bounded chain on independent rows. Strides count floats. Inputs
+   contain replay tokens first, then n new tokens; outputs/delta contain only
+   the new tokens. replay_delta, when present, is the exact d computed by an
+   earlier verification, so replay needs k/decay but neither q/v nor a dot.
+   The state is rounded to half AFTER EACH TOKEN; output uses the unrounded
+   update. M is advanced past replay, tip past replay+n (M==tip is allowed).
+   delta and replay_delta may alias: a row consumes its entire old prefix
+   before writing its new deltas. Other arrays must not overlap the state.
+   The caller retains the legacy path if this returns -1 (nothing touched). */
+#define JANAS_GDN_CHAIN_MAX 17u
+struct janas_gdn_chain {
+    const float *q, *k, *v, *decay, *beta;
+    size_t x_stride, gate_stride;
+    float *out;
+    size_t out_stride;
+    const float *replay_delta;
+    float *delta;
+    size_t delta_stride;
+};
+int janas_gdn_chain_h(uint16_t *M, uint16_t *tip,
+                      const struct janas_gdn_chain *chain, float scale,
+                      size_t dim, size_t rows, size_t replay, size_t n);
+/* Production opt-in is limited to the qualified ARM arithmetic/FPCR mode;
+   the chain itself has a portable reference fallback for tests. */
+int janas_gdn_chain_eligible(void);
+uint64_t janas_gdn_fp_mode(void);
+
 #ifdef JANAS_DELTANET_TEST
 /* Exercise the same half conversions as the ARM kernel, without arithmetic. */
 int janas_gdn_test_neon_half_enabled(void);

@@ -7,6 +7,7 @@
  */
 #include "files_store.h"
 #include "server.h"
+#include "llm/spec_config.h"
 #include "assistants.h"
 #include "containers.h"
 #include "vectors.h"
@@ -54,10 +55,11 @@ static void usage(FILE *f)
         "                    fits it: an MTP block or Gemma 4's assistant)\n"
         "  --no-mtp          none, not even one found beside the model\n"
         "  --draft FILE      a small model of the same family, for speed\n"
-        "  --speculation M   none, lookup, mtp or auto (default auto); mtp\n"
+        "  --speculation M   none, lookup, mtp, hybrid or auto (default auto); mtp\n"
         "                    requires an MTP head and fails without one\n"
         "  --draft-tokens N  maximum guessed tokens per pass, 1..16\n"
         "                    (default: 8 with an MTP head, 4 otherwise)\n"
+        JANAS_SPEC_RUNTIME_HELP
         "  --mode M          auto, eco or max (default auto)\n"
         "  --quality Q       the lowest quality the engine may choose to be\n"
         "                    faster where memory is short: low (default)\n"
@@ -183,6 +185,8 @@ static const char *const OPTIONS[] = {"--help",
                                       "--draft",
                                       "--speculation",
                                       "--draft-tokens",
+                                      "--spec-planner", "--spec-explore",
+                                      "--draft-vocab", "--draft-vocab-rows",
                                       "--mode",
                                       "--quality",
                                       "--think",
@@ -339,13 +343,18 @@ int main(int argc, char **argv)
             c->llm.draft_path = arg(argc, argv, &i);
         } else if (!strcmp(a, "--speculation")) {
             static const char *const modes[] = {"none", "lookup", "mtp",
-                                                "auto"};
+                                                "auto", "hybrid"};
             static const int values[] = {JANAS_LLM_SPEC_NONE,
                                          JANAS_LLM_SPEC_LOOKUP,
                                          JANAS_LLM_SPEC_MTP,
-                                         JANAS_LLM_SPEC_AUTO};
-            c->speculation = values[choice(argc, argv, &i, modes, 4)];
+                                         JANAS_LLM_SPEC_AUTO, JANAS_LLM_SPEC_HYBRID};
+            c->speculation = values[choice(argc, argv, &i, modes, 5)];
             c->speculation_set = 1;
+        } else if (janas_spec_runtime_is_option(a)) {
+            char why[160];
+            if (janas_spec_runtime_option(a, arg(argc, argv, &i), why, sizeof why) < 0) {
+                fprintf(stderr, "janas-server: %s\n", why); return 2;
+            }
         } else if (!strcmp(a, "--draft-tokens")) {
             c->max_drafts = (int)num(argc, argv, &i, 1, 16);
         } else if (!strcmp(a, "--quality")) {
@@ -469,7 +478,8 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    if (c->speculation_set && c->speculation == JANAS_LLM_SPEC_MTP &&
+    if (c->speculation_set && (c->speculation == JANAS_LLM_SPEC_MTP ||
+        c->speculation == JANAS_LLM_SPEC_HYBRID) &&
         c->no_mtp) {
         fprintf(stderr, "janas-server: --speculation mtp conflicts with "
                         "--no-mtp\n");

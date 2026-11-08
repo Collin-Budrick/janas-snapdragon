@@ -53,6 +53,22 @@
 
 #include "model_impl.h"
 
+void janas_m_products_cpu(struct janas_llm_model *m,
+                           const struct janas_matvec_task *tasks, size_t n)
+{
+    struct janas_matvec_stats s;
+    janas_matvec_q4k_group_stats(m->compute, tasks, n, &s);
+#define CPU(f) m->runtime_stats.cpu_##f += s.f
+    CPU(groups); CPU(tasks);
+    CPU(prepared_rows); CPU(prepared_row_vectors);
+    CPU(established_rows); CPU(established_row_vectors);
+    CPU(panel_views); CPU(panel_unique); CPU(panel_dedup_hits); CPU(panel_bytes);
+    CPU(panel_prepare_seconds);
+#undef CPU
+    if (s.panel_bytes > m->runtime_stats.cpu_panel_peak_bytes)
+        m->runtime_stats.cpu_panel_peak_bytes = s.panel_bytes;
+}
+
 struct janas_pool *janas_llm_model_compute(struct janas_llm_model *m)
 {
     return m->compute;
@@ -282,6 +298,8 @@ static void unrotate_row(void *row, float *scale, uint32_t hd, uint32_t half,
 int janas_llm_model_shift(struct janas_llm_model *m, uint32_t keep,
                           uint32_t drop, uint32_t n_kv)
 {
+    janas_m_gdn_invalidate(m);
+    janas_llm_mtp_vocab_new_reply(m);
     /* pictures' positions are not slid (yet): the caller reads the prompt
        again instead */
     if (!drop || n_kv > m->n_ctx || keep + drop > n_kv || m->hd_max > 512 ||
@@ -544,8 +562,17 @@ double janas_llm_model_pass_seconds(const struct janas_llm_model *m)
     return m->last_pass_s;
 }
 
+static int forward_core(struct janas_llm_model *m, const int32_t *tokens,
+                        uint32_t n, uint32_t pos0, float *logits, int all_logits);
 static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
                    uint32_t pos0, float *logits, int all_logits)
+{
+    int rc = forward_core(m, tokens, n, pos0, logits, all_logits);
+    if (rc != 0) janas_m_gdn_invalidate(m);
+    return rc;
+}
+static int forward_core(struct janas_llm_model *m, const int32_t *tokens,
+                        uint32_t n, uint32_t pos0, float *logits, int all_logits)
 {
     if (n < 1 || n > m->blk || pos0 + n > m->n_ctx)
         return -1;
@@ -577,6 +604,7 @@ static int forward(struct janas_llm_model *m, const int32_t *tokens, uint32_t n,
        host's (the recurrent states zeroed below) is the one */
     if (m->gtok_dev && pos0 == 0)
         m->gtok_where = JANAS_GT_HOST;
+    janas_m_gdn_prepare(m, pos0, n);
     if (m->a->rec) {
         if (pos0 == 0) {
             m->src = 0;
@@ -775,6 +803,7 @@ output:
         m->base_pos = pos0 + n;
         m->log_n = 0;
     }
+    janas_m_gdn_finish(m);
     return 0;
 }
 
@@ -930,7 +959,7 @@ static int head_of_vocab(struct janas_llm_model *m,
                                   .cols = m->d_model,
                                   .n_vec = n};
     /* on the CPU: the GPU and the NPU know the model's weights, not these */
-    janas_matvec_q4k_group(m->compute, &t, 1);
+    janas_m_products_cpu(m, &t, 1);
     if (m->softcap > 0.0f) /* as softcap_worker, on the rows computed */
         for (size_t i = 0; i < (size_t)n * m->vs_n; i++)
             m->vs_y[i] = m->softcap * janas_tanhf(m->vs_y[i] / m->softcap);
@@ -948,8 +977,9 @@ void janas_llm_mtp_note_tokens(struct janas_llm_model *m, const int32_t *tokens,
         if (t < 0 || (uint32_t)t >= m->n_vocab || m->dh_in[t] ||
             m->dh_n == m->dh_cap)
             continue;
-        memcpy(m->dh_w + (size_t)m->dh_n * m->dh_row,
-               m->dh_src + (size_t)t * m->dh_row, m->dh_row);
+        if (!janas_llm_mtp_vocab_policy(m))
+            memcpy(m->dh_w + (size_t)m->dh_n * m->dh_row,
+                   m->dh_src + (size_t)t * m->dh_row, m->dh_row);
         m->dh_ids[m->dh_n++] = t;
         m->dh_in[t] = 1;
     }
@@ -973,17 +1003,22 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
                             1); /* one-row head */
     double td = now();
     size_t nbd = m->d_model / JANAS_QK;
+    uint32_t rows = janas_llm_mtp_vocab_rows(m);
+    if (!rows) return -1;
     struct janas_matvec_task t = {.type = (int)m->output->type,
                                   .w = m->dh_w,
                                   .x = m->xq + (n - 1) * nbd,
                                   .y = m->dh_logits,
-                                  .rows = m->dh_n,
+                                  .rows = rows,
                                   .cols = m->d_model};
-    janas_m_products(m, janas_m_gpu(m, 0), &t, 1);
+    if (janas_llm_mtp_vocab_cpu_only(m))
+        janas_m_products_cpu(m, &t, 1);
+    else
+        janas_m_products(m, janas_m_gpu(m, 0), &t, 1);
     /* the best row and its softmax probability within the head */
     float *l = m->dh_logits, mx = l[0];
     uint32_t best = 0;
-    for (uint32_t i = 1; i < m->dh_n; i++)
+    for (uint32_t i = 1; i < rows; i++)
         if (l[i] > mx) {
             mx = l[i];
             best = i;
@@ -992,19 +1027,34 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
     uint32_t i = 0;
 #if defined(__x86_64__)
     if (m->avx2)
-        sum = exp_sum_avx2(l, m->dh_n, mx, &i);
+        sum = exp_sum_avx2(l, rows, mx, &i);
 #endif
-    for (; i < m->dh_n; i++)
+    for (; i < rows; i++)
         sum += janas_exp_det(l[i] - mx);
-    *token = m->dh_ids[best];
+    *token = janas_llm_mtp_vocab_token(m, best);
     *conf = (float)(1.0 / sum);
-    m->phase[JANAS_PH_OUTPUT] += now() - td;
+    double head_time = now() - td;
+    m->phase[JANAS_PH_OUTPUT] += head_time;
+    m->mtp_head_s += head_time;
+    m->mtp_head_calls++;
     return 0;
 }
 
+static int mtp_forward_core(struct janas_llm_model *m, const int32_t *tokens,
+                            const float *hidden, uint32_t n, uint32_t pos0,
+                            float *logits, int all_logits);
 int janas_llm_mtp_forward(struct janas_llm_model *m, const int32_t *tokens,
                           const float *hidden, uint32_t n, uint32_t pos0,
                           float *logits, int all_logits)
+{
+    double start = now();
+    int rc = mtp_forward_core(m, tokens, hidden, n, pos0, logits, all_logits);
+    m->mtp_maintenance_s += now() - start;
+    return rc;
+}
+static int mtp_forward_core(struct janas_llm_model *m, const int32_t *tokens,
+                            const float *hidden, uint32_t n, uint32_t pos0,
+                            float *logits, int all_logits)
 {
     if (m->asst) /* no keys and values of its own: nothing to fill */
         return logits || n < 1 || n > m->blk ? -1 : 0;

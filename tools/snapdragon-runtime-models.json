@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "models": {
+    "main": {
+      "filename": "qwen3-next-80b-a3b-q4km.jns",
+      "bytes": 48411922432,
+      "sha256": "fa3255c73106391e9cb5a97efd30f77a928fb4518d40060f795a8cff6656daed"
+    },
+    "mtp": {
+      "filename": "qwen3-next-80b-a3b-mtp-q4k.jns",
+      "bytes": 937992192,
+      "sha256": "5c9bc4cb6f739193fac5e4daa30c922f73255acf41443ecfc0123ef084584559"
+    }
+  },
+  "published_baseline": {
+    "sha256": "870221ae326c8435bcde7cae1ab023c2318fd43c3b88c1b35560e7f6d49e925e",
+    "source_commit": "3b8d508e5cfcf74f52cd9c3ebd34d333a8a17619"
+  },
+  "quality_reference": {
+    "filename": "cpu64.qref",
+    "bytes": 38895956,
+    "sha256": "52b0f576b85e9df0d2ba24380ff974f836a0f467fdcb46bbf19a747535883390",
+    "logit_fnv1a64": "c70a79fcb00b7e3d",
+    "vocab": 151936,
+    "positions": 64,
+    "context": 1024,
+    "tokens": 65
+  }
+}

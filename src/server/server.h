@@ -227,6 +227,10 @@ struct srv_job {
     int32_t err;           /* JANAS_LLM_OK or the library's code */
     char errmsg[256];
     struct janas_llm_chat_stats st;               /* of the first reply */
+    /* Captured by the engine with st, before another chat can run. Readers
+       use this job-owned snapshot under mu, never the live chat counters. */
+    struct janas_llm_speculation_metrics speculation;
+    int speculation_valid;
     uint32_t prompt_tokens;                       /* of every prompt, once */
     uint32_t completion_tokens, reasoning_tokens; /* of all of them */
     uint32_t queue_pos;       /* requests ahead of it, while it waits */

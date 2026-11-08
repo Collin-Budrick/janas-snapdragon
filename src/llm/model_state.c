@@ -315,6 +315,9 @@ struct janas_llm_state *janas_llm_model_state_save(struct janas_llm_model *m,
 int janas_llm_model_state_load(struct janas_llm_model *m,
                                const struct janas_llm_state *st)
 {
+    /* Derived acceleration scratch is never restored from a snapshot. The
+       unchanged projected-input log remains the exact recovery fallback. */
+    janas_m_gdn_invalidate(m);
     janas_m_gtok_host(m, 1); /* the state written here */
     /* the rows copied do not depend on the context opened, only on its
        being long enough */

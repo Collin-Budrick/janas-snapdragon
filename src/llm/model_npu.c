@@ -1101,6 +1101,15 @@ static void npu_loud(struct janas_llm_model *m, int spin)
     janas_pool_set_spin(m->compute, spin);
 }
 
+static void products_cpu_or_gpu(struct janas_llm_model *m, struct janas_gpu *g,
+                                 const struct janas_matvec_task *t, size_t n)
+{
+    if (g)
+        janas_gpu_matvec_group(g, m->compute, t, n);
+    else
+        janas_m_products_cpu(m, t, n);
+}
+
 void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
                       const struct janas_matvec_task *t, size_t nt)
 {
@@ -1109,7 +1118,7 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
     struct janas_m_npu *n =
         m->npu_use && m->npu && m->npu->lmode != 1 ? m->npu : NULL;
     if (!n) {
-        janas_gpu_matvec_group(g, m->compute, t, nt);
+        products_cpu_or_gpu(m, g, t, nt);
         return;
     }
     enum { MAXT = 64 };
@@ -1120,7 +1129,7 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
     double on_begin[MAXT];
     size_t nc = 0, nn = 0;
     if (nt > MAXT) {
-        janas_gpu_matvec_group(g, m->compute, t, nt);
+        products_cpu_or_gpu(m, g, t, nt);
         return;
     }
     /* The matvec API defines zero n_vec as one vector. Intel's existing
@@ -1172,7 +1181,7 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
     }
     double t0 = now();
     if (nc)
-        janas_gpu_matvec_group(g, m->compute, cpu, nc);
+        products_cpu_or_gpu(m, g, cpu, nc);
     double t1 = now();
     n->t_cpu += t1 - t0;
     int spin = nn && !hx ? npu_quiet(m) : 0; /* Intel waits after CPU work */
@@ -1188,7 +1197,7 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
         if (failed) {
             /* the NPU failed: this product on the CPU after all */
             n->cpu_fallbacks++;
-            janas_gpu_matvec_group(g, m->compute, k, 1);
+            products_cpu_or_gpu(m, g, k, 1);
             continue;
         }
         if (checking()) {

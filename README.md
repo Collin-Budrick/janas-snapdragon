@@ -15,6 +15,11 @@ include cache-size, lookup, Hexagon and native llama.cpp comparisons;
 the [guide](docs/snapdragon.md#measured-settings-and-starting-the-server)
 provides the measured launch profiles and their validation limits.
 
+The [exact runtime experiments](docs/snapdragon-runtime.md) add bounded activation
+panels, cycle planning, hybrid conversation lookup, adaptive draft-only vocabulary
+and recurrent recovery journals. Their controls and validation are documented
+separately from the earlier SIMD measurements.
+
 The upstream performance figures below describe its Intel test machine.
 Results for this Snapdragon laptop are recorded separately in the guide.
 

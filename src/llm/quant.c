@@ -4,6 +4,7 @@
  * quant.c - quantized block formats and dot-product kernels (see quant.h).
  */
 #include "quant.h"
+#include "quant_panel.h"
 #include "common/sysinfo.h"
 #include "quant_q6kp.h"
 #include "vmath.h"
@@ -1695,6 +1696,7 @@ static inline void iq2_sub_mask(int type, const void *blk, int l,
 #if defined(__aarch64__)
 #include "quant_neon.h"
 #include "quant_neon_k.h"
+#include "quant_neon_panel.h"
 #endif
 
 typedef float (*dot_fn)(const struct janas_block_q4k *,
@@ -1766,6 +1768,7 @@ static int use_vnni, use_evnni;
 #if defined(__aarch64__)
 /* 0 off, 1 measured automatic cases, 2 experimental JANAS_CPU_TILES=1. */
 static int use_i8mm;
+static int use_panels; /* new shapes: experimental until native O2 gates */
 #endif
 #if defined(__x86_64__)
 /* the prompt's tiles on 512 bits (quant_z.h), where AVX-512 VNNI is */
@@ -1933,6 +1936,7 @@ __attribute__((constructor)) static void dot_kernels_init(void)
             dot6p_impl = q6kp_dotn_neon_fused;
         if (janas_cpu_arm_i8mm())
             use_i8mm = tile_mode;
+        use_panels = use_i8mm == 2;
         if (use_i8mm)
             dot_name = "neon-dotprod+i8mm";
     }
@@ -1949,6 +1953,35 @@ int janas_kernels_ref(void)
 int janas_use_vnni(void)
 {
     return use_vnni + use_evnni;
+}
+
+int janas_quant_panels_enabled(void)
+{
+#if defined(__aarch64__)
+    return use_panels;
+#else
+    return 0;
+#endif
+}
+
+size_t janas_dot_prepared_rows(
+    int type, const void *w, size_t row_bytes, const uint8_t *p1,
+    const uint8_t *p0, size_t pb, const struct janas_q8k_panel *panel,
+    size_t rows, float *y, size_t ys)
+{
+#if defined(__aarch64__)
+    size_t r2 = rows / 2 * 2;
+    if (!use_panels || !panel || !panel->x || !panel->nb || !panel->nv ||
+        panel->nv > 9 || (panel->pairs && !panel->qs) || !r2 ||
+        (type != JANAS_Q4_K && type != JANAS_Q6_K && type != JANAS_Q6_K_P))
+        return 0;
+    panel_rows_neon(type, w, row_bytes, p1, p0, pb, panel, r2, y, ys);
+    return r2;
+#else
+    (void)type, (void)w, (void)row_bytes, (void)p1, (void)p0, (void)pb;
+    (void)panel, (void)rows, (void)y, (void)ys;
+    return 0;
+#endif
 }
 
 float janas_q4k_dot(const struct janas_block_q4k *w,

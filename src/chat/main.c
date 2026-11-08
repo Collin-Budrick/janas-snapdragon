@@ -38,6 +38,7 @@
 #include "edit.h"
 #include "layout.h"
 #include "janas/llm.h"
+#include "llm/spec_config.h"
 #include "markdown.h"
 #include "mcp_chat.h"
 #include "options.h"
@@ -362,10 +363,11 @@ static void usage(void)
         "  --min-p <p>      (default 0)    --seed <n> (default: random)\n"
         "  --max <tokens>   longest reply (default: no limit)\n"
         "  --no-spec        no speculative decoding\n"
-        "  --speculation <none|lookup|mtp|auto>\n"
+        "  --speculation <none|lookup|mtp|hybrid|auto>\n"
         "                   choose drafts explicitly (default auto); mtp\n"
         "                   requires a loaded prediction block\n"
         "  --draft-tokens <1..16>  maximum guessed tokens per pass\n"
+        JANAS_SPEC_RUNTIME_HELP
         "  --mode <m>       auto (default), eco or max\n"
         "  --think <on|off> reasoning before replying, for models that do\n"
         "                   it (default off: it is slow, and a small model\n"
@@ -1000,9 +1002,10 @@ static const char *const OPTIONS[] = {
     "--top-k",       "--top-p",      "--min-p",       "--seed",
     "--max",         "--head",       "--profile",     "--models",
     "--quality",     "--prompt-on",  "--drafts-on",   "--reply-on",
-    "--speech-model", "--speculation", "--draft-tokens"};
+    "--speech-model", "--speculation", "--draft-tokens",
+    "--spec-planner", "--spec-explore", "--draft-vocab", "--draft-vocab-rows"};
 #define N_OPTIONS (sizeof OPTIONS / sizeof *OPTIONS)
-static const char *const SPECULATION[] = {"none", "auto", "lookup", "mtp"};
+static const char *const SPECULATION[] = {"none", "auto", "lookup", "mtp", "hybrid"};
 
 /* v of option a as a whole number or a number within limits; on a
    mistake, the reason into why and -1 */
@@ -1130,8 +1133,10 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
             o->devices[k - 1] = janas_devices_mask(v, why, why_len);
         } else if (strcmp(a, "--mtp") == 0)
             o->mp->mtp_path = v;
-        else if (strcmp(a, "--speculation") == 0) {
-            if ((k = opt_choice(a, v, SPECULATION, 4, why, why_len)) < 0)
+        else if (janas_spec_runtime_is_option(a)) {
+            if (janas_spec_runtime_option(a, v, why, why_len) < 0) return -1;
+        } else if (strcmp(a, "--speculation") == 0) {
+            if ((k = opt_choice(a, v, SPECULATION, 5, why, why_len)) < 0)
                 return -1;
             o->cp->speculate = k;
         } else if (strcmp(a, "--draft-tokens") == 0) {
@@ -2068,7 +2073,7 @@ int main(int argc, char **argv)
                                  cannot always see */
     if (janas_llm_open(cm.path, &mp, &llm) != JANAS_LLM_OK ||
         janas_llm_chat_create(llm, &cp, &c) != JANAS_LLM_OK ||
-        janas_llm_chat_speculation(c, cp.speculate, draft_tokens) != JANAS_LLM_OK) {
+        janas_spec_runtime_apply(c, cp.speculate, draft_tokens) != JANAS_LLM_OK) {
         fprintf(stderr, "janas-chat: %s\n", janas_llm_last_error());
         return 1;
     }
@@ -2238,7 +2243,7 @@ int main(int argc, char **argv)
                     }
                     conf_text = text;
                     if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK ||
-                        janas_llm_chat_speculation(c, cp.speculate, draft_tokens) != JANAS_LLM_OK)
+                        janas_spec_runtime_apply(c, cp.speculate, draft_tokens) != JANAS_LLM_OK)
                         term_printf(&term, "%s\n", janas_llm_last_error());
                     janas_llm_set_mode(llm, mp.mode);
                     if (janas_llm_set_gpu(llm, gpu) != JANAS_LLM_OK)
@@ -2389,10 +2394,10 @@ int main(int argc, char **argv)
             } else if (strcmp(msg, "/spec") == 0) {
                 int mode = !*arg || strcmp(arg, "on") == 0 || strcmp(arg, "off") == 0
                                ? on_off(arg, cp.speculate)
-                               : opt_choice("/spec", arg, SPECULATION, 4, why, sizeof why);
+                               : opt_choice("/spec", arg, SPECULATION, 5, why, sizeof why);
                 if (mode < 0)
                     term_printf(&term, "%s\n", why);
-                else if (janas_llm_chat_speculation(c, mode, draft_tokens) == JANAS_LLM_OK) {
+                else if (janas_spec_runtime_apply(c, mode, draft_tokens) == JANAS_LLM_OK) {
                     cp.speculate = mode;
                     term_printf(&term, "speculative decoding %s\n", SPECULATION[mode]);
                 } else

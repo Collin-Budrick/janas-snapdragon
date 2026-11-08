@@ -9,6 +9,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -26,6 +27,133 @@
 
 #include "model_impl.h"
 
+#define GDN_JOURNAL_BUDGET ((size_t)16 * 1024 * 1024)
+
+static int gdn_opt(const char *name)
+{
+    const char *s = getenv(name);
+    return s && !strcmp(s, "1");
+}
+
+struct gdn_fp_job {
+    uint64_t mode;
+    atomic_int okay;
+};
+
+static void gdn_fp_worker(void *arg, int tid, int n_threads)
+{
+    (void)tid;
+    (void)n_threads;
+    struct gdn_fp_job *a = arg;
+    if (!janas_gdn_chain_eligible() || janas_gdn_fp_mode() != a->mode)
+        atomic_store_explicit(&a->okay, 0, memory_order_relaxed);
+}
+
+void janas_m_gdn_invalidate(struct janas_llm_model *m)
+{
+    m->gdn_journal_valid = 0;
+    m->gdn_chain_active = m->gdn_journal_active = m->gdn_recover_active = 0;
+    m->gdn_konly_active = 0;
+    m->gdn_written_mask = 0;
+}
+
+void janas_m_gdn_free(struct janas_llm_model *m)
+{
+    janas_m_gdn_invalidate(m);
+    free(m->gdn_delta);
+    m->gdn_delta = NULL;
+    m->gdn_delta_bytes = m->gdn_delta_stride = 0;
+    m->gdn_delta_capacity = 0;
+}
+
+void janas_m_gdn_prepare(struct janas_llm_model *m, uint32_t pos, uint32_t n)
+{
+    uint64_t fpcr = janas_gdn_fp_mode();
+    int old = m->gdn_journal_valid && m->gdn_journal_pos == m->base_pos &&
+              m->gdn_journal_n == m->log_n && m->gdn_journal_base == m->base &&
+              m->gdn_journal_fpcr == fpcr;
+    janas_m_gdn_invalidate(m);
+    if ((m->a->rec != JANAS_REC_NEXT && m->a->rec != JANAS_REC_Q35) ||
+        !gdn_opt("JANAS_GDN_CHAIN") ||
+        !janas_gdn_chain_eligible() || !n || n > JANAS_GDN_CHAIN_MAX ||
+        !m->ds || m->ds > MAX_SSM_DIM || m->ds % SSM_ROWS ||
+        m->gtok_where == JANAS_GT_DEV)
+        return;
+    uint32_t replay = 0;
+    if (pos && m->base_pos != UINT32_MAX && pos >= m->base_pos &&
+        (uint64_t)pos < (uint64_t)m->base_pos + m->log_n)
+        replay = pos - m->base_pos;
+    if (replay > JANAS_GDN_CHAIN_MAX)
+        return;
+    /* Check every active pool thread BEFORE omitting any convolution output.
+       The pool's workers keep their own FPCR; checking only the caller would
+       permit a different worker mode to reuse deltas from the wrong mode. */
+    struct gdn_fp_job check = {.mode = fpcr};
+    atomic_init(&check.okay, 1);
+    janas_pool_run(m->compute, gdn_fp_worker, &check);
+    if (!atomic_load_explicit(&check.okay, memory_order_relaxed))
+        return;
+    m->gdn_chain_active = 1;
+    m->gdn_pending_pos = pos;
+    m->gdn_pending_n = n;
+    m->gdn_journal_fpcr = fpcr;
+    if (!gdn_opt("JANAS_GDN_JOURNAL") || !m->n_rec || m->n_rec > 64 ||
+        !m->n_vh)
+        return;
+    /* Multiplication is bounded by the byte budget before each step. */
+    size_t limit = GDN_JOURNAL_BUDGET / sizeof(float);
+    size_t stride = m->n_rec;
+    if (stride > limit / m->n_vh)
+        return;
+    stride *= m->n_vh;
+    if (stride > limit / m->ds)
+        return;
+    stride *= m->ds;
+    uint32_t capacity = n;
+    if (old && replay && m->gdn_journal_n > capacity)
+        capacity = m->gdn_journal_n;
+    if (stride > limit / capacity)
+        return;
+    size_t bytes = stride * capacity * sizeof(float);
+    if (m->gdn_delta_stride != stride) {
+        free(m->gdn_delta);
+        m->gdn_delta = NULL;
+        m->gdn_delta_bytes = m->gdn_delta_capacity = 0;
+        old = 0;
+    }
+    if (bytes > m->gdn_delta_bytes) {
+        float *p = realloc(m->gdn_delta, bytes);
+        if (!p)
+            return; /* full projected-input replay remains available */
+        m->gdn_delta = p;
+        m->gdn_delta_bytes = bytes;
+        m->gdn_delta_capacity = capacity;
+    }
+    m->gdn_delta_stride = stride;
+    m->gdn_journal_active = 1;
+    m->gdn_recover_active = old && replay != 0;
+    m->gdn_konly_active = m->gdn_recover_active && gdn_opt("JANAS_GDN_K_ONLY");
+}
+
+void janas_m_gdn_finish(struct janas_llm_model *m)
+{
+    uint64_t all = m->n_rec >= 64 ? UINT64_MAX
+                                : (m->n_rec ? (UINT64_C(1) << m->n_rec) - 1 : 0);
+    int valid = m->gdn_journal_active && m->n_rec <= 64 &&
+                m->gdn_written_mask == all &&
+                m->base_pos == m->gdn_pending_pos &&
+                m->log_n == m->gdn_pending_n &&
+                m->gdn_journal_fpcr == janas_gdn_fp_mode() &&
+                m->gtok_where != JANAS_GT_DEV;
+    janas_m_gdn_invalidate(m);
+    if (valid) {
+        m->gdn_journal_pos = m->base_pos;
+        m->gdn_journal_n = m->log_n;
+        m->gdn_journal_base = m->base;
+        m->gdn_journal_valid = 1;
+    }
+}
+
 /*
  * Gated DeltaNet in four steps per layer, over the rows of a call: rows
  * 0 .. replay - 1 are logged tokens of the previous call replayed on the base
@@ -40,10 +168,12 @@ struct ssm_job {
     struct janas_llm_model *m;
     const struct layer *ly;
     uint32_t n;
+    int chain, recover, journal, k_only;
 };
 
 static void conv_head_ref(struct janas_llm_model *m, const float *wt,
-                          float *src, float *dst, uint32_t c0, uint32_t n)
+                          float *src, float *dst, uint32_t c0, uint32_t n,
+                          int k_only)
 {
     uint32_t cc = m->conv_ch, dc = m->d_conv, a = m->replay;
     for (uint32_t c = c0; c < c0 + m->ds; c++) {
@@ -55,10 +185,13 @@ static void conv_head_ref(struct janas_llm_model *m, const float *wt,
                 for (uint32_t i = 0; i + 1 < dc; i++)
                     src[(size_t)i * cc + c] = win[i];
             win[dc - 1] = m->mixed[(size_t)t * cc + c];
-            float s = 0.0f;
-            for (uint32_t i = 0; i < dc; i++)
-                s += win[i] * wt[(size_t)i * cc + c];
-            m->conv_out[(size_t)t * cc + c] = s / (1.0f + janas_expf(-s));
+            if (!k_only || t >= a ||
+                (c >= m->n_kh * m->ds && c < 2 * m->n_kh * m->ds)) {
+                float s = 0.0f;
+                for (uint32_t i = 0; i < dc; i++)
+                    s += win[i] * wt[(size_t)i * cc + c];
+                m->conv_out[(size_t)t * cc + c] = s / (1.0f + janas_expf(-s));
+            }
             for (uint32_t i = 0; i + 1 < dc; i++)
                 win[i] = win[i + 1];
         }
@@ -139,10 +272,11 @@ static void conv_worker(void *arg, int tid, int n_threads)
             conv_head_avx2(m, a->ly->conv_t, src, dst, c0, a->n);
         else
 #endif
-            conv_head_ref(m, a->ly->conv_t, src, dst, c0, a->n);
+            conv_head_ref(m, a->ly->conv_t, src, dst, c0, a->n, a->k_only);
         if (c0 >= 2 * kd) /* a value head: not normalized */
             continue;
-        for (uint32_t t = 0; t < m->replay + a->n; t++) {
+        for (uint32_t t = a->k_only && c0 < kd ? m->replay : 0;
+             t < m->replay + a->n; t++) {
             float *x = m->conv_out + (size_t)t * cc + c0;
 #if defined(__x86_64__)
             if (m->avx2)
@@ -177,6 +311,28 @@ static void rec_worker(void *arg, int tid, int n_threads)
         uint16_t *M =
             m->ssm_buf + (size_t)(m->rec_cont ? 1 - m->src : m->src) * sz + off;
         uint16_t *D = m->ssm_buf + (size_t)(1 - m->src) * sz + off;
+        if (a->chain) {
+            size_t jo = ((size_t)a->ly->slot * nv + h) * ds + r0;
+            struct janas_gdn_chain chain = {
+                .q = m->conv_out + (size_t)g * ds,
+                .k = m->conv_out + kd + (size_t)g * ds,
+                .v = m->conv_out + 2 * kd + (size_t)h * ds + r0,
+                .decay = m->decay + h,
+                .beta = m->beta + h,
+                .x_stride = cc,
+                .gate_stride = nv,
+                .out = m->att + (size_t)h * ds + r0,
+                .out_stride = m->d_inner,
+                .replay_delta = a->recover ? m->gdn_delta + jo : NULL,
+                .delta = a->journal ? m->gdn_delta + jo : NULL,
+                .delta_stride = m->gdn_delta_stride};
+            /* Geometry/pointers were checked before convolution. In
+               particular, a K-only replay must never fall into the old
+               path that consumes its intentionally absent Q/V outputs. */
+            (void)janas_gdn_chain_h(M, D, &chain, scale, ds, SSM_ROWS,
+                                    m->replay, a->n);
+            continue;
+        }
         for (uint32_t t = 0; t < m->replay + a->n; t++) {
             if (t == m->replay) {
                 if (M != D) /* not a call going on from the one before */
@@ -442,8 +598,23 @@ void janas_m_rec_core(struct janas_llm_model *m, const struct layer *ly,
               m->big + (size_t)(n - 1) * m->qkvz_dim +
                   (ly->ssm_qkv ? m->conv_ch : 0),
               m->d_inner);
-    struct ssm_job sj = {m, ly, n};
+    int chain = m->gdn_chain_active && !m->rec_cont &&
+                n == m->gdn_pending_n && a <= JANAS_GDN_CHAIN_MAX;
+    if (!chain) {
+        /* A device-split continuation can visit a layer more than once.
+           Its first fragment must not publish a complete-pass journal. */
+        m->gdn_journal_active = m->gdn_recover_active = m->gdn_konly_active = 0;
+    }
+    struct ssm_job sj = {.m = m,
+                         .ly = ly,
+                         .n = n,
+                         .chain = chain,
+                         .recover = chain && m->gdn_recover_active,
+                         .journal = chain && m->gdn_journal_active,
+                         .k_only = chain && m->gdn_konly_active};
+    double tv = now();
     janas_pool_run(m->compute, conv_worker, &sj);
+    m->gdn_conv_seconds += now() - tv;
     trace_row(m, "conv_out", m->conv_out + (size_t)(m->replay + n - 1) * cc,
               cc);
     if (m->trace >= 3) {
@@ -453,7 +624,19 @@ void janas_m_rec_core(struct janas_llm_model *m, const struct layer *ly,
         trace_row(m, "conv_v_h31", co + 2 * kd + (size_t)31 * ds, ds);
         trace_row(m, "conv_v_h0", co + 2 * kd, ds);
     }
+    tv = now();
     janas_pool_run(m->compute, rec_worker, &sj);
+    m->gdn_core_seconds += now() - tv;
+    if (chain)
+        m->gdn_chain_tokens += n;
+    if (sj.recover)
+        m->gdn_journal_replay_tokens += a;
+    else
+        m->gdn_scalar_replay_tokens += a;
+    if (sj.k_only)
+        m->gdn_konly_replay_tokens += a;
+    if (sj.journal && ly->slot < 64)
+        m->gdn_written_mask |= UINT64_C(1) << ly->slot;
     trace_row(m, "ssm_raw", m->att + (size_t)(n - 1) * m->d_inner, m->d_inner);
     if (m->trace >= 3) {
         const float *o = m->att + (size_t)(n - 1) * m->d_inner;
