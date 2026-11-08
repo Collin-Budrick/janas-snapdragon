@@ -22,6 +22,7 @@
 #include "gpu.h"
 #include "matvec.h"
 #include "quant.h"
+#include "router.h"
 #include "vmath.h"
 
 #include "model_impl.h"
@@ -167,6 +168,7 @@ struct router_job {
     const uint16_t *w;
     uint32_t n;
     uint32_t ne; /* the layer's experts: the model's, or fewer (Nemotron-H) */
+    const uint16_t *packed;
 };
 
 static float dot_f16_ref(const uint16_t *w, const float *x, uint32_t n)
@@ -203,6 +205,18 @@ static void router_worker(void *arg, int tid, int n_threads)
     struct router_job *r = arg;
     struct janas_llm_model *m = r->m;
     uint32_t ne = m->n_expert, dm = m->d_model;
+    if (r->packed) {
+        for (uint32_t e = 4 * (uint32_t)tid; e < r->ne;
+             e += 4 * (uint32_t)n_threads)
+            for (uint32_t j = 0; j < r->n; j++) {
+                float out[4];
+                janas_router4_dot(r->packed + (size_t)e * dm,
+                                   m->xn + (size_t)j * dm, dm, out);
+                for (uint32_t lane = 0; lane < 4 && e + lane < r->ne; lane++)
+                    m->router[(size_t)j * ne + e + lane] = out[lane];
+            }
+        return;
+    }
     for (uint32_t e = (uint32_t)tid; e < r->ne; e += (uint32_t)n_threads)
         for (uint32_t j = 0; j < r->n; j++) {
             const float *x = m->xn + (size_t)j * dm;
@@ -432,7 +446,7 @@ int janas_m_route_rank(struct janas_llm_model *m, uint32_t l, uint32_t n,
         return -1;
     /* xn and router are free between layers: l + 1 norms into xn first */
     janas_m_norm_quant(m, f32(m, ly->ffn_norm), 0, n);
-    struct router_job rj = {m, ly->router16, n, ne};
+    struct router_job rj = {m, ly->router16, n, ne, ly->router4};
     janas_pool_run(m->compute, router_worker, &rj); /* 512 x 2048 a layer */
     for (uint32_t j = 0; j < n; j++) {
         float *r = m->router + (size_t)j * ne;
@@ -733,7 +747,8 @@ int janas_m_moe_block(struct janas_llm_model *m, const struct layer *ly,
     double t_route = 0;
     if (k) {
         struct router_job rj = {m, ly->router16, n,
-                                ly->n_exp ? ly->n_exp : m->n_expert};
+                                ly->n_exp ? ly->n_exp : m->n_expert,
+                                ly->router4};
         janas_pool_run(m->compute, router_worker, &rj);
         if (janas_m_exp_tracing())
             t_route = now();

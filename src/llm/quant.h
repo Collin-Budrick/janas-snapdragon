@@ -565,10 +565,11 @@ float janas_q6kp_dot_ref(const struct janas_block_q6kp *w, const uint8_t *p1,
                          const uint8_t *p0, const struct janas_block_q8k *x,
                          size_t nb);
 /* Q6_K or Q3_K (p1, p0 NULL) or Q6_K_P (each row's planes pb bytes apart from
-   p1 and p0, NULL past its level) rows against nv vectors, y[r + v ys], eight
-   rows at a time as tiles (quant_dotn.h q6k_gemm): the rows done, a
-   multiple of eight (0 where the tiles do not serve: few vectors, no
-   AVX2, JANAS_CPU_TILES=0). The same bits as janas_dot_multi. */
+   p1 and p0, NULL past its level) rows against nv vectors, y[r + v ys].
+   Returns the rows done: a multiple of eight on x86 or two on ARM I8MM,
+   zero where the tiles do not serve. JANAS_CPU_TILES=0 disables them;
+   positive values explicitly enable experimental ARM shapes, while auto
+   retains only measured full-six-bit shapes. Same bits as janas_dot_multi. */
 size_t janas_q6k_tile_rows(int type, const void *w, size_t row_bytes,
                            const uint8_t *p1, const uint8_t *p0, size_t pb,
                            const struct janas_block_q8k *x, size_t x_stride,

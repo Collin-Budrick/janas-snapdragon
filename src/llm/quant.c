@@ -1763,6 +1763,10 @@ static const char *dot_name = "ref";
 /* the products of bytes and words in one instruction: AVX-VNNI, or
    AVX-512 VNNI (use_evnni too) */
 static int use_vnni, use_evnni;
+#if defined(__aarch64__)
+/* 0 off, 1 measured automatic cases, 2 experimental JANAS_CPU_TILES=1. */
+static int use_i8mm;
+#endif
 #if defined(__x86_64__)
 /* the prompt's tiles on 512 bits (quant_z.h), where AVX-512 VNNI is */
 static int use_z;
@@ -1923,6 +1927,14 @@ __attribute__((constructor)) static void dot_kernels_init(void)
         dotxs_impl = iq4xs_dot_neon;
         dotmx_impl = mxfp4_dot_neon;
         dot_name = "neon-dotprod";
+        const char *tiles = getenv("JANAS_CPU_TILES");
+        int tile_mode = !tiles ? 1 : atoi(tiles) > 0 ? 2 : 0;
+        if (tile_mode == 2)
+            dot6p_impl = q6kp_dotn_neon_fused;
+        if (janas_cpu_arm_i8mm())
+            use_i8mm = tile_mode;
+        if (use_i8mm)
+            dot_name = "neon-dotprod+i8mm";
     }
 #endif
 }
@@ -2231,6 +2243,21 @@ size_t janas_q6k_tile_rows(int type, const void *w, size_t row_bytes,
                           pb, x, x_stride, nv, nb, r8 - r16, y + r16, y_stride,
                           level);
     return r8;
+#elif defined(__aarch64__)
+    size_t r2 = rows / 2 * 2;
+    if (!use_i8mm || type != JANAS_Q6_K_P || nv < 2 || !r2)
+        return 0;
+    /* Native Windows microbenchmarks establish gains for the 80B model's
+       full six-bit, 512-column down products at four and eight vectors.
+       Odd counts, other widths and lower prefixes keep the established
+       rows unless JANAS_CPU_TILES=1 explicitly requests experimental tiles.
+       In particular a two-vector tile plus a one-vector tail can lose to
+       the existing three-vector kernel, which unpacks the weights once. */
+    if (use_i8mm == 1 && (!p0 || nb != 2 || (nv != 4 && nv != 8)))
+        return 0;
+    q6kp_rows_i8mm(w, row_bytes, p1, p0, pb, x, x_stride, nv, nb, r2, y,
+                    y_stride);
+    return r2;
 #else
     (void)type, (void)w, (void)row_bytes, (void)p1, (void)p0, (void)pb;
     (void)x, (void)x_stride, (void)nv, (void)nb, (void)rows, (void)y;

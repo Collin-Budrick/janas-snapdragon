@@ -25,6 +25,7 @@
 #include "common/pool.h"
 #include "common/sysinfo.h"
 #include "deltanet.h"
+#include "router.h"
 #include "tuner.h"
 #include "gpu.h"
 #include "matvec.h"
@@ -1065,6 +1066,26 @@ struct janas_llm_model *janas_llm_model_load(const char *path,
     if (!m->mtp && m->j.h.n_layer > m->n_layer &&
         load_mtp_internal(m, err, err_len) != 0)
         goto fail;
+#if defined(__aarch64__)
+    /* Conversion to router16 uses only the first half of an F32 tensor.
+       Its remaining half holds a lossless four-row interleave: no new RAM
+       allocation and the row-major copy remains available to the GPU.
+       Other source formats and incomplete groups retain the old path. */
+    for (uint32_t l = 0; l < m->n_layer + (uint32_t)m->mtp; l++) {
+        struct layer *ly = l < m->n_layer ? &m->layers[l] : &m->mtp_layer;
+        const struct janas_jns_tensor *t = ly->gate_inp;
+        uint32_t ne = ly->n_exp ? ly->n_exp : m->n_expert;
+        size_t bytes = janas_router4_bytes(ne, dm);
+        if (!ly->router16 || !t || t->type != 0 || ne != m->n_expert ||
+            ne % 4 || !bytes ||
+            t->dims[0] != dm || t->dims[1] != ne || bytes > t->bytes / 2 ||
+            ly->router16 != (const uint16_t *)data(m, t))
+            continue;
+        uint16_t *dst = (uint16_t *)data(m, t) + (size_t)ne * dm;
+        if (janas_router4_pack(dst, bytes, ly->router16, ne, dm) == 0)
+            ly->router4 = dst;
+    }
+#endif
     {
         /* the full layers' RoPE factors (theta divided by them, pair by
            pair: Gemma 4 turns only the first quarter of a head; Llama 3's

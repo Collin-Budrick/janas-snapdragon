@@ -43,6 +43,19 @@ void janas_gdn_step_h(uint16_t *M, const float *q, const float *k,
                       const float *v, float decay, float beta, float scale,
                       float *o, size_t dim, size_t rows);
 
+/* Portable half-state reference, for exact ARM kernel/replay comparisons.
+   This private header is not part of the public library ABI. */
+void janas_gdn_step_h_ref(uint16_t *M, const float *q, const float *k,
+                          const float *v, float decay, float beta, float scale,
+                          float *o, size_t dim, size_t rows);
+
+#ifdef JANAS_DELTANET_TEST
+/* Exercise the same half conversions as the ARM kernel, without arithmetic. */
+int janas_gdn_test_neon_half_enabled(void);
+void janas_gdn_test_half_to_float(const uint16_t *h, float *f, size_t n);
+void janas_gdn_test_float_to_half(const float *f, uint16_t *h, size_t n);
+#endif
+
 /* "avx2" or "ref": the kernel janas_gdn_step uses on this machine. */
 const char *janas_gdn_kernel_name(void);
 

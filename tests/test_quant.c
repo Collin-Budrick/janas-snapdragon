@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "common/pool.h"
+#include "common/sysinfo.h"
 #include "llm/bf16.h"
 #include "llm/matvec.h"
 #include "llm/quant.h"
@@ -365,12 +366,229 @@ done:
     free(xf);
 }
 
+/* The ARM tile gate is observable separately from numerical agreement: a
+   scalar fallback must not make an unavailable or unselected tile look used. */
+#if defined(__aarch64__)
+static size_t q6kp_arm_tile_rows(size_t rows, size_t nv, size_t nb, int level)
+{
+    const char *kernel = getenv("JANAS_KERNELS"),
+               *tiles = getenv("JANAS_CPU_TILES");
+    int enabled = tiles ? atoi(tiles) > 0
+                        : level == 3 && nb == 2 && (nv == 4 || nv == 8);
+    return janas_cpu_arm_dotprod() && janas_cpu_arm_i8mm() &&
+                   !(kernel && strcmp(kernel, "ref") == 0) && enabled &&
+                   nv >= 2
+               ? rows / 2 * 2
+               : 0;
+}
+#endif
+
+/* Check the complete output allocation, including the prefix/suffix, row
+   padding and unused tokens. The reference has ref_stride floats per token. */
+static size_t q6kp_tile_bad(const float *buffer, size_t count, size_t guard,
+                           size_t ys, size_t nv, size_t rows,
+                           const float *ref, size_t ref_stride)
+{
+    for (size_t i = 0; i < count; i++) {
+        float want = -12345.0f;
+        if (i >= guard) {
+            size_t at = i - guard, v = at / ys, r = at % ys;
+            if (v < nv && r < rows)
+                want = ref[v * ref_stride + r];
+        }
+        if (memcmp(buffer + i, &want, sizeof want))
+            return i;
+    }
+    return count;
+}
+
+/* Two-row tiles must respect byte strides for the weights and planes,
+   independent of the block strides of X and float strides of Y. Their odd
+   vector tail is still part of every returned row. The matrix task API has
+   contiguous weight rows: it is checked separately with padded X and Y. */
+static void test_q6kp_row_tiles_strided(void)
+{
+    enum {
+        NB = 9, NV = 17, ROWS = 9, GUARD = 4, YS = ROWS + 3,
+        WROW = ((NB * sizeof(struct janas_block_q6kp) + 15) / 16 + 1) * 16,
+        PB = NB * JANAS_Q6KP_PLANE + 7,
+        OUT = 2 * GUARD + (NV + 1) * YS
+    };
+    static const int blocks[] = {1, 2, 8, 9};
+    static const int row_counts[] = {1, 2, 3, 4, 9};
+    static const int vectors[] = {1, 2, 3, 4, 5, 8, 9, 16, 17};
+    static const uint16_t scales[] = {0x0000, 0x8000, 0x0001, 0x03ff,
+                                      0x0400, 0x3c00, 0xbc00, 0x7bff};
+    _Alignas(16) uint8_t
+        packed_w[ROWS * NB * sizeof(struct janas_block_q6kp) + 16];
+    _Alignas(16) uint8_t packed_p1[ROWS * NB * JANAS_Q6KP_PLANE + 16];
+    _Alignas(16) uint8_t packed_p0[ROWS * NB * JANAS_Q6KP_PLANE + 16];
+    _Alignas(16) uint8_t padded_w[ROWS * WROW + 16];
+    _Alignas(16) uint8_t padded_p1[ROWS * PB + 16];
+    _Alignas(16) uint8_t padded_p0[ROWS * PB + 16];
+    struct janas_block_q6kp *base = (void *)(packed_w + 2);
+    uint8_t *p1 = packed_p1 + 1, *p0 = packed_p0 + 3;
+    uint8_t *wp = padded_w + 2, *pp1 = padded_p1 + 1, *pp0 = padded_p0 + 3;
+    struct janas_block_q6k *raw = malloc(ROWS * NB * sizeof(*raw));
+    struct janas_block_q8k *x = calloc(NV * (NB + 2), sizeof(*x));
+    float *xf = malloc(NB * JANAS_QK * sizeof(*xf));
+    float output[OUT], ref[NV][ROWS];
+    struct janas_pool *pool = janas_pool_create(2, NULL);
+#if defined(__aarch64__)
+    size_t tiled_cases = 0;
+#endif
+    CHECK(raw && x && xf && pool, "q6kp row tiles: allocation");
+    if (!raw || !x || !xf || !pool)
+        goto done;
+    CHECK((uintptr_t)base % 16 == 2 && (uintptr_t)wp % 16 == 2 &&
+              (uintptr_t)p1 % 16 == 1 && (uintptr_t)pp1 % 16 == 1 &&
+              (uintptr_t)p0 % 16 == 3 && (uintptr_t)pp0 % 16 == 3,
+          "q6kp row tiles: fixture alignment");
+    for (int trial = 0; trial < 2; trial++) {
+        for (size_t i = 0; i < ROWS * NB * sizeof(*raw); i++)
+            ((uint8_t *)raw)[i] = (uint8_t)rnd();
+        for (int b = 0; b < ROWS * NB; b++) {
+            raw[b].d = scales[(b + 4 * trial) % 8];
+            for (int g = 0; g < 16; g++)
+                if ((g + b + trial) % 3 != 0)
+                    raw[b].scales[g] = (g & 1) ? 127 : -128;
+        }
+        for (size_t bi = 0; bi < sizeof blocks / sizeof *blocks; bi++) {
+            size_t nb = (size_t)blocks[bi], xs = nb + 2;
+            size_t rb = (nb * sizeof(*base) + 15) / 16 * 16 + 16;
+            size_t pb = nb * JANAS_Q6KP_PLANE + 7;
+            janas_q6k_to_planes(raw, ROWS * nb, base, p1, p0);
+            memset(padded_w, 0xa5, sizeof padded_w);
+            memset(padded_p1, 0xa5, sizeof padded_p1);
+            memset(padded_p0, 0xa5, sizeof padded_p0);
+            for (size_t r = 0; r < ROWS; r++) {
+                memcpy(wp + r * rb, base + r * nb, nb * sizeof(*base));
+                memcpy(pp1 + r * pb, p1 + r * nb * JANAS_Q6KP_PLANE,
+                       nb * JANAS_Q6KP_PLANE);
+                memcpy(pp0 + r * pb, p0 + r * nb * JANAS_Q6KP_PLANE,
+                       nb * JANAS_Q6KP_PLANE);
+            }
+            memset(x, 0, NV * (NB + 2) * sizeof(*x));
+            for (int v = 0; v < NV; v++) {
+                for (size_t i = 0; i < nb * JANAS_QK; i++)
+                    xf[i] = rndf(-1.0f, 1.0f);
+                janas_q8k_quantize(xf, x + v * xs, nb * JANAS_QK);
+            }
+            for (int level = 1; level <= 3; level++) {
+                const uint8_t *a1 = level >= 2 ? p1 : NULL;
+                const uint8_t *a0 = level >= 3 ? p0 : NULL;
+                const uint8_t *pa1 = level >= 2 ? pp1 : NULL;
+                const uint8_t *pa0 = level >= 3 ? pp0 : NULL;
+                for (size_t v = 0; v < NV; v++)
+                    for (size_t r = 0; r < ROWS; r++)
+                        ref[v][r] = janas_q6kp_dot_ref(
+                            base + r * nb,
+                            a1 ? a1 + r * nb * JANAS_Q6KP_PLANE : NULL,
+                            a0 ? a0 + r * nb * JANAS_Q6KP_PLANE : NULL,
+                            x + v * xs, nb);
+                for (size_t ri = 0;
+                     ri < sizeof row_counts / sizeof *row_counts; ri++) {
+                    size_t rows = (size_t)row_counts[ri], ys = rows + 3;
+                    for (size_t vi = 0;
+                         vi < sizeof vectors / sizeof *vectors; vi++) {
+                        size_t nv = (size_t)vectors[vi];
+                        for (size_t i = 0; i < OUT; i++)
+                            output[i] = -12345.0f;
+                        float *out = output + GUARD;
+                        size_t tiled = janas_q6k_tile_rows(
+                            JANAS_Q6_K_P, wp, rb, pa1, pa0, pb, x, xs,
+                            nv, nb, rows, out, ys);
+                        CHECK(tiled <= rows,
+                              "q6kp tiles: returned %zu of %zu rows", tiled,
+                              rows);
+#if defined(__aarch64__)
+                        CHECK(tiled == q6kp_arm_tile_rows(rows, nv, nb, level),
+                              "q6kp ARM tiles not selected correctly: nb %zu rows %zu level %d nv %zu got %zu",
+                              nb, rows, level, nv, tiled);
+                        if (tiled)
+                            tiled_cases++;
+#elif defined(__x86_64__)
+                        CHECK(tiled % 8 == 0, "q6kp x86 tiles: %zu rows", tiled);
+#else
+                        CHECK(tiled == 0, "q6kp unsupported tiles: %zu rows",
+                              tiled);
+#endif
+                        size_t safe = tiled <= rows ? tiled : 0;
+                        size_t bad = q6kp_tile_bad(output, OUT, GUARD, ys, nv,
+                                                 safe, &ref[0][0], ROWS);
+                        CHECK(bad == OUT,
+                              "q6kp direct tiles: trial %d nb %zu rows %zu level %d nv %zu index %zu",
+                              trial, nb, rows, level, nv, bad);
+                        for (size_t r = safe; r < rows; r++)
+                            janas_q6kp_dot_multi(
+                                (const void *)(wp + r * rb),
+                                pa1 ? pa1 + r * pb : NULL,
+                                pa0 ? pa0 + r * pb : NULL,
+                                x, xs, nv, nb, out + r, ys);
+                        bad = q6kp_tile_bad(output, OUT, GUARD, ys, nv, rows,
+                                           &ref[0][0], ROWS);
+                        CHECK(bad == OUT,
+                              "q6kp tiles with tail: nb %zu rows %zu level %d nv %zu index %zu",
+                              nb, rows, level, nv, bad);
+                        for (size_t i = 0; i < OUT; i++)
+                            output[i] = -12345.0f;
+                        struct janas_matvec_task t = {
+                            .type = JANAS_Q6_K_P, .w = base,
+                            .plane = {a1, a0}, .x = x, .y = out,
+                            .rows = rows, .cols = nb * JANAS_QK,
+                            .n_vec = nv, .x_stride = xs, .y_stride = ys};
+                        janas_matvec_q4k_group(pool, &t, 1);
+                        bad = q6kp_tile_bad(output, OUT, GUARD, ys, nv, rows,
+                                           &ref[0][0], ROWS);
+                        CHECK(bad == OUT,
+                              "q6kp matrix tiles: nb %zu rows %zu level %d nv %zu index %zu",
+                              nb, rows, level, nv, bad);
+                    }
+                }
+            }
+        }
+    }
+#if defined(__aarch64__)
+    {
+        const char *kernel = getenv("JANAS_KERNELS"),
+                   *tiles = getenv("JANAS_CPU_TILES");
+        if (janas_cpu_arm_dotprod() && janas_cpu_arm_i8mm() &&
+            !(kernel && strcmp(kernel, "ref") == 0) &&
+            (!tiles || atoi(tiles) > 0))
+            CHECK(tiled_cases > 0,
+                  "q6kp ARM tiles: %s matrix must exercise I8MM",
+                  tiles ? "forced" : "automatic full-level nb2 nv4/8");
+        struct janas_block_q6k q6[2] = {0};
+        struct janas_block_q3k q3[2] = {0};
+        const void *weights[] = {q6, q3};
+        const int types[] = {JANAS_Q6_K, JANAS_Q3_K};
+        const size_t row_bytes[] = {sizeof q6[0], sizeof q3[0]};
+        for (int type = 0; type < 2; type++) {
+            for (size_t i = 0; i < OUT; i++)
+                output[i] = -12345.0f;
+            size_t tiled = janas_q6k_tile_rows(
+                types[type], weights[type], row_bytes[type], NULL, NULL, 0,
+                x, NB + 2, 2, 1, 2, output + GUARD, 5);
+            CHECK(tiled == 0, "ARM tiles must decline type %d", types[type]);
+            CHECK(q6kp_tile_bad(output, OUT, GUARD, 5, 0, 0,
+                               &ref[0][0], ROWS) == OUT,
+                  "declined ARM type %d changed output", types[type]);
+        }
+    }
+#endif
+done:
+    janas_pool_destroy(pool);
+    free(raw);
+    free(x);
+    free(xf);
+}
+
 /*
  * Q6_K and Q6_K_P as tiles of eight rows (janas_q6k_tile_rows), and of
  * sixteen on 512 bits where AVX-512 VNNI is: 27 rows, 9 blocks (past the eight
  * transposed at a time), 1 to 65 vectors (past the 64 tokens at a time), Q6_K_P
- * at every level; each result janas_q6k_dot's or janas_q6kp_dot's to the bit,
- * and the rows done a multiple of eight.
+ * at every level; each result janas_q6k_dot's or janas_q6kp_dot's to the bit.
+ * ARM I8MM covers pairs of Q6_K_P rows; raw Q6_K declines its tile path.
  */
 static void test_q6k_tiles(void)
 {
@@ -406,11 +624,13 @@ static void test_q6k_tiles(void)
                 out[i] = -12345.0f;
             size_t done = janas_q6k_tile_rows(t, wr, rb, a1, a0, pb, x, NB,
                                               (size_t)nv, NB, ROWS, out, ROWS);
-            /* The optional row-tile kernel is x86-only; other targets
-               decline the rows and use the regular matrix-vector path. */
+            /* x86's tiles cover eight rows; ARM I8MM takes pairs of planar
+               rows. Raw Q6_K still declines the optional ARM tile path. */
             size_t want = 0;
 #if defined(__x86_64__)
             want = nv >= 12 ? 24u : 0u;
+#elif defined(__aarch64__)
+            want = level ? q6kp_arm_tile_rows(ROWS, (size_t)nv, NB, level) : 0;
 #endif
             CHECK(done == want, "q6k tiles: %zu rows", done);
             for (size_t r = 0; r < done; r++)
@@ -2451,6 +2671,7 @@ int main(void)
     test_dot_q6k();
     test_q6k_planes();
     test_q6k_planes_strided();
+    test_q6kp_row_tiles_strided();
     test_q6kpn_axpy();
     test_q6kpn_chunk();
     test_matvec();

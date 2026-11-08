@@ -12,6 +12,9 @@
 #if defined(__x86_64__)
 #include <immintrin.h>
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
 
 void janas_gdn_step_ref(float *M, const float *q, const float *k,
                         const float *v, float decay, float beta, float scale,
@@ -94,9 +97,9 @@ gdn_step_avx2(float *M, const float *q, const float *k, const float *v,
 }
 #endif
 
-static void gdn_step_h_ref(uint16_t *M, const float *q, const float *k,
-                           const float *v, float decay, float beta, float scale,
-                           float *o, size_t dim, size_t rows)
+void janas_gdn_step_h_ref(uint16_t *M, const float *q, const float *k,
+                          const float *v, float decay, float beta, float scale,
+                          float *o, size_t dim, size_t rows)
 {
     float r[256];
     for (size_t j = 0; j < rows; j++) {
@@ -115,6 +118,145 @@ static void gdn_step_h_ref(uint16_t *M, const float *q, const float *k,
         o[j] = sq * scale;
     }
 }
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+/* Use the hardware conversion only in the IEEE, round-to-nearest FPCR
+   configuration tested against the software conversion. Do not change the
+   caller's FPCR: other rounding/half modes retain the portable path. */
+static int gdn_neon_half_ok(void)
+{
+    uint64_t fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    return !(fpcr & ((UINT64_C(1) << 26) | (UINT64_C(3) << 22) |
+                     (UINT64_C(1) << 19)));
+}
+
+static float32x4_t gdn_load_half4(const uint16_t *p)
+{
+    uint16x4_t h = vld1_u16(p);
+    /* The software conversion preserves a signalling NaN's payload. FCVTL
+       quiets it, so retain the software behavior for nonfinite inputs. */
+    if (vmaxv_u16(vceq_u16(vand_u16(h, vdup_n_u16(0x7c00)),
+                            vdup_n_u16(0x7c00)))) {
+        float f[4];
+        for (int i = 0; i < 4; i++)
+            f[i] = janas_fp16_to_fp32(p[i]);
+        return vld1q_f32(f);
+    }
+    return vcvt_f32_f16(vreinterpret_f16_u16(h));
+}
+
+static void gdn_store_half4(uint16_t *p, float32x4_t f)
+{
+    uint32x4_t bits = vreinterpretq_u32_f32(f);
+    if (vmaxvq_u32(vceqq_u32(vandq_u32(bits, vdupq_n_u32(0x7f800000)),
+                              vdupq_n_u32(0x7f800000)))) {
+        float a[4];
+        vst1q_f32(a, f);
+        for (int i = 0; i < 4; i++)
+            p[i] = janas_fp32_to_fp16(a[i]);
+        return;
+    }
+    /* FCVTN is round-to-nearest, ties-to-even, including half subnormals. */
+    vst1_u16(p, vreinterpret_u16_f16(vcvt_f16_f32(f)));
+}
+
+/* Four rows become the lanes of a vector. The temporary is transposed, but
+   persistent state stays row-major. Every lane adds i=0,1,... in the scalar
+   order; neither reduction is reassociated and no multiply-add is fused. */
+static void gdn_transpose4(float32x4_t *a, float32x4_t *b, float32x4_t *c,
+                            float32x4_t *d)
+{
+    float32x4x2_t ab = vtrnq_f32(*a, *b), cd = vtrnq_f32(*c, *d);
+    *a = vcombine_f32(vget_low_f32(ab.val[0]), vget_low_f32(cd.val[0]));
+    *b = vcombine_f32(vget_low_f32(ab.val[1]), vget_low_f32(cd.val[1]));
+    *c = vcombine_f32(vget_high_f32(ab.val[0]), vget_high_f32(cd.val[0]));
+    *d = vcombine_f32(vget_high_f32(ab.val[1]), vget_high_f32(cd.val[1]));
+}
+
+static void gdn_step_h_neon(uint16_t *M, const float *q, const float *k,
+                            const float *v, float decay, float beta, float scale,
+                            float *o, size_t dim, size_t rows)
+{
+    float32x4_t r[256];
+    float32x4_t vd = vdupq_n_f32(decay), vb = vdupq_n_f32(beta);
+    size_t j = 0;
+    for (; j + 4 <= rows; j += 4) {
+        uint16_t *m = M + j * dim;
+        float32x4_t sk = vdupq_n_f32(0), sq = vdupq_n_f32(0);
+        for (size_t i = 0; i < dim; i += 4) {
+            float32x4_t a = gdn_load_half4(m + i);
+            float32x4_t b = gdn_load_half4(m + dim + i);
+            float32x4_t c = gdn_load_half4(m + 2 * dim + i);
+            float32x4_t d = gdn_load_half4(m + 3 * dim + i);
+            gdn_transpose4(&a, &b, &c, &d);
+            r[i] = vmulq_f32(a, vd);
+            r[i + 1] = vmulq_f32(b, vd);
+            r[i + 2] = vmulq_f32(c, vd);
+            r[i + 3] = vmulq_f32(d, vd);
+            sk = vaddq_f32(sk, vmulq_n_f32(r[i], k[i]));
+            sk = vaddq_f32(sk, vmulq_n_f32(r[i + 1], k[i + 1]));
+            sk = vaddq_f32(sk, vmulq_n_f32(r[i + 2], k[i + 2]));
+            sk = vaddq_f32(sk, vmulq_n_f32(r[i + 3], k[i + 3]));
+        }
+        float32x4_t delta = vmulq_f32(vsubq_f32(vld1q_f32(v + j), sk), vb);
+        for (size_t i = 0; i < dim; i += 4) {
+            float32x4_t a = vaddq_f32(r[i], vmulq_n_f32(delta, k[i]));
+            float32x4_t b = vaddq_f32(r[i + 1], vmulq_n_f32(delta, k[i + 1]));
+            float32x4_t c = vaddq_f32(r[i + 2], vmulq_n_f32(delta, k[i + 2]));
+            float32x4_t d = vaddq_f32(r[i + 3], vmulq_n_f32(delta, k[i + 3]));
+            sq = vaddq_f32(sq, vmulq_n_f32(a, q[i]));
+            sq = vaddq_f32(sq, vmulq_n_f32(b, q[i + 1]));
+            sq = vaddq_f32(sq, vmulq_n_f32(c, q[i + 2]));
+            sq = vaddq_f32(sq, vmulq_n_f32(d, q[i + 3]));
+            gdn_transpose4(&a, &b, &c, &d);
+            gdn_store_half4(m + i, a);
+            gdn_store_half4(m + dim + i, b);
+            gdn_store_half4(m + 2 * dim + i, c);
+            gdn_store_half4(m + 3 * dim + i, d);
+        }
+        vst1q_f32(o + j, vmulq_n_f32(sq, scale));
+    }
+    if (j < rows)
+        janas_gdn_step_h_ref(M + j * dim, q, k, v + j, decay, beta, scale,
+                             o + j, dim, rows - j);
+}
+#endif
+
+#ifdef JANAS_DELTANET_TEST
+int janas_gdn_test_neon_half_enabled(void)
+{
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return gdn_neon_half_ok();
+#else
+    return 0;
+#endif
+}
+
+void janas_gdn_test_half_to_float(const uint16_t *h, float *f, size_t n)
+{
+    size_t i = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (gdn_neon_half_ok())
+        for (; i + 4 <= n; i += 4)
+            vst1q_f32(f + i, gdn_load_half4(h + i));
+#endif
+    for (; i < n; i++)
+        f[i] = janas_fp16_to_fp32(h[i]);
+}
+
+void janas_gdn_test_float_to_half(const float *f, uint16_t *h, size_t n)
+{
+    size_t i = 0;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (gdn_neon_half_ok())
+        for (; i + 4 <= n; i += 4)
+            gdn_store_half4(h + i, vld1q_f32(f + i));
+#endif
+    for (; i < n; i++)
+        h[i] = janas_fp32_to_fp16(f[i]);
+}
+#endif
 
 #if defined(__x86_64__)
 __attribute__((target("avx2,fma,f16c"))) static void
@@ -207,7 +349,13 @@ void janas_gdn_step_h(uint16_t *M, const float *q, const float *k,
         return;
     }
 #endif
-    gdn_step_h_ref(M, q, k, v, decay, beta, scale, o, dim, rows);
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (dim <= 256 && dim % 4 == 0 && gdn_neon_half_ok()) {
+        gdn_step_h_neon(M, q, k, v, decay, beta, scale, o, dim, rows);
+        return;
+    }
+#endif
+    janas_gdn_step_h_ref(M, q, k, v, decay, beta, scale, o, dim, rows);
 }
 
 const char *janas_gdn_kernel_name(void)

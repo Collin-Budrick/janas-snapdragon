@@ -425,8 +425,8 @@ static NEON_DP float q6k_dot_neon(const struct janas_block_q6k *w,
 /* One two-bit piece of each plane, combined before the dot. All levels
    remain unsigned int8 (0..3, 0..15 or 0..63); the zero-point correction is
    applied exactly in int32, as in janas_q6kp_dot_ref. */
-NEON_DOTN_K uint8x16_t neon_q6kp_piece(uint8x16_t base, uint8x16_t p1,
-                                       uint8x16_t p0, int shift, int level)
+static inline __attribute__((always_inline)) uint8x16_t neon_q6kp_piece(
+    uint8x16_t base, uint8x16_t p1, uint8x16_t p0, int shift, int level)
 {
     int8x16_t right = vdupq_n_s8((int8_t)-shift);
     uint8x16_t mask = vdupq_n_u8(3);
@@ -436,6 +436,67 @@ NEON_DOTN_K uint8x16_t neon_q6kp_piece(uint8x16_t base, uint8x16_t p1,
     if (level >= 3)
         q = vorrq_u8(vshlq_n_u8(q, 2), vandq_u8(vshlq_u8(p0, right), mask));
     return q;
+}
+
+/* Four consecutive groups, without keeping a whole unpacked block live.
+   The integer additions may be regrouped; the block's float FMA may not. */
+NEON_DOTN_K int32x4_t neon_q6kp_dot4_6(uint8x16_t hi0, uint8x16_t hi1,
+                                       uint8x16_t mid0, uint8x16_t mid1,
+                                       uint8x16_t lo0, uint8x16_t lo1,
+                                       const int8_t *x, int shift)
+{
+    int8x16_t q0 =
+        vreinterpretq_s8_u8(neon_q6kp_piece(hi0, mid0, lo0, shift, 3));
+    int8x16_t q1 =
+        vreinterpretq_s8_u8(neon_q6kp_piece(hi1, mid1, lo1, shift, 3));
+    int8x16_t q2 =
+        vreinterpretq_s8_u8(neon_q6kp_piece(hi0, mid0, lo0, shift + 2, 3));
+    int8x16_t q3 =
+        vreinterpretq_s8_u8(neon_q6kp_piece(hi1, mid1, lo1, shift + 2, 3));
+    return neon_red4(vdotq_s32(vdupq_n_s32(0), q0, vld1q_s8(x)),
+                     vdotq_s32(vdupq_n_s32(0), q1, vld1q_s8(x + 16)),
+                     vdotq_s32(vdupq_n_s32(0), q2, vld1q_s8(x + 32)),
+                     vdotq_s32(vdupq_n_s32(0), q3, vld1q_s8(x + 48)));
+}
+
+static NEON_DP float q6kp_dot_6_neon(const struct janas_block_q6kp *w,
+                                     const uint8_t *p1, const uint8_t *p0,
+                                     const struct janas_block_q8k *x, size_t nb)
+{
+    float acc = 0.0f;
+    for (size_t b = 0; b < nb; b++) {
+        const struct janas_block_q6kp *wb = w + b;
+        const struct janas_block_q8k *xb = x + b;
+        int8x16_t sc = vld1q_s8(wb->scales);
+        int16x8_t sl = vmovl_s8(vget_low_s8(sc));
+        int16x8_t sh = vmovl_s8(vget_high_s8(sc));
+        int32x4_t si = vdupq_n_s32(0);
+        for (int n = 0; n < 2; n++) {
+            size_t at = b * JANAS_Q6KP_PLANE + 32 * n;
+            uint8x16_t hi0 = vld1q_u8(wb->q + 32 * n);
+            uint8x16_t hi1 = vld1q_u8(wb->q + 32 * n + 16);
+            uint8x16_t mid0 = vld1q_u8(p1 + at);
+            uint8x16_t mid1 = vld1q_u8(p1 + at + 16);
+            uint8x16_t lo0 = vld1q_u8(p0 + at);
+            uint8x16_t lo1 = vld1q_u8(p0 + at + 16);
+            int16x8_t scales = n ? sh : sl;
+            si = vmlaq_s32(si,
+                           neon_q6kp_dot4_6(hi0, hi1, mid0, mid1, lo0, lo1,
+                                            xb->qs + 128 * n, 0),
+                           vmovl_s16(vget_low_s16(scales)));
+            si = vmlaq_s32(si,
+                           neon_q6kp_dot4_6(hi0, hi1, mid0, mid1, lo0, lo1,
+                                            xb->qs + 128 * n + 64, 4),
+                           vmovl_s16(vget_high_s16(scales)));
+        }
+        int32x4_t off = vmull_s16(vget_low_s16(sl), vld1_s16(xb->bsums));
+        off = vmlal_s16(off, vget_high_s16(sl), vld1_s16(xb->bsums + 4));
+        off = vmlal_s16(off, vget_low_s16(sh), vld1_s16(xb->bsums + 8));
+        off = vmlal_s16(off, vget_high_s16(sh), vld1_s16(xb->bsums + 12));
+        int32_t dot = 2 * vaddvq_s32(si) - 64 * vaddvq_s32(off);
+        acc = fmaf(neon_h2f(wb->d) * 0.5f * xb->d, (float)dot, acc);
+    }
+    return acc;
 }
 
 /* Q6_K_P: unpack each block once for up to eight activation vectors. Group
@@ -507,4 +568,169 @@ static NEON_DP void q6kp_dotn_neon(const struct janas_block_q6kp *w,
 #define C(N) q6kp_dotn_neon_k(w, p1, p0, x, xs, N, nb, out)
     NEON_NV_SWITCH(C)
 #undef C
+}
+
+/* Opt-in: register allocation and the winning width vary by compiler.
+   The default single-vector dispatch remains the established kernel. */
+static NEON_DP void q6kp_dotn_neon_fused(const struct janas_block_q6kp *w,
+                                         const uint8_t *p1, const uint8_t *p0,
+                                         const struct janas_block_q8k *x,
+                                         size_t xs, int nv, size_t nb,
+                                         float *out)
+{
+    if (nv == 1 && p0)
+        out[0] = q6kp_dot_6_neon(w, p1, p0, x, nb);
+    else
+        q6kp_dotn_neon(w, p1, p0, x, xs, nv, nb, out);
+}
+
+/* I8MM's four lanes are [row0 token0, row0 token1, row1 token0,
+   row1 token1]. Pack two eight-element halves of each 16-element group.
+   Scale and zero-point corrections remain exact int32; each output keeps
+   the reference's one FMA per block, in ascending block order. */
+#define NEON_I8MM __attribute__((target("+i8mm")))
+#define NEON_I8MM_K static inline __attribute__((always_inline)) NEON_I8MM
+
+static inline __attribute__((always_inline))
+int32_t neon_q6kp_offset(const int8_t *scales, const int16_t *bsums)
+{
+    int8x16_t sc = vld1q_s8(scales);
+    int16x8_t sl = vmovl_s8(vget_low_s8(sc));
+    int16x8_t sh = vmovl_s8(vget_high_s8(sc));
+    int32x4_t off = vmull_s16(vget_low_s16(sl), vld1_s16(bsums));
+    off = vmlal_s16(off, vget_high_s16(sl), vld1_s16(bsums + 4));
+    off = vmlal_s16(off, vget_low_s16(sh), vld1_s16(bsums + 8));
+    off = vmlal_s16(off, vget_high_s16(sh), vld1_s16(bsums + 12));
+    return vaddvq_s32(off);
+}
+
+NEON_I8MM_K void q6kp_tile_i8mm_k(const struct janas_block_q6kp *w0,
+                                  const struct janas_block_q6kp *w1,
+                                  const uint8_t *p10, const uint8_t *p11,
+                                  const uint8_t *p00, const uint8_t *p01,
+                                  const struct janas_block_q8k *x, size_t xs,
+                                  int nt, size_t nb, float *y, size_t ys,
+                                  int level)
+{
+    float32x4_t acc[2]; /* two or four tokens, two rows */
+    for (int t = 0; t < nt / 2; t++)
+        acc[t] = vdupq_n_f32(0.0f);
+    for (size_t b = 0; b < nb; b++) {
+        int32x4_t sum[2];
+        for (int t = 0; t < nt / 2; t++)
+            sum[t] = vdupq_n_s32(0);
+        for (int n = 0; n < 2; n++)
+            for (int h = 0; h < 2; h++) {
+                size_t at = b * JANAS_Q6KP_PLANE + 32 * n + 16 * h;
+                uint8x16_t hi0 = vld1q_u8(w0[b].q + 32 * n + 16 * h);
+                uint8x16_t hi1 = vld1q_u8(w1[b].q + 32 * n + 16 * h);
+                uint8x16_t mid0 =
+                    level >= 2 ? vld1q_u8(p10 + at) : vdupq_n_u8(0);
+                uint8x16_t mid1 =
+                    level >= 2 ? vld1q_u8(p11 + at) : vdupq_n_u8(0);
+                uint8x16_t lo0 =
+                    level >= 3 ? vld1q_u8(p00 + at) : vdupq_n_u8(0);
+                uint8x16_t lo1 =
+                    level >= 3 ? vld1q_u8(p01 + at) : vdupq_n_u8(0);
+                for (int part = 0; part < 4; part++) {
+                    int g = 8 * n + h + 2 * part;
+                    int8x16_t q0 = vreinterpretq_s8_u8(
+                        neon_q6kp_piece(hi0, mid0, lo0, 2 * part, level));
+                    int8x16_t q1 = vreinterpretq_s8_u8(
+                        neon_q6kp_piece(hi1, mid1, lo1, 2 * part, level));
+                    int8x16_t wl = vreinterpretq_s8_s64(vzip1q_s64(
+                        vreinterpretq_s64_s8(q0), vreinterpretq_s64_s8(q1)));
+                    int8x16_t wh = vreinterpretq_s8_s64(vzip2q_s64(
+                        vreinterpretq_s64_s8(q0), vreinterpretq_s64_s8(q1)));
+                    int32x4_t sc = vcombine_s32(vdup_n_s32(w0[b].scales[g]),
+                                                vdup_n_s32(w1[b].scales[g]));
+                    for (int t = 0; t < nt / 2; t++) {
+                        const struct janas_block_q8k *a = x + 2 * t * xs + b;
+                        const struct janas_block_q8k *c = a + xs;
+                        int8x16_t a0 = vld1q_s8(a->qs + 16 * g);
+                        int8x16_t a1 = vld1q_s8(c->qs + 16 * g);
+                        int8x16_t al = vreinterpretq_s8_s64(
+                            vzip1q_s64(vreinterpretq_s64_s8(a0),
+                                       vreinterpretq_s64_s8(a1)));
+                        int8x16_t ah = vreinterpretq_s8_s64(
+                            vzip2q_s64(vreinterpretq_s64_s8(a0),
+                                       vreinterpretq_s64_s8(a1)));
+                        int32x4_t dot = vmmlaq_s32(vdupq_n_s32(0), wl, al);
+                        dot = vmmlaq_s32(dot, wh, ah);
+                        sum[t] = vmlaq_s32(sum[t], dot, sc);
+                    }
+                }
+            }
+        int factor = level == 3 ? 2 : level == 2 ? 8 : 32;
+        int center = level == 3 ? 64 : level == 2 ? 61 : 49;
+        float32x4_t d = vcombine_f32(vdup_n_f32(neon_h2f(w0[b].d) * 0.5f),
+                                     vdup_n_f32(neon_h2f(w1[b].d) * 0.5f));
+        for (int t = 0; t < nt / 2; t++) {
+            const struct janas_block_q8k *a = x + 2 * t * xs + b;
+            const struct janas_block_q8k *c = a + xs;
+            int32x2_t o0 = vdup_n_s32(neon_q6kp_offset(w0[b].scales, a->bsums));
+            o0 = vset_lane_s32(neon_q6kp_offset(w0[b].scales, c->bsums), o0, 1);
+            int32x2_t o1 = vdup_n_s32(neon_q6kp_offset(w1[b].scales, a->bsums));
+            o1 = vset_lane_s32(neon_q6kp_offset(w1[b].scales, c->bsums), o1, 1);
+            int32x4_t dot =
+                vsubq_s32(vmulq_n_s32(sum[t], factor),
+                          vmulq_n_s32(vcombine_s32(o0, o1), center));
+            float32x2_t dx = vdup_n_f32((x + 2 * t * xs + b)->d);
+            dx = vset_lane_f32((x + (2 * t + 1) * xs + b)->d, dx, 1);
+            acc[t] = vfmaq_f32(acc[t], vmulq_f32(d, vcombine_f32(dx, dx)),
+                               vcvtq_f32_s32(dot));
+        }
+    }
+    for (int t = 0; t < nt / 2; t++) {
+        y[(size_t)(2 * t) * ys] = vgetq_lane_f32(acc[t], 0);
+        y[(size_t)(2 * t + 1) * ys] = vgetq_lane_f32(acc[t], 1);
+        y[(size_t)(2 * t) * ys + 1] = vgetq_lane_f32(acc[t], 2);
+        y[(size_t)(2 * t + 1) * ys + 1] = vgetq_lane_f32(acc[t], 3);
+    }
+}
+
+static NEON_I8MM void q6kp_rows_i8mm(const void *w, size_t row_bytes,
+                                     const uint8_t *p1, const uint8_t *p0,
+                                     size_t pb, const struct janas_block_q8k *x,
+                                     size_t xs, size_t nv, size_t nb,
+                                     size_t rows, float *y, size_t ys)
+{
+    int level = p0 ? 3 : p1 ? 2 : 1;
+    for (size_t r = 0; r < rows; r += 2) {
+        const struct janas_block_q6kp *w0 =
+            (const struct janas_block_q6kp *)((const char *)w + r * row_bytes);
+        const struct janas_block_q6kp *w1 =
+            (const struct janas_block_q6kp *)((const char *)w0 + row_bytes);
+        const uint8_t *p10 = p1 ? p1 + r * pb : NULL;
+        const uint8_t *p11 = p1 ? p10 + pb : NULL;
+        const uint8_t *p00 = p0 ? p0 + r * pb : NULL;
+        const uint8_t *p01 = p0 ? p00 + pb : NULL;
+        size_t v = 0;
+#define Q6KP_TILE_L(T, L)                                                      \
+    q6kp_tile_i8mm_k(w0, w1, p10, p11, p00, p01, x + v * xs, xs, T, nb,        \
+                     y + r + v * ys, ys, L)
+#define Q6KP_TILE(T)                                                           \
+    do {                                                                       \
+        if (level == 3)                                                        \
+            Q6KP_TILE_L(T, 3);                                                 \
+        else if (level == 2)                                                   \
+            Q6KP_TILE_L(T, 2);                                                 \
+        else                                                                   \
+            Q6KP_TILE_L(T, 1);                                                 \
+    } while (0)
+        for (; v + 4 <= nv; v += 4)
+            Q6KP_TILE(4);
+        if (v + 2 <= nv) {
+            Q6KP_TILE(2);
+            v += 2;
+        }
+#undef Q6KP_TILE
+#undef Q6KP_TILE_L
+        if (v < nv) {
+            q6kp_dotn_neon_fused(w0, p10, p00, x + v * xs, xs, 1, nb,
+                                 y + r + v * ys);
+            q6kp_dotn_neon_fused(w1, p11, p01, x + v * xs, xs, 1, nb,
+                                 y + r + v * ys + 1);
+        }
+    }
 }

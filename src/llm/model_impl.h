@@ -72,6 +72,7 @@ struct layer {
     struct janas_jns_matrix sh_mx[3];
     float *sh_gate;           /* d_model weights of the sigmoid gate, as f32 */
     const uint16_t *router16; /* router weights, f16 (in place of the f32) */
+    uint16_t *router4;        /* non-owning: interleaved f16 in unused f32 half */
     uint16_t *router_own;     /* the zero router of a dense layer, if any */
     float *conv_t;            /* conv weights transposed: d_conv x conv_ch */
     /* qwen4exp (model_hc.c): the hyper-connections before the token mixer
