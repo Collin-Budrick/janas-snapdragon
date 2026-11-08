@@ -83,6 +83,6 @@ int main(void)
     check_case(pool, 5, 3); /* exact odd-row fallback and shared input */
     check_case(pool, 513, 9); /* concurrent claims, odd token, many row pieces */
     janas_pool_destroy(pool);
-    puts("matvec dispatch stats: exact rows/vectors, dedup, reset and NULL path ok");
+    puts("test_matvec_stats: exact rows/vectors, dedup, reset and NULL path ok");
     return 0;
 }

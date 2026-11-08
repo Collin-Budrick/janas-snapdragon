@@ -241,12 +241,15 @@ static void metrics_tests(struct janas_llm_chat *c)
         offsetof(struct janas_llm_speculation_metrics, expert_assignments)};
     for (unsigned i = 0; i < 4; i++) {
         box = before; box.m.size = prefixes[i];
-        CHECK(janas_llm_chat_speculation_metrics(c, &box.m) == JANAS_LLM_OK &&
-              box.m.size == sizeof(box.m) && box.m.version == JANAS_LLM_SPEC_METRICS_VERSION,
-              "known metrics prefix accepted and reports current layout");
-        const unsigned char *bytes = (const unsigned char *)&box;
-        for (size_t j = prefixes[i]; j < sizeof(box); j++)
-            CHECK(bytes[j] == 0xa5, "prefix metrics copy respects exact caller boundary");
+        for (unsigned call = 0; call < 2; call++) {
+            CHECK(janas_llm_chat_speculation_metrics(c, &box.m) == JANAS_LLM_OK &&
+                  box.m.size == prefixes[i] &&
+                  box.m.version == JANAS_LLM_SPEC_METRICS_VERSION,
+                  "metrics prefix preserves caller capacity across repeated calls");
+            const unsigned char *bytes = (const unsigned char *)&box;
+            for (size_t j = prefixes[i]; j < sizeof(box); j++)
+                CHECK(bytes[j] == 0xa5, "repeated prefix copy respects exact caller boundary");
+        }
     }
     fixture_gen.cycles = c->gm0.cycles;
     box = before;
