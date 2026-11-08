@@ -15,10 +15,11 @@ include cache-size, lookup, Hexagon and native llama.cpp comparisons;
 the [guide](docs/snapdragon.md#measured-settings-and-starting-the-server)
 provides the measured launch profiles and their validation limits.
 
-The [exact runtime experiments](docs/snapdragon-runtime.md) add bounded activation
-panels, cycle planning, hybrid conversation lookup, adaptive draft-only vocabulary
-and recurrent recovery journals. Their controls and validation are documented
-separately from the earlier SIMD measurements.
+The [exact runtime experiments](docs/snapdragon-runtime.md) add activation panels,
+cycle planning, hybrid lookup, adaptive draft-only vocabulary and recurrent
+recovery journals. The [matched release report](docs/benchmarks/snapdragon80b-20261108-runtime.json)
+records the balanced workload comparison and validation boundaries. The CPU
+profile enables only the exact recovery changes that passed its promotion gates.
 
 The upstream performance figures below describe its Intel test machine.
 Results for this Snapdragon laptop are recorded separately in the guide.

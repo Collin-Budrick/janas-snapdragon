@@ -26,9 +26,29 @@ Weights and local runtime binaries stay outside Git.
 The selected profile uses eight CPU cores, a 32 GiB main expert cache, the
 separate MTP cache, a four-token draft ceiling and demand reads from the SSD.
 The 48.4 GB model stays on disk; only the needed experts enter the RAM cache.
-The MTP planner adjusts its actual draft length. Exact SIMD optimizations now
+The MTP planner adjusts its actual draft length. The promoted CPU profile also enables exact DeltaNet chains, a delta journal
+and K-only recovery. The planner and draft vocabulary remain legacy, and new
+activation panels remain experimental. The latest matched ABBA comparison used
+five warm samples per binary on every workload:
+
+| Workload, 128 generated tokens | Prior release | Current CPU profile | Rate ratio |
+|---|---:|---:|---:|
+| Repeated code, 276 input tokens | 16.14 tok/s | **23.32 tok/s** | 1.444x |
+| General prose, 63 input tokens | 16.31 tok/s | **18.90 tok/s** | 1.159x |
+| Longer code prompt, 1,304 input tokens | 17.01 tok/s | **17.68 tok/s** | 1.039x |
+
+The geometric-mean rate gain was **20.3%**, with no workload regression and
+improved median first-token time on all three. All output hashes and counts
+agreed. Fresh samples are retained; fresh process does not imply cold SSD cache.
+**40 tok/s was not reached.** See the [runtime guide](snapdragon-runtime.md) and
+[raw matched results](benchmarks/snapdragon80b-20261108-runtime.json) for identities,
+controls and validation limits.
+
+Earlier SIMD-stage comparison (a separate control and measurement window):
+
+Exact SIMD optimizations now
 accelerate routing, recurrent state updates and selected expert products.
-The latest matched trials used the same CPU/MTP settings in both builds:
+That earlier SIMD comparison used the same CPU/MTP settings in both builds:
 
 | Workload, 128 generated tokens | Saved build | SIMD build | Rate ratio | Warm samples per binary |
 |---|---:|---:|---:|---:|
@@ -77,7 +97,7 @@ Prompt time varied substantially in those llama.cpp runs and is not ranked here.
 Successful NPU operation counters verified real Hexagon execution in the
 earlier draft-only configuration; it was slower than that CPU/MTP comparison.
 The optional NPU and automatic-cache profiles retain explicitly historical
-performance evidence and have not been rebenchmarked in this SIMD stage.
+performance evidence and have not been rebenchmarked in this runtime stage.
 GPU chat trials fell back to the CPU after a startup self-check failure and
 are not counted as GPU acceleration. Numerical accelerator probes are discussed
 below. The [machine-readable report](benchmarks/snapdragon80b-20261108-results.json)
@@ -100,7 +120,8 @@ not part of this validation. No automatic startup service is installed.
 For terminal chat, replace `--app server --port 8089 --test` with `--app chat`.
 Use `--dry-run` to inspect the command and identity checks first. The launcher
 checks model size and the first MiB hash; the recorded full-file hashes were
-verified at download time rather than reread on every launch. The default
+verified at download time rather than reread on every launch. Both full payload
+hashes were also reverified for this runtime release. The default
 context is 2,048 tokens, and the profiles do not impose the benchmark's
 128-token reply limit.
 

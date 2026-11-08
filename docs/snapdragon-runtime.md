@@ -206,9 +206,26 @@ The [reproduction tools](../tools/snapdragon-runtime-tools.md) provide
 plan-first native quality/rejection/session gates and matched component/screen/ABBA
 protocols, with configurable frozen baseline executables and model receipts.
 
-Measured results are pending the whole-model quality gate and paired balanced
-workload measurements. Existing published SIMD results describe the earlier
-release and do not measure these experiments.
+## Release validation and measurements
+
+The final CPU runtime was checked against the frozen 80B reference and compared with the previous executable in matched ABBA trials. Each workload has five warm samples per binary; all fresh samples and component timings are retained in the [raw report](benchmarks/snapdragon80b-20261108-runtime.json).
+
+| Workload | Previous tok/s | Candidate tok/s | Rate change | Warm first token, previous → candidate |
+|---|---:|---:|---:|---:|
+| Code | 16.14 | 23.32 | +44.4% | 9.150s → 7.908s |
+| Prose | 16.31 | 18.90 | +15.9% | 1.984s → 1.711s |
+| Longer prompt (1,304 tokens) | 17.01 | 17.68 | +3.9% | 50.914s → 49.242s |
+
+The geometric-mean rate change is **+20.3%**.
+The CPU profile passed the promotion gates and now enables exact DeltaNet chain, delta journal and K-only recovery. CPU8, the 32 GiB expert cache and 12 GiB reserve remain unchanged.
+
+The planner and draft vocabulary remain legacy by default. The hybrid/adaptive screening runs regressed prose and were not selected for the promotion trial. The explicit `--fair-retain-controller` benchmark mode measures learned costs across samples while clearing conversation state and resetting the target sampler; the historical screen created a new controller for every sample.
+
+New activation-panel shapes remain opt-in. Fixed-width specialization removed compiler-generated hot-loop helper calls. Three flat component cases passed the measured gain/drift gate; variable production expert-group topology has not passed a promotion gate. Existing automatic Q6_K_P choices are preserved. Model-level rates above use those established automatic kernels, not blanket panel activation.
+
+Validation includes 61 native Windows ARM64 unit programs; six 64-position full-vocabulary frozen-logit checks at widths 1/3/5/8/9/17 with zero error; three real-model rejection cases; five multi-turn greedy/seeded configurations and three default-attention configurations. Synthetic tests compare every recurrent state/output word, all 16 partial snapshot prefixes, FPCR changes and journal refusal. Linux sanitizer and emulated Windows x64 checks are separate from native model proof. All 75 Python tooling tests pass on Linux and Windows. See the [correctness receipts](benchmarks/snapdragon80b-20261108-runtime-correctness.json) and [component source bundle](benchmarks/snapdragon80b-20261108-runtime-component-sources.json).
+
+**40 tok/s remains unachieved in this balanced trial; 50 tok/s is also unachieved.** These are one-machine measurements, not forecasts. Fresh process does not mean cold SSD cache, physical memory bandwidth was not measured, and no full-context, sustained-conversation, browser, RAG, GPU or NPU qualification is claimed.
 
 Implementation references: [Arm I8MM](https://developer.arm.com/community/arm-community-blogs/b/ai-blog/posts/optimize-llama-cpp-with-arm-i8mm-instruction),
 [S²-MoE](https://github.com/angerybob/S2-MoE), and

@@ -25,7 +25,15 @@
     "prefetch": "off",
     "gpu_min_tokens": 0,
     "npu_min_tokens": 0,
-    "npu_min_macs": 0
+    "npu_min_macs": 0,
+    "spec_planner": "legacy",
+    "spec_explore": 20,
+    "draft_vocab": "legacy",
+    "draft_vocab_rows": 0,
+    "gdn_chain": 1,
+    "gdn_journal": 1,
+    "gdn_k_only": 1,
+    "panels": "auto"
   },
   "settings": {
     "ctx": 2048,
@@ -37,19 +45,75 @@
   },
   "evidence": {
     "date": "2026-11-08",
-    "device": "Dell XPS 13 9345, Snapdragon X Elite X1E-80-100, 64 GB",
+    "device": "Dell XPS 13 9345; Snapdragon X Elite X1E-80-100; 64 GB RAM; 2 TB NVMe",
     "workload": "tools/benchmark-prompts/repetitive-code.txt",
     "generated_tokens_per_sample": 128,
     "warm_rounds": 5,
-    "warm_median_tokens_per_second": 18.6195866,
+    "warm_median_tokens_per_second": 23.3174064,
+    "baseline_warm_median_tokens_per_second": 16.1428951,
+    "paired_rate_ratio": 1.4444377080787696,
     "output_hash": "aad9221895bb6fe0",
     "output_matches_cpu_reference": true,
-    "notes": "Matched ABBA trial with five warm samples per binary on the fixed code workload; original weights, HIGH, no expert skipping, unchanged INT8 KV/FP16 recurrent state. Absolute rates varied under sustained load. Context configured to 2048; not full-context validation.",
-    "report": "docs/benchmarks/snapdragon80b-20261108-simd.json",
-    "baseline_warm_median_tokens_per_second": 9.59931291,
-    "paired_rate_ratio": 1.9396790973032259,
-    "baseline_bench_sha256": "a73070dd31de59fb5e333f08d1867c61ca308cd8da00c84e8a6f7766d133ed02",
-    "candidate_bench_sha256": "870221ae326c8435bcde7cae1ab023c2318fd43c3b88c1b35560e7f6d49e925e",
-    "kernel_source_commit": "5f33ff29f7c9910ea2fb0f23d73133e80200f0b4"
+    "report": "docs/benchmarks/snapdragon80b-20261108-runtime.json",
+    "correctness_report": "docs/benchmarks/snapdragon80b-20261108-runtime-correctness.json",
+    "baseline_bench_sha256": "870221ae326c8435bcde7cae1ab023c2318fd43c3b88c1b35560e7f6d49e925e",
+    "candidate_bench_sha256": "3f5d0fb6b837fefbd69016147900e3e32c2b3f0a635b080c40be9b000c842d32",
+    "runtime_source_snapshot_commit": "ccd4d11097b6450a693544e6311a0486bd397df6",
+    "balanced_workload_results": [
+      {
+        "workload": "code",
+        "baseline_median_tokens_per_second": 16.1428951,
+        "candidate_median_tokens_per_second": 23.3174064,
+        "rate_ratio": 1.4444377080787696,
+        "baseline_median_first_token_seconds": 9.1502693,
+        "candidate_median_first_token_seconds": 7.9075303,
+        "first_token_limit_seconds": 9.607782765,
+        "first_token_passed": true,
+        "workload_rate_floor_passed": true
+      },
+      {
+        "workload": "prose",
+        "baseline_median_tokens_per_second": 16.3070377,
+        "candidate_median_tokens_per_second": 18.9011693,
+        "rate_ratio": 1.1590804932032506,
+        "baseline_median_first_token_seconds": 1.9842986,
+        "candidate_median_first_token_seconds": 1.7108575,
+        "first_token_limit_seconds": 2.08351353,
+        "first_token_passed": true,
+        "workload_rate_floor_passed": true
+      },
+      {
+        "workload": "long",
+        "baseline_median_tokens_per_second": 17.0141734,
+        "candidate_median_tokens_per_second": 17.6776213,
+        "rate_ratio": 1.0389938367502471,
+        "baseline_median_first_token_seconds": 50.9141036,
+        "candidate_median_first_token_seconds": 49.2424938,
+        "first_token_limit_seconds": 53.459808779999996,
+        "first_token_passed": true,
+        "workload_rate_floor_passed": true
+      }
+    ],
+    "balanced_geometric_mean_rate_ratio": 1.2026570327774295,
+    "promotion_gate_passed": true,
+    "new_panel_auto_promotions": [],
+    "notes": "Matched ABBA, five warm samples per binary/workload across code, prose and a 1,304-token prompt; fresh samples retained. Original 80B/MTP weights, HIGH, no expert skipping, unchanged INT8 KV/FP16 state. Only exact DeltaNet chain/journal/K-only recovery enabled; legacy planner/head and established automatic kernels retained. Configured context 2048 is not full-context qualification. Absolute rates vary with system conditions.",
+    "previous_evidence": {
+      "date": "2026-11-08",
+      "device": "Dell XPS 13 9345, Snapdragon X Elite X1E-80-100, 64 GB",
+      "workload": "tools/benchmark-prompts/repetitive-code.txt",
+      "generated_tokens_per_sample": 128,
+      "warm_rounds": 5,
+      "warm_median_tokens_per_second": 18.6195866,
+      "output_hash": "aad9221895bb6fe0",
+      "output_matches_cpu_reference": true,
+      "notes": "Matched ABBA trial with five warm samples per binary on the fixed code workload; original weights, HIGH, no expert skipping, unchanged INT8 KV/FP16 recurrent state. Absolute rates varied under sustained load. Context configured to 2048; not full-context validation.",
+      "report": "docs/benchmarks/snapdragon80b-20261108-simd.json",
+      "baseline_warm_median_tokens_per_second": 9.59931291,
+      "paired_rate_ratio": 1.9396790973032259,
+      "baseline_bench_sha256": "a73070dd31de59fb5e333f08d1867c61ca308cd8da00c84e8a6f7766d133ed02",
+      "candidate_bench_sha256": "870221ae326c8435bcde7cae1ab023c2318fd43c3b88c1b35560e7f6d49e925e",
+      "kernel_source_commit": "5f33ff29f7c9910ea2fb0f23d73133e80200f0b4"
+    }
   }
 }

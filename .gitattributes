@@ -1,3 +1,4 @@
 # Shell entrypoints must also run from WSL and MSYS2 checkouts.
 *.sh text eol=lf
 tools/benchmark-prompts/*.txt text eol=lf
+docs/benchmarks/*-runtime*.json text eol=lf
