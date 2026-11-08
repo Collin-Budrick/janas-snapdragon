@@ -68,6 +68,11 @@ static int allowed(const struct janas_tuner *t, int cls, int i)
     return !t->allowed[cls] || (t->allowed[cls] >> combo & 1);
 }
 
+static int npu_allowed(const struct janas_tuner *t, int cls, int i)
+{
+    return !t->cand[i].npu || cls == 2 || t->allow_npu_small;
+}
+
 /* the CPU alone for blocks only; once settled, the side settled */
 static int same_side(const struct janas_tuner *t, int cls, int i)
 {
@@ -79,7 +84,7 @@ static int same_side(const struct janas_tuner *t, int cls, int i)
 static int usable(const struct janas_tuner *t, int cls, int i)
 {
     return allowed(t, cls, i) && same_side(t, cls, i) &&
-           (!t->cand[i].npu || cls == 2) &&
+           npu_allowed(t, cls, i) &&
            (!t->cand[i].gpu || (t->allow_gpu && (cls > 0 || t->gpu_one))) &&
            (!t->cls[cls].threads || t->cand[i].threads == t->cls[cls].threads);
 }
@@ -91,7 +96,7 @@ static int usable(const struct janas_tuner *t, int cls, int i)
 static int retryable(const struct janas_tuner *t, int cls, int i)
 {
     return allowed(t, cls, i) && same_side(t, cls, i) &&
-           (!t->cand[i].npu || cls == 2) &&
+           npu_allowed(t, cls, i) &&
            (!t->cand[i].gpu || (t->allow_gpu && (cls > 0 || t->gpu_one)));
 }
 
@@ -110,7 +115,7 @@ static int class_def(const struct janas_tuner *t, int cls)
             first = -1;
         for (int i = 0; i < t->n_cand; i++)
             if (allowed(t, cls, i) && same_side(t, cls, i) &&
-                (!t->cand[i].npu || cls == 2)) {
+                npu_allowed(t, cls, i)) {
                 if (t->cand[i].threads == th)
                     return i;
                 if (first < 0)
@@ -179,6 +184,11 @@ void janas_tuner_allow_gpu(struct janas_tuner *t, int allow)
 void janas_tuner_allow_gpu_one(struct janas_tuner *t, int allow)
 {
     t->gpu_one = allow;
+}
+
+void janas_tuner_allow_npu_small(struct janas_tuner *t, int allow)
+{
+    t->allow_npu_small = allow;
 }
 
 int janas_tuner_best(const struct janas_tuner *t, int cls)

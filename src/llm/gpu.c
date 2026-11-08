@@ -1014,6 +1014,12 @@ struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
     g->nospin = ns ? atoi(ns) != 0 : janas_gpu_fast_prompt();
     g->block_wait = bw ? atoi(bw) != 0 : janas_gpu_fast_prompt();
     janas_g_selfcheck(g);
+    if (g->broken) {
+        snprintf(err, err_len,
+                 "Vulkan device failed during startup self-check; GPU disabled");
+        goto fail;
+    }
+    g->product_submissions = g->products = 0;
     return g;
 
 missing:
@@ -2180,6 +2186,7 @@ int janas_gpu_begin(struct janas_gpu *g, const struct janas_matvec_task *tasks,
         g->broken = 1;
         return -1;
     }
+    g->pending_products = (uint64_t)recorded;
     g->busy = 1;
     return 0;
 }
@@ -2634,6 +2641,7 @@ int janas_gpu_ffn_begin(struct janas_gpu *g, const struct janas_gpu_expert *e,
         g->n_pend = 0;
         return -1;
     }
+    g->pending_products = (uint64_t)n * 3;
     g->busy = 1;
     return 0;
 }
@@ -2662,6 +2670,7 @@ int janas_gpu_finish(struct janas_gpu *g, int *waited)
     g->busy = 0;
     if (r != VK_SUCCESS) {
         g->broken = 1; /* device lost: the caller computes these rows */
+        g->pending_products = 0;
         return -1;
     }
     g->vkResetFences(g->dev, 1, &g->fence);
@@ -2682,7 +2691,21 @@ int janas_gpu_finish(struct janas_gpu *g, int *waited)
                    p->rows * sizeof(float));
     }
     g->n_pend = 0;
+    if (g->pending_products) {
+        g->product_submissions++;
+        g->products += g->pending_products;
+        g->pending_products = 0;
+    }
     return 0;
+}
+
+void janas_gpu_product_counters(const struct janas_gpu *g,
+                                 uint64_t *submissions, uint64_t *products)
+{
+    if (submissions)
+        *submissions = g ? g->product_submissions : 0;
+    if (products)
+        *products = g ? g->products : 0;
 }
 
 static struct share *find_share(struct janas_gpu *g, uint64_t key)
@@ -2997,6 +3020,7 @@ static int experts_id(struct janas_gpu *g, struct janas_pool *pool,
         g->broken = 1;
         return -1;
     }
+    g->pending_products = (uint64_t)ng;
     g->busy = 1;
     /* the experts with few tokens on the CPU meanwhile */
     struct janas_matvec_task cpu[2 * 128 + 8];
@@ -3076,6 +3100,7 @@ int janas_gpu_dense_mm(struct janas_gpu *g, int bf16, const void *w,
         g->broken = 1;
         return -1;
     }
+    g->pending_products = 1;
     g->busy = 1;
     int waited;
     return janas_gpu_finish(g, &waited) == 0 ? 0 : -1;
@@ -3169,6 +3194,7 @@ int janas_gpu_bf16_mv(struct janas_gpu *g, const uint16_t *w, const float *x,
         g->n_pend = 0;
         return -1;
     }
+    g->pending_products = 1;
     g->busy = 1;
     int waited;
     if (janas_gpu_finish(g, &waited) != 0)
@@ -3334,6 +3360,16 @@ void janas_gpu_matvec_group(struct janas_gpu *g, struct janas_pool *pool,
 struct janas_gpu {
     int unused;
 };
+
+void janas_gpu_product_counters(const struct janas_gpu *g,
+                                 uint64_t *submissions, uint64_t *products)
+{
+    (void)g;
+    if (submissions)
+        *submissions = 0;
+    if (products)
+        *products = 0;
+}
 
 struct janas_gpu *janas_gpu_create(char *err, size_t err_len)
 {

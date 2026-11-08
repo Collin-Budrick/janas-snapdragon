@@ -694,6 +694,8 @@ void janas_m_npu_close(struct janas_llm_model *m);
 /* Whether the NPU takes products of a pass of n tokens (its candidate has
    it, and n reaches JANAS_NPU_MIN_N). */
 int janas_m_npu_takes(const struct janas_llm_model *m, uint32_t n);
+/* A provider with actual one-token products (currently Hexagon). */
+int janas_m_npu_token_capable(const struct janas_llm_model *m);
 /* Whether the tuner may give the NPU the blocks by itself: where its
    answers measured at par with the CPU's (janas_llm_model_npu_auto). */
 int janas_m_npu_auto(const struct janas_llm_model *m);

@@ -362,6 +362,10 @@ static void usage(void)
         "  --min-p <p>      (default 0)    --seed <n> (default: random)\n"
         "  --max <tokens>   longest reply (default: no limit)\n"
         "  --no-spec        no speculative decoding\n"
+        "  --speculation <none|lookup|mtp|auto>\n"
+        "                   choose drafts explicitly (default auto); mtp\n"
+        "                   requires a loaded prediction block\n"
+        "  --draft-tokens <1..16>  maximum guessed tokens per pass\n"
         "  --mode <m>       auto (default), eco or max\n"
         "  --think <on|off> reasoning before replying, for models that do\n"
         "                   it (default off: it is slow, and a small model\n"
@@ -440,7 +444,7 @@ static const struct {
      "a recording (WAV, FLAC, MP3, Ogg, M4A, WebM) transcribed, or translated "
      "into English, for your next message: by --speech-model's Whisper "
      "model, or one beside the model"},
-    {"/spec [on|off]", "speculative decoding (toggles)"},
+    {"/spec [none|lookup|mtp|auto]", "speculative decoding (on/off or no argument also work)"},
     {"/mode [auto|eco|max]", "power mode, and what the engine chose"},
     {"/experts [n]",
      "experts per token (fewer: faster, a little less accurate)"},
@@ -979,6 +983,7 @@ struct chat_opts { /* where the words land: main keeps them, this names them */
     int *devices;
     int *npu_int8;
     const char **speech_model;
+    int *draft_tokens; /* 0: the library's existing default ceiling */
 };
 
 /* every option, for the nearest to one mistyped: the first N_ALONE stand
@@ -995,8 +1000,9 @@ static const char *const OPTIONS[] = {
     "--top-k",       "--top-p",      "--min-p",       "--seed",
     "--max",         "--head",       "--profile",     "--models",
     "--quality",     "--prompt-on",  "--drafts-on",   "--reply-on",
-    "--speech-model"};
+    "--speech-model", "--speculation", "--draft-tokens"};
 #define N_OPTIONS (sizeof OPTIONS / sizeof *OPTIONS)
+static const char *const SPECULATION[] = {"none", "auto", "lookup", "mtp"};
 
 /* v of option a as a whole number or a number within limits; on a
    mistake, the reason into why and -1 */
@@ -1124,7 +1130,15 @@ static int take_options(int n, char **w, struct chat_opts *o, char *why,
             o->devices[k - 1] = janas_devices_mask(v, why, why_len);
         } else if (strcmp(a, "--mtp") == 0)
             o->mp->mtp_path = v;
-        else if (strcmp(a, "--draft") == 0)
+        else if (strcmp(a, "--speculation") == 0) {
+            if ((k = opt_choice(a, v, SPECULATION, 4, why, why_len)) < 0)
+                return -1;
+            o->cp->speculate = k;
+        } else if (strcmp(a, "--draft-tokens") == 0) {
+            if (opt_int(a, v, 1, 16, &x, why, why_len) != 0)
+                return -1;
+            *o->draft_tokens = (int)x;
+        } else if (strcmp(a, "--draft") == 0)
             o->mp->draft_path = v;
         else if (strcmp(a, "--think") == 0) {
             char *end;
@@ -1393,8 +1407,9 @@ static void conf_write(const char *path, const struct chat_opts *o)
         fprintf(f, "--think %d\n", c->max_reasoning);
     else
         fprintf(f, "--think %s\n", c->thinking ? "on" : "off");
-    if (!c->speculate)
-        fprintf(f, "--no-spec\n");
+    fprintf(f, "--speculation %s\n", SPECULATION[c->speculate]);
+    if (*o->draft_tokens)
+        fprintf(f, "--draft-tokens %d\n", *o->draft_tokens);
     if (*o->stats)
         fprintf(f, "--stats\n");
     if (!*o->markdown)
@@ -1844,13 +1859,14 @@ int main(int argc, char **argv)
     int mcp = 1, mcp_auto = 0, mcp_instructions = 0, services = 1, no_mtp = 0;
     /* profile: the catalog's faster choices, at --quality low asked */
     int all_tools = 0, profile = 0, tune = 0, npu_int8 = 0;
+    int draft_tokens = 0;
     int devices[JANAS_DEVICES_OPTIONS] = {0, 0, 0};
     static char mtp_found[4096];
     struct chat_opts o = {
         &mp,       &cp,         &system_arg, &stats,       &markdown,
         &gpu,      &mcp_config, &mcp,        &mcp_auto,    &mcp_instructions,
         &services, &no_mtp,     mtp_found,   &all_tools,   &profile,
-        &tune,     devices,     &npu_int8,   &speech_model};
+        &tune,     devices,     &npu_int8,   &speech_model, &draft_tokens};
     /*
      * The settings in layers, each over the one before: the catalog's
      * profile for the model, the chat's own file, the model's file, the
@@ -1930,7 +1946,7 @@ int main(int argc, char **argv)
     /* the levers the user set, in any file or typed: the measure leaves
        them alone */
     static const char *const SPEC_OPTS[] = {"--mtp", "--draft", "--no-mtp",
-                                            "--no-spec", NULL};
+        "--no-spec", "--speculation", "--draft-tokens", NULL};
     static const char *const HEAD_OPTS[] = {"--head", NULL};
     int spec_user = chat_words_any(cn, cw, SPEC_OPTS) ||
                     chat_words_any(mn, mw, SPEC_OPTS) ||
@@ -2051,7 +2067,8 @@ int main(int argc, char **argv)
                                  a compiler looking across the whole program
                                  cannot always see */
     if (janas_llm_open(cm.path, &mp, &llm) != JANAS_LLM_OK ||
-        janas_llm_chat_create(llm, &cp, &c) != JANAS_LLM_OK) {
+        janas_llm_chat_create(llm, &cp, &c) != JANAS_LLM_OK ||
+        janas_llm_chat_speculation(c, cp.speculate, draft_tokens) != JANAS_LLM_OK) {
         fprintf(stderr, "janas-chat: %s\n", janas_llm_last_error());
         return 1;
     }
@@ -2220,7 +2237,8 @@ int main(int argc, char **argv)
                         old_texts[n_old_texts++] = conf_text;
                     }
                     conf_text = text;
-                    if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK)
+                    if (janas_llm_chat_set_params(c, &cp) != JANAS_LLM_OK ||
+                        janas_llm_chat_speculation(c, cp.speculate, draft_tokens) != JANAS_LLM_OK)
                         term_printf(&term, "%s\n", janas_llm_last_error());
                     janas_llm_set_mode(llm, mp.mode);
                     if (janas_llm_set_gpu(llm, gpu) != JANAS_LLM_OK)
@@ -2369,11 +2387,15 @@ int main(int argc, char **argv)
                 if (janas_llm_tuning(llm, tb, sizeof(tb), &tl) == JANAS_LLM_OK)
                     term_printf(&term, "%s\n", tb);
             } else if (strcmp(msg, "/spec") == 0) {
-                cp.speculate = on_off(arg, cp.speculate);
-                if (janas_llm_chat_set_params(c, &cp) == JANAS_LLM_OK)
-                    term_printf(&term, "speculative decoding %s\n",
-                                cp.speculate ? "on" : "off");
-                else
+                int mode = !*arg || strcmp(arg, "on") == 0 || strcmp(arg, "off") == 0
+                               ? on_off(arg, cp.speculate)
+                               : opt_choice("/spec", arg, SPECULATION, 4, why, sizeof why);
+                if (mode < 0)
+                    term_printf(&term, "%s\n", why);
+                else if (janas_llm_chat_speculation(c, mode, draft_tokens) == JANAS_LLM_OK) {
+                    cp.speculate = mode;
+                    term_printf(&term, "speculative decoding %s\n", SPECULATION[mode]);
+                } else
                     term_printf(&term, "%s\n", janas_llm_last_error());
             } else {
                 term_printf(&term, "unknown command %s: /help lists them\n",

@@ -33,6 +33,7 @@ struct srv_engine {
     int stop;
     int closing; /* the server is stopping: no client's request taken */
     int verbose;
+    int speculation; /* fixed across requests; their defaults must not reset it */
     uint32_t max_input, warn_input;
     struct srv_fim *fim; /* the windows of fill-in-the-middle requests */
     uint32_t fim_max;    /* the tokens they write at most; 0: as asked */
@@ -422,6 +423,7 @@ static int32_t run_one(struct srv_engine *e, struct srv_job *j, int k)
     janas_llm_chat *c = e->chat;
     struct srv_choice *ch = &j->ch[k];
     struct janas_llm_chat_params p = j->p;
+    p.speculate = e->speculation;
     if (j->seeded)
         p.seed += (uint64_t)k;
     p.max_input = e->max_input; /* the server's limit, not the request's */
@@ -758,6 +760,8 @@ struct srv_engine *srv_engine_start(const struct srv_config *cfg, char *err,
     }
     e->max_queue = cfg->max_queue ? cfg->max_queue : 16;
     e->verbose = cfg->verbose;
+    e->speculation =
+        cfg->speculation_set ? cfg->speculation : JANAS_LLM_SPEC_AUTO;
     e->max_input = cfg->max_input;
     e->warn_input = cfg->warn_input;
     pthread_mutex_init(&e->mu, NULL);
@@ -776,6 +780,14 @@ struct srv_engine *srv_engine_start(const struct srv_config *cfg, char *err,
     if (janas_llm_open(cfg->model_path, &lp, &e->llm) != JANAS_LLM_OK ||
         janas_llm_chat_create(e->llm, NULL, &e->chat) != JANAS_LLM_OK) {
         snprintf(err, err_len, "%s", janas_llm_last_error());
+        janas_llm_close(e->llm);
+        free(e);
+        return NULL;
+    }
+    if (janas_llm_chat_speculation(e->chat, e->speculation, cfg->max_drafts) !=
+        JANAS_LLM_OK) {
+        snprintf(err, err_len, "%s", janas_llm_last_error());
+        janas_llm_chat_destroy(e->chat);
         janas_llm_close(e->llm);
         free(e);
         return NULL;

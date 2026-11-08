@@ -71,6 +71,9 @@ Environment
   AR            the archiver, ar by default (gcc-ar for -flto)
   JANAS_CFLAGS  flags added to the variant, to try a compiler out:
                 JANAS_CFLAGS="-O3 -flto" ./build.sh
+  JANAS_HEXAGON_INCLUDE
+                matching GGML public headers for the optional Windows ARM64
+                Hexagon provider; its DLLs are loaded at runtime.
   JANAS_OS      windows: the same sources for Windows x86-64 or ARM64,
                 with MinGW-w64, into bin/<cpu>-windows/ (.exe, .dll);
                 release and debug only. Set CC and AR for ARM64.
@@ -183,6 +186,19 @@ if [ "$OS" = windows ]; then
 else
     CFLAGS+=(-fPIC -fvisibility=hidden)
 fi
+if [ -n "${JANAS_HEXAGON_INCLUDE:-}" ]; then
+    if [ "$OS" != windows ] || [ "$CPU" != aarch64 ]; then
+        echo "build.sh: JANAS_HEXAGON_INCLUDE requires a Windows ARM64 target" >&2
+        exit 2
+    fi
+    for header in ggml.h ggml-backend.h ggml-alloc.h ggml-hexagon.h; do
+        if [ ! -f "$JANAS_HEXAGON_INCLUDE/$header" ]; then
+            echo "build.sh: missing Hexagon ABI header: $JANAS_HEXAGON_INCLUDE/$header" >&2
+            exit 2
+        fi
+    done
+    CFLAGS+=(-DJANAS_HEXAGON=1 "-I$JANAS_HEXAGON_INCLUDE")
+fi
 case "$VARIANT" in
 release) CFLAGS+=(-O2 -DNDEBUG) ;;
 debug) CFLAGS+=(-O0 -g) ;;
@@ -286,7 +302,7 @@ GPU_MISSING=""
 XFMA_NAMES=() # the shaders with an _xfma variant
 VK_INC=()
 if [ "$OS" = windows ] && [ -d /usr/include/vulkan ] &&
-    ! echo '#include <vulkan/vulkan.h>' | "$CC" -E -x c - >/dev/null 2>&1; then
+    ! echo '#include <vulkan/vulkan.h>' | "$CC" "${CFLAGS[@]}" -E -x c - >/dev/null 2>&1; then
     # the Vulkan headers are the same for every system: the host's, alone
     # in a directory of their own (never /usr/include, which is Linux's)
     mkdir -p "$OBJ/vkinc"
@@ -312,7 +328,7 @@ if command -v glslangValidator >/dev/null 2>&1; then
 else
     GPU_MISSING="glslangValidator (glslang-tools, glslang), 15.2 or later"
 fi
-echo '#include <vulkan/vulkan.h>' | "$CC" "${VK_INC[@]}" -E -x c - >/dev/null 2>&1 ||
+echo '#include <vulkan/vulkan.h>' | "$CC" "${CFLAGS[@]}" -E -x c - >/dev/null 2>&1 ||
     GPU_MISSING="${GPU_MISSING:+$GPU_MISSING and }the Vulkan headers (libvulkan-dev, vulkan-headers)"
 # every fma() of a shader decorated NoContraction, one operation as on the
 # CPU (tools/spv_fma.c: glslang leaves them free to be split), by a tool

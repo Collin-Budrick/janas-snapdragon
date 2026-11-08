@@ -1,0 +1,5 @@
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Explain how a language model can use RAM, SSD storage, a CPU, a GPU and an NPU together. Describe the tradeoffs and give a concrete example. Write clear paragraphs without assuming a specific benchmark result.<|im_end|>
+<|im_start|>assistant

@@ -241,6 +241,68 @@ int main(void)
                                           {.threads = 12, .gpu = 1, .npu = 1}};
     const int dd[JANAS_TUNE_CLASSES] = {0, 0, 0, 0};
     struct janas_tuner d;
+    /* Intel keeps blocks only; a token-capable NPU is tried for every
+       small class, with the CPU still the unmeasured default. */
+    for (int cls = 0; cls < JANAS_TUNE_CLASSES; cls++) {
+        if (cls == 2)
+            continue;
+        janas_tuner_init(&d, dc, 4, dd, 0);
+        janas_tuner_allow_gpu(&d, 1);
+        janas_tuner_allow_gpu_one(&d, 1);
+        for (int i = 0; i < 200; i++) {
+            int c = janas_tuner_pick(&d, cls);
+            CHECK(!dc[c].npu, "NPU picked for class %d without opt-in", cls);
+            janas_tuner_record(&d, cls, c, dc[c].npu ? 0.1 : 1.0);
+        }
+        CHECK(!dc[janas_tuner_best(&d, cls)].npu,
+              "NPU best for class %d without opt-in", cls);
+        for (int faster = 0; faster < 2; faster++) {
+            janas_tuner_init(&d, dc, 4, dd, 0);
+            janas_tuner_allow_gpu(&d, 1);
+            janas_tuner_allow_gpu_one(&d, 1);
+            janas_tuner_allow_npu_small(&d, 1);
+            CHECK(janas_tuner_best(&d, cls) == 0,
+                  "class %d did not keep the CPU default", cls);
+            int tried_npu = 0;
+            for (int i = 0; i < 200; i++) {
+                int c = janas_tuner_pick(&d, cls);
+                tried_npu += dc[c].npu;
+                janas_tuner_record(&d, cls, c,
+                                   dc[c].npu ? (faster ? 0.5 : 2.0) : 1.0);
+            }
+            CHECK(tried_npu > 0, "NPU never tried for class %d", cls);
+            CHECK(dc[janas_tuner_best(&d, cls)].npu == faster,
+                  "class %d chose the wrong devices (NPU faster %d)", cls,
+                  faster);
+            if (!faster) {
+                for (int i = 0; i < 2000; i++) {
+                    int c = janas_tuner_pick(&d, cls);
+                    janas_tuner_record(&d, cls, c, dc[c].npu ? 0.3 : 1.0);
+                }
+                CHECK(dc[janas_tuner_best(&d, cls)].npu,
+                      "class %d never retried the faster NPU", cls);
+            }
+        }
+        const int masks[] = {1, 1 << JANAS_DEV_NPU, 1 | 1 << JANAS_DEV_NPU,
+                             1 << (JANAS_DEV_GPU | JANAS_DEV_NPU)};
+        for (int fixed = 0; fixed < 2; fixed++)
+            for (size_t mask = 0; mask < sizeof masks / sizeof *masks; mask++) {
+                janas_tuner_init(&d, dc, 4, dd, fixed);
+                janas_tuner_allow_gpu(&d, 1);
+                janas_tuner_allow_gpu_one(&d, 1);
+                janas_tuner_allow_npu_small(&d, 1);
+                janas_tuner_allow(&d, cls, masks[mask]);
+                for (int i = 0; i < 100; i++) {
+                    int c = janas_tuner_pick(&d, cls);
+                    int combo = (dc[c].gpu ? JANAS_DEV_GPU : 0) |
+                                (dc[c].npu ? JANAS_DEV_NPU : 0);
+                    CHECK(masks[mask] >> combo & 1,
+                          "class %d fixed %d mask %x picked %d", cls, fixed,
+                          masks[mask], combo);
+                    janas_tuner_record(&d, cls, c, dc[c].npu ? 2.0 : 1.0);
+                }
+            }
+    }
     janas_tuner_init(&d, dc, 4, dd, 0);
     janas_tuner_allow_gpu(&d, 1);
     janas_tuner_allow(&d, 2, 1 << JANAS_DEV_NPU);

@@ -32,6 +32,9 @@ struct srv_config {
     struct janas_llm_params llm; /* how the model is opened */
     int no_gpu;
     int no_mtp;           /* no MTP file, not even one found beside the model */
+    int speculation;      /* JANAS_LLM_SPEC_* when speculation_set; else AUTO */
+    int speculation_set;  /* keeps a zero-initialized configuration at AUTO */
+    int max_drafts;       /* 1..16, or 0 for the library's default ceiling */
     const char *model_id; /* the name clients use; default: the file name */
     const char *host;     /* address to listen on (default 127.0.0.1) */
     uint16_t port;        /* default 8080 */

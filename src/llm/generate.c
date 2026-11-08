@@ -419,8 +419,10 @@ int janas_llm_session_set_options(struct janas_llm_session *s,
      * switch, 20.6 after, with no draft in between).
      */
     s->mtp = janas_llm_model_has_mtp(s->m) && (was_mtp || s->n_kv == 0);
-    if (!s->mtp)
+    if (!s->mtp || o->spec_mode != JANAS_SPEC_MTP)
         s->n_mdraft = 0;
+    else if (s->n_mdraft > o->spec_k)
+        s->n_mdraft = o->spec_k;
     if (o->draft && !s->dlogits) {
         s->dlogits = malloc((size_t)s->nv * sizeof(float));
         if (!s->dlogits)
@@ -1074,7 +1076,8 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     if (s->mtp) {
         if (mtp_step(m, s->hist, pos, (uint32_t)acc,
                      plan ? drafts_cap(m, o->spec_k) : o->spec_k,
-                     s->off_left == 0 && !is_stop(o, t), o->spec_min_conf,
+                     drafts_wanted && s->off_left == 0 && !is_stop(o, t),
+                     o->spec_min_conf,
                      plan ? &s->pl : NULL, s->hrow, s->mdraft, s->msurv,
                      &s->n_mdraft) != 0)
             return -1;

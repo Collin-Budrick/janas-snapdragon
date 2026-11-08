@@ -257,6 +257,9 @@ struct janas_gpu {
     struct pending pend[MAX_PENDING];
     size_t n_pend;
     int busy, broken;
+    /* Count only completed product submissions, independent of verbose
+       diagnostics and adaptive-share table capacity. */
+    uint64_t product_submissions, products, pending_products;
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     uint32_t sg;              /* subgroup size the shader runs with */
     int discrete;             /* weights copied to its memory, not shared */

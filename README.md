@@ -1,5 +1,21 @@
 # Janas
 
+This is the [Snapdragon Windows ARM64 fork](https://github.com/Collin-Budrick/janas-snapdragon)
+of [upstream Janas](https://github.com/prabanta-dev/janas). It adds native ARM
+optimizations, an optional Hexagon tensor backend, and controlled SSD/RAM,
+lookup and MTP benchmarks. Start with the [Snapdragon guide](docs/snapdragon.md)
+and [Hexagon build instructions](docs/snapdragon-hexagon.md).
+
+On the tested 64 GB Snapdragon X Elite, Qwen3-Next-80B-A3B reached a median
+16.4 generated tokens/s on the repeated code workload using the SSD-backed
+expert cache and CPU MTP drafting. The [recorded results](docs/benchmarks/snapdragon80b-20261108-results.json)
+include prose, cache-size, lookup, Hexagon and native llama.cpp comparisons;
+the [guide](docs/snapdragon.md#measured-settings-and-starting-the-server)
+provides the measured launch profiles and their validation limits.
+
+The upstream performance figures below describe its Intel test machine.
+Results for this Snapdragon laptop are recorded separately in the guide.
+
 [![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)]() [![Platform: Linux | Windows x86-64](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20x86--64-lightgrey.svg)]() [![LinkedIn](https://img.shields.io/badge/LinkedIn-Maurizio%20Cammalleri-0077B5?logo=linkedin)](https://www.linkedin.com/in/maurizio-cammalleri-80a89a11/) [![Substack](https://img.shields.io/badge/Substack-Maurizio%20Cammalleri-FF6719?logo=substack)](https://cammalleri.substack.com/)
 
 ```

@@ -315,6 +315,14 @@ JANAS_LLM_API int32_t janas_llm_token_text(const janas_llm *llm, int32_t id,
                                            char *buf, int32_t cap,
                                            int32_t *len);
 
+/* The original boolean speculate values retain their behavior. */
+enum {
+    JANAS_LLM_SPEC_NONE = 0,
+    JANAS_LLM_SPEC_AUTO = 1,
+    JANAS_LLM_SPEC_LOOKUP = 2,
+    JANAS_LLM_SPEC_MTP = 3,
+};
+
 struct janas_llm_chat_params {
     uint32_t size;     /* sizeof(struct janas_llm_chat_params) */
     float temperature; /* 0: always the most likely token (default 0.7) */
@@ -322,9 +330,11 @@ struct janas_llm_chat_params {
     float top_p;       /* default 0.8 */
     float min_p;       /* default 0 */
     uint64_t seed;     /* 0: a new one each chat (default) */
-    int32_t speculate; /* 1: draft tokens ahead when it pays, with the
-                          MTP block if open, else from the context
-                          (default); 0: never. The text is the same. */
+    int32_t speculate; /* JANAS_LLM_SPEC_*: AUTO (1, default) uses the
+                          drafting model or MTP block if open, else context
+                          lookup; NONE (0) never drafts; LOOKUP (2) forces
+                          context lookup; MTP (3) requires an open MTP head.
+                          The text is the same. */
     int32_t max_reply; /* tokens per reply; 0: no limit (default) */
     int32_t thinking;  /* models that reason before replying (Qwen3.5 and
                           later): 1 reasoning on, 0 off, -1 the model's own
@@ -375,6 +385,15 @@ JANAS_LLM_API void janas_llm_chat_destroy(janas_llm_chat *c);
 /* New parameters, from the next reply on. */
 JANAS_LLM_API int32_t janas_llm_chat_set_params(
     janas_llm_chat *c, const struct janas_llm_chat_params *p);
+
+/* Explicit speculation selection without changing the parameter struct's ABI.
+ * max_drafts is the planner's ceiling, 1..16; 0 restores the default ceiling
+ * (8 with an MTP head, 4 otherwise). MTP without a head fails with EINVAL.
+ * Takes effect from the next generation pass; invalid settings change nothing.
+ */
+JANAS_LLM_API int32_t janas_llm_chat_speculation(janas_llm_chat *c,
+                                                 int32_t mode,
+                                                 int32_t max_drafts);
 
 /* Sets the system message. Only before the first message (see reset). */
 JANAS_LLM_API int32_t janas_llm_chat_system(janas_llm_chat *c, const char *text,

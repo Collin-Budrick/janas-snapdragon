@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "model": {
+    "path": "models/qwen3-next-80b-a3b-q4km.jns",
+    "size": 48411922432,
+    "first_mib_sha256": "0cb659c13145b35f1e1c24c0d126c6f0e3b4b04faba5cd421908ac25f1c2e38c",
+    "full_sha256_verified_at_download": "fa3255c73106391e9cb5a97efd30f77a928fb4518d40060f795a8cff6656daed"
+  },
+  "mtp": {
+    "path": "models/qwen3-next-80b-a3b-mtp-q4k.jns",
+    "size": 937992192,
+    "first_mib_sha256": "8d2bcfca5f3c4cafae5c4fe49174152ea072ae0fd87551fb4b7a4431d9d0db84",
+    "full_sha256_verified_at_download": "5c9bc4cb6f739193fac5e4daa30c922f73255acf41443ecfc0123ef084584559"
+  },
+  "case": {
+    "profile": "cpu",
+    "speculation": "mtp",
+    "threads": 8,
+    "cache_gib": 32,
+    "draft_tokens": 4,
+    "prompt": 0,
+    "prompt_on": "cpu",
+    "drafts_on": "cpu",
+    "reply_on": "cpu",
+    "prefetch": "off",
+    "gpu_min_tokens": 0,
+    "npu_min_tokens": 0,
+    "npu_min_macs": 0
+  },
+  "settings": {
+    "ctx": 2048,
+    "reserve_gib": 12,
+    "seed": 20260926,
+    "temperature": 0,
+    "max_reply": 0,
+    "preload": false
+  },
+  "evidence": {
+    "date": "2026-11-08",
+    "device": "Dell XPS 13 9345, Snapdragon X Elite X1E-80-100, 64 GB",
+    "workload": "tools/benchmark-prompts/repetitive-code.txt",
+    "generated_tokens_per_sample": 128,
+    "warm_rounds": 3,
+    "warm_median_tokens_per_second": 16.4116556,
+    "output_hash": "aad9221895bb6fe0",
+    "output_matches_cpu_reference": true,
+    "notes": "Workload-specific warm measurements; original weight precision, HIGH, no expert skipping; default Janas INT8 KV and FP16 recurrent state. Configured context 2048, not a full-context validation.",
+    "report": "docs/benchmarks/snapdragon80b-20261108-results.json"
+  }
+}

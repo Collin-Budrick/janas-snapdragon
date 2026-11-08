@@ -414,6 +414,20 @@ int janas_llm_model_npu_preparing(const struct janas_llm_model *m,
                                   double *seconds);
 /* Without an NPU: why ("" with one). */
 const char *janas_llm_model_npu_why(const struct janas_llm_model *m);
+/* Read on the model's calling thread between passes. Successful inference
+   operations since load, excluding NPU plan warm-up and GPU self-checks.
+   npu_prepared_plans reports successful setup/warm-up separately.
+   GPU products include partial row products; whole GPU passes are counted
+   separately, not expanded into an estimated number of products. Take two
+   snapshots to measure an interval. Weight bytes is a current gauge, not a
+   monotonic counter, and is zero for providers without unique-byte accounting. */
+struct janas_llm_accel_counters {
+    uint64_t npu_products, npu_ffns, npu_layer_passes;
+    uint64_t npu_prepared_plans, npu_weight_bytes;
+    uint64_t gpu_product_submissions, gpu_products, gpu_whole_passes;
+};
+void janas_llm_model_accel_counters(const struct janas_llm_model *m,
+                                    struct janas_llm_accel_counters *out);
 void janas_llm_model_force(struct janas_llm_model *m, int cand);
 
 /*
@@ -463,5 +477,7 @@ const char *janas_llm_model_gpu_why(const struct janas_llm_model *m);
 
 /* The expert cache, for statistics and warm-up. */
 struct janas_expert_cache *janas_llm_model_cache(struct janas_llm_model *m);
+/* The separate MTP sidecar's cache; NULL for embedded/shared MTP or no MTP. */
+struct janas_expert_cache *janas_llm_model_mtp_cache(struct janas_llm_model *m);
 
 #endif

@@ -34,7 +34,7 @@
 struct janas_tune_cand {
     int threads; /* compute threads (a prefix of the pool) */
     int gpu;     /* the GPU takes part in the products */
-    int npu;     /* the NPU takes the blocks' products it can (blocks only) */
+    int npu;     /* the NPU takes the products it supports */
     int alone;   /* blocks only: the CPU alone, without the GPU's fast
                     prompt (which reads them in the other candidates) */
 };
@@ -54,6 +54,7 @@ struct janas_tuner {
     /* the combinations of devices a class may use (common/devices.h: bit
        gpu | npu << 1), the user's choice; 0 any */
     int allowed[JANAS_TUNE_CLASSES];
+    int allow_npu_small; /* the NPU also supports passes below a block */
     struct {
         double cost[JANAS_TUNE_MAX_CANDS]; /* seconds per token, averaged */
         uint32_t tried[JANAS_TUNE_MAX_CANDS];
@@ -102,6 +103,9 @@ void janas_tuner_allow_gpu(struct janas_tuner *t, int allow);
 /* Whether they may be chosen for one token too: only where the GPU takes
    single-token products (janas_gpu_min_n 1, a discrete GPU). */
 void janas_tuner_allow_gpu_one(struct janas_tuner *t, int allow);
+
+/* Small NPU passes are opt-in; other backends keep blocks only. */
+void janas_tuner_allow_npu_small(struct janas_tuner *t, int allow);
 
 /* The best known candidate of a class (for work that is not measured). */
 int janas_tuner_best(const struct janas_tuner *t, int cls);

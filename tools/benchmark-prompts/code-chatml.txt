@@ -1,0 +1,40 @@
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+These are two functions from a small settings parser:
+
+def parse_integer(settings, key, default=None):
+    raw = settings.get(key)
+    if raw is None:
+        return default
+    if not isinstance(raw, str):
+        raise ValueError(f"{key}: expected a string")
+    value = raw.strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{key}: invalid integer") from exc
+
+def parse_decimal(settings, key, default=None):
+    raw = settings.get(key)
+    if raw is None:
+        return default
+    if not isinstance(raw, str):
+        raise ValueError(f"{key}: expected a string")
+    value = raw.strip()
+    if not value:
+        return default
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise ValueError(f"{key}: invalid decimal") from exc
+
+Add a parse_boolean function using the same validation and default handling.
+Accept true/yes/1 and false/no/0 without regard to case; reject other strings.
+Then write small unittest tests covering successful conversion, missing keys,
+blank strings, non-string input, and invalid values for all three functions.
+Show the code first and briefly explain the behavior afterward.
+<|im_end|>
+<|im_start|>assistant

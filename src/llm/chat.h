@@ -100,6 +100,7 @@ struct janas_llm_chat {
     janas_llm *llm;
     struct janas_llm_session *s;
     struct janas_llm_chat_params p;
+    int max_drafts; /* 0: the public API's default ceiling; else 1..16 */
     char *system;
     int replying;   /* a reply is being read */
     int closed;     /* the last reply ended with a stop token */

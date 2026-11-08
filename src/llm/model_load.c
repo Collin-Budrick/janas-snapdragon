@@ -2061,3 +2061,9 @@ struct janas_expert_cache *janas_llm_model_cache(struct janas_llm_model *m)
 {
     return m->cache;
 }
+
+struct janas_expert_cache *janas_llm_model_mtp_cache(struct janas_llm_model *m)
+{
+    return m && m->mtp_own_cache && m->mtp_cache != m->cache ? m->mtp_cache
+                                                            : NULL;
+}

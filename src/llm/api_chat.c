@@ -33,15 +33,21 @@ static int32_t gen_options(const janas_llm_chat *c, struct janas_gen_options *o)
         !(p->min_p >= 0) || p->max_reply < 0 || p->max_reasoning < 0 ||
         p->top_logprobs < 0 || p->top_logprobs > JANAS_SAMPLE_MAX_TOP ||
         !(p->presence_penalty >= -2 && p->presence_penalty <= 2) ||
-        !(p->frequency_penalty >= -2 && p->frequency_penalty <= 2))
+        !(p->frequency_penalty >= -2 && p->frequency_penalty <= 2) ||
+        p->speculate < JANAS_LLM_SPEC_NONE || p->speculate > JANAS_LLM_SPEC_MTP)
         return janas_api_fail(JANAS_LLM_EINVAL, "invalid chat parameters");
     memset(o, 0, sizeof(*o));
     int mtp = c->llm->has_mtp;
-    o->spec_mode = !p->speculate   ? JANAS_SPEC_OFF
+    if (p->speculate == JANAS_LLM_SPEC_MTP && !mtp)
+        return janas_api_fail(JANAS_LLM_EINVAL,
+                              "MTP speculation requires an open MTP head");
+    o->spec_mode = p->speculate == JANAS_LLM_SPEC_NONE ? JANAS_SPEC_OFF
+                   : p->speculate == JANAS_LLM_SPEC_LOOKUP ? JANAS_SPEC_LOOKUP
+                   : p->speculate == JANAS_LLM_SPEC_MTP ? JANAS_SPEC_MTP
                    : c->llm->draft ? JANAS_SPEC_DRAFT
                    : mtp           ? JANAS_SPEC_MTP
                                    : JANAS_SPEC_LOOKUP;
-    o->draft = c->llm->draft;
+    o->draft = o->spec_mode == JANAS_SPEC_DRAFT ? c->llm->draft : NULL;
     /*
      * The ceiling on how many tokens may be proposed, not how many will be:
      * a planner picks the number from the cost of a longer pass and the rate
@@ -52,7 +58,7 @@ static int32_t gen_options(const janas_llm_chat *c, struct janas_gen_options *o)
      * falls to about one in nine and a failed verification costs a pass over
      * five tokens.
      */
-    o->spec_k = mtp ? 8 : 4;
+    o->spec_k = c->max_drafts ? c->max_drafts : mtp ? 8 : 4;
     o->spec_auto = 1;
     o->eos = -1;
     o->temperature = p->temperature;
@@ -155,6 +161,22 @@ int32_t janas_llm_chat_set_params(janas_llm_chat *c,
     if (!c || !p)
         return janas_api_fail(JANAS_LLM_EINVAL, "invalid argument");
     return take_params(c, p);
+}
+
+int32_t janas_llm_chat_speculation(janas_llm_chat *c, int32_t mode,
+                                    int32_t max_drafts)
+{
+    if (!c || mode < JANAS_LLM_SPEC_NONE || mode > JANAS_LLM_SPEC_MTP ||
+        max_drafts < 0 || max_drafts > JANAS_GEN_MAX_K)
+        return janas_api_fail(JANAS_LLM_EINVAL, "invalid speculation settings");
+    int old = c->max_drafts;
+    c->max_drafts = max_drafts;
+    struct janas_llm_chat_params p = c->p;
+    p.speculate = mode;
+    int32_t rc = take_params(c, &p);
+    if (rc != JANAS_LLM_OK)
+        c->max_drafts = old;
+    return rc;
 }
 
 int32_t janas_llm_chat_system(janas_llm_chat *c, const char *text, int32_t len)

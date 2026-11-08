@@ -54,6 +54,10 @@ static void usage(FILE *f)
         "                    fits it: an MTP block or Gemma 4's assistant)\n"
         "  --no-mtp          none, not even one found beside the model\n"
         "  --draft FILE      a small model of the same family, for speed\n"
+        "  --speculation M   none, lookup, mtp or auto (default auto); mtp\n"
+        "                    requires an MTP head and fails without one\n"
+        "  --draft-tokens N  maximum guessed tokens per pass, 1..16\n"
+        "                    (default: 8 with an MTP head, 4 otherwise)\n"
         "  --mode M          auto, eco or max (default auto)\n"
         "  --quality Q       the lowest quality the engine may choose to be\n"
         "                    faster where memory is short: low (default)\n"
@@ -177,6 +181,8 @@ static const char *const OPTIONS[] = {"--help",
                                       "--cache",
                                       "--mtp",
                                       "--draft",
+                                      "--speculation",
+                                      "--draft-tokens",
                                       "--mode",
                                       "--quality",
                                       "--think",
@@ -331,6 +337,17 @@ int main(int argc, char **argv)
             c->llm.mtp_path = arg(argc, argv, &i);
         } else if (!strcmp(a, "--draft")) {
             c->llm.draft_path = arg(argc, argv, &i);
+        } else if (!strcmp(a, "--speculation")) {
+            static const char *const modes[] = {"none", "lookup", "mtp",
+                                                "auto"};
+            static const int values[] = {JANAS_LLM_SPEC_NONE,
+                                         JANAS_LLM_SPEC_LOOKUP,
+                                         JANAS_LLM_SPEC_MTP,
+                                         JANAS_LLM_SPEC_AUTO};
+            c->speculation = values[choice(argc, argv, &i, modes, 4)];
+            c->speculation_set = 1;
+        } else if (!strcmp(a, "--draft-tokens")) {
+            c->max_drafts = (int)num(argc, argv, &i, 1, 16);
         } else if (!strcmp(a, "--quality")) {
             static const char *const levels[] = {"low", "medium", "high"};
             c->llm.min_quality = choice(argc, argv, &i, levels, 3);
@@ -451,6 +468,12 @@ int main(int argc, char **argv)
             fprintf(stderr, "janas-server: one model only\n");
             return 2;
         }
+    }
+    if (c->speculation_set && c->speculation == JANAS_LLM_SPEC_MTP &&
+        c->no_mtp) {
+        fprintf(stderr, "janas-server: --speculation mtp conflicts with "
+                        "--no-mtp\n");
+        return 2;
     }
     if (!c->model_path) {
         usage(stderr);

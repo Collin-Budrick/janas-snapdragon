@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""Sequential, native-Windows Janas benchmarks with fixed chat workloads.
+
+Run --plan anywhere to inspect the bounded screen/refinement design. Actual
+runs require native ARM64 Windows Python and a rebuilt janas-bench.exe.
+Fresh-process results do not claim that Windows's file cache or the SSD is
+cold. Warm samples retain model/expert caches but recreate the chat history.
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime as dt
+import hashlib
+import itertools
+import json
+import math
+import os
+from pathlib import Path
+import platform
+import statistics
+import subprocess
+import sys
+import time
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+PROFILES = {
+    "cpu": ("cpu", "cpu", "cpu"),
+    "cpu+gpu": ("gpu", "gpu", "gpu"),
+    "cpu+npu": ("npu", "cpu", "cpu"),
+    "cpu+gpu+npu": ("npu+gpu", "gpu", "gpu"),
+}
+PROMPTS = [
+    ("explanation", "Explain how a language model can use RAM, SSD storage, a CPU, "
+     "a GPU and an NPU together. Describe the tradeoffs and give a concrete example. "
+     "Write clear paragraphs without assuming a specific benchmark result."),
+    ("code", "Write a Python function that groups a list of event dictionaries by "
+     "their UTC date. Handle missing timestamps explicitly. Explain the design and "
+     "show two small examples with different dates."),
+    ("planning", "Plan a small community garden with herbs, vegetables and flowers. "
+     "Explain the layout, watering schedule and how volunteers can share the work. "
+     "Make the recommendations concrete and practical."),
+]
+REQUIRED_FLAGS = {
+    "--speculation", "--draft-tokens", "--prompt-file", "--seed", "--threads",
+    "--warmups", "--json", "--prompt-on", "--drafts-on", "--reply-on",
+}
+PREFETCH_POLICIES = {"auto": {}, "off": {"JANAS_PREFETCH": "0", "JANAS_PREFETCH_PREFILL": "0"},
+    "decode-off": {"JANAS_PREFETCH": "0"}, "prompt-off": {"JANAS_PREFETCH_PREFILL": "0"}}
+RECORDED_PERFORMANCE_ENV = (
+    "JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG", "JANAS_TUNE",
+    "JANAS_TUNE_THREADS", "JANAS_WARM", "JANAS_MISS_SKIP", "JANAS_EXPERT_BITS",
+    "JANAS_HEAD_BITS", "JANAS_KERNELS", "JANAS_EXPERTS", "JANAS_BLOCK_THREADS",
+    "JANAS_KV", "JANAS_ATTN",
+    "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL", "JANAS_URING", "JANAS_URING_BATCH",
+    "JANAS_URING_DEEP", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS", "JANAS_NPU_MAX_MB", "JANAS_NPU_SPIN",
+    "JANAS_NPU_A8", "JANAS_NPU_LAYERS", "JANAS_GPU_ALWAYS", "JANAS_NPU_ALWAYS",
+    "JANAS_GPU_TOKEN", "JANAS_GPU_WHOLE", "JANAS_GPU_FAST_PROMPT",
+    "JANAS_GPU_EXPERT_SHARE", "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_GPU_ALLOC")
+
+
+@dataclasses.dataclass(frozen=True)
+class Case:
+    profile: str
+    speculation: str
+    threads: int
+    cache_gib: float
+    draft_tokens: int
+    prompt: int = 0
+    prompt_on: str = "cpu"
+    drafts_on: str = "cpu"
+    reply_on: str = "cpu"
+    prefetch: str = "auto"
+    gpu_min_tokens: int = 0
+    npu_min_tokens: int = 0
+    npu_min_macs: int = 0
+
+    def key(self) -> str:
+        data = json.dumps(dataclasses.asdict(self), sort_keys=True).encode()
+        return hashlib.sha256(data).hexdigest()[:16]
+
+    def cpu_reference(self) -> Case:
+        return dataclasses.replace(self, profile="cpu", speculation="none",
+                                   draft_tokens=4, prompt_on="cpu",
+                                   drafts_on="cpu", reply_on="cpu")
+
+
+def csv_values(value: str, convert: Any = str) -> list[Any]:
+    return list(dict.fromkeys(convert(x.strip()) for x in value.split(",") if x.strip()))
+
+
+def unique(cases: list[Case]) -> list[Case]:
+    return list(dict.fromkeys(cases))
+
+
+def screen_cases(args: argparse.Namespace) -> list[Case]:
+    cases = []
+    for profile, spec in itertools.product(args.profiles, args.speculations):
+        p, d, r = PROFILES[profile]
+        ceiling = 4 if spec == "none" or 4 in args.draft_tokens else args.draft_tokens[0]
+        cases.append(Case(profile, spec, max(args.threads), args.cache_gib[-1],
+                          ceiling, prompt_on=p, drafts_on=d, reply_on=r,
+                          prefetch=getattr(args, "prefetch", "auto"),
+                          gpu_min_tokens=getattr(args, "gpu_min_tokens", 0),
+                          npu_min_tokens=getattr(args, "npu_min_tokens", 0),
+                          npu_min_macs=getattr(args, "npu_min_macs", 0)))
+    return with_references(cases)
+
+
+def with_references(cases: list[Case]) -> list[Case]:
+    # Baselines precede variants even when the caller requests only accelerators.
+    return unique([x for c in cases for x in (c.cpu_reference(), c)])
+
+
+def refinement_cases(args: argparse.Namespace, winners: list[Case], n_prompts: int) -> list[Case]:
+    cases: list[Case] = []
+    for winner in winners:
+        changes = [winner]
+        changes += [dataclasses.replace(winner, threads=n) for n in args.threads]
+        changes += [dataclasses.replace(winner, cache_gib=n) for n in args.cache_gib]
+        if winner.speculation != "none":
+            changes += [dataclasses.replace(winner, draft_tokens=n) for n in args.draft_tokens]
+        choices = ["cpu"]
+        if "gpu" in winner.profile:
+            choices.append("gpu")
+        if "npu" in winner.profile:
+            choices.append("npu")
+        if "gpu" in winner.profile and "npu" in winner.profile:
+            choices.append("npu+gpu")
+        # One factor at a time, rather than a large Cartesian product.
+        for phase in ("prompt_on", "drafts_on", "reply_on"):
+            changes += [dataclasses.replace(winner, **{phase: v}) for v in choices]
+        for c in unique(changes):
+            cases.extend(dataclasses.replace(c, prompt=i) for i in range(n_prompts))
+    return with_references(cases)
+
+
+def identity(path: Path) -> dict[str, Any]:
+    st = path.stat()
+    with path.open("rb") as f:
+        header = hashlib.sha256(f.read(1 << 20)).hexdigest()
+    return {"path": str(path), "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+            "first_mib_sha256": header}
+
+
+def unchanged(path: Path, frozen: dict[str, Any]) -> None:
+    st = path.stat()
+    if (st.st_size, st.st_mtime_ns) != (frozen["size"], frozen["mtime_ns"]):
+        raise RuntimeError(f"Model changed during the benchmark: {path}")
+
+
+def validate_cli(bench: Path) -> str:
+    r = subprocess.run([str(bench), "--help"], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=30)
+    help_text = r.stdout + r.stderr
+    missing = sorted(x for x in REQUIRED_FLAGS if x not in help_text)
+    if missing:
+        raise RuntimeError("Rebuild janas-bench; required CLI flags missing: " + ", ".join(missing))
+    return help_text
+
+
+def execution_evidence(samples: list[dict[str, Any]], gpu: bool, npu: bool) -> dict[str, Any]:
+    """Completed inference work, excluding plan creation and device discovery."""
+    evidence = []
+    for sample in samples:
+        counters = sample.get("accelerator_counters", {})
+        gpu_ran = any(counters.get(k, 0) > 0 for k in ("gpu_products", "gpu_whole_passes"))
+        npu_ran = any(counters.get(k, 0) > 0 for k in ("npu_products", "npu_ffns", "npu_layer_passes"))
+        evidence.append({"phase": sample.get("phase"), "index": sample.get("index"),
+                         "gpu": gpu_ran, "npu": npu_ran})
+    return {"verified": bool(samples) and all((not gpu or x["gpu"]) and
+                                             (not npu or x["npu"]) for x in evidence),
+            "scope": "completed work per sample; does not attribute work to generation vs prompt",
+            "samples": evidence}
+
+
+def run_case(args: argparse.Namespace, case: Case, prompt_path: Path,
+             directory: Path, stage: str) -> dict[str, Any]:
+    key = case.key()
+    cache_root = directory / "cache" / key
+    cache_root.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    # Remove inherited performance choices while retaining SDK/runtime paths.
+    for name in ("JANAS_KERNELS", "JANAS_EXPERTS", "JANAS_GPU_ALWAYS", "JANAS_NPU_ALWAYS",
+                 "JANAS_BLOCK_THREADS", "JANAS_GPU_TOKEN", "JANAS_GPU_WHOLE",
+                 "JANAS_GPU_FAST_PROMPT", "JANAS_GPU_EXPERT_SHARE",
+                 "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS", "JANAS_PREFETCH",
+                 "JANAS_PREFETCH_PREFILL", "JANAS_KV", "JANAS_ATTN"):
+        env.pop(name, None)
+    env.update(PREFETCH_POLICIES[case.prefetch])
+    for name, value in (("JANAS_GPU_MIN_N", case.gpu_min_tokens),
+                        ("JANAS_NPU_MIN_N", case.npu_min_tokens)):
+        if type(value) is not int or not 0 <= value <= 256:
+            raise ValueError("Minimum accelerator tokens must be integers in 0..256")
+        if value:
+            env[name] = str(value)
+    if type(case.npu_min_macs) is not int or not 0 <= case.npu_min_macs <= (1 << 63) - 1:
+        raise ValueError("Minimum Hexagon MACs must be an integer in 0..2^63-1")
+    if case.npu_min_macs:
+        env["JANAS_NPU_MIN_MACS"] = str(case.npu_min_macs)
+    gpu = "gpu" in case.profile
+    npu = "npu" in case.profile
+    env.update({"JANAS_GPU": str(int(gpu)), "JANAS_NPU": str(int(npu)),
+                "JANAS_GPU_DEVICE": "0", "JANAS_GPU_SG": "64",
+                "JANAS_TUNE": "0", "JANAS_TUNE_THREADS": "0", "JANAS_WARM": "0",
+                "JANAS_MISS_SKIP": "0", "JANAS_EXPERT_BITS": "6", "JANAS_HEAD_BITS": "0",
+                "XDG_CACHE_HOME": cache_root.as_posix()})
+    command = [str(args.bench), str(args.model), "--speculation", case.speculation,
+               "--draft-tokens", str(case.draft_tokens), "--seed", str(args.seed),
+               "--threads", str(case.threads), "--prompt-file", str(prompt_path),
+               "--gen", str(args.gen), "--ctx", str(args.ctx), "--rounds", str(args.rounds),
+               "--warmups", str(args.warmups), "--cache", str(case.cache_gib),
+               "--reserve", str(args.reserve_gib), "--prompt-on", case.prompt_on,
+               "--drafts-on", case.drafts_on, "--reply-on", case.reply_on, "--json"]
+    if case.speculation in ("mtp", "auto"):
+        command += ["--mtp", str(args.mtp)]
+    else:
+        command.append("--no-mtp")
+    t0 = time.perf_counter()
+    result: dict[str, Any] = {"stage": stage, "key": key, "case": dataclasses.asdict(case),
+                              "command": command, "records": [], "status": "failed",
+                              "performance_environment": {name: env.get(name) for name in RECORDED_PERFORMANCE_ENV},
+                              "comparison_prompt_ids": [0] if stage == "screen" else list(range(args.n_prompts))}
+    try:
+        r = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=args.timeout)
+        result["exit_code"] = r.returncode
+        (directory / f"{stage}-{key}.stdout.log").write_text(r.stdout, encoding="utf-8")
+        (directory / f"{stage}-{key}.stderr.log").write_text(r.stderr, encoding="utf-8")
+        for line in r.stdout.splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, dict) and value.get("schema") == 1:
+                result["records"].append(value)
+        setup = [x for x in result["records"] if x.get("kind") == "setup"]
+        samples = [x for x in result["records"] if x.get("kind") == "sample"]
+        expected = 1 + args.warmups + args.rounds
+        if r.returncode:
+            result["error"] = r.stderr[-4000:]
+        elif len(setup) != 1 or len(samples) != expected:
+            result["error"] = f"Incomplete benchmark output: {len(samples)}/{expected} samples"
+        elif (gpu and not setup[0].get("gpu")) or (npu and not setup[0].get("npu")):
+            result["error"] = "Requested accelerator is unavailable; CPU fallback is not that hardware case"
+        elif any(x.get("output_tokens", 0) <= 0 for x in samples):
+            result["error"] = "A sample produced no output tokens"
+        else:
+            warm = [x for x in samples if x["phase"] == "warm"]
+            result["status"] = "ok"
+            result["warm_median_tokens_per_second"] = statistics.median(
+                x["output_tokens_per_second"] for x in warm)
+            result["output_signature"] = [warm[0]["output_hash"], warm[0]["output_tokens"]]
+            result["repeatable_output"] = len({(x["output_hash"], x["output_tokens"])
+                                                for x in samples}) == 1
+            evidence = execution_evidence(samples, gpu, npu)
+            result["execution_evidence"] = evidence
+            result["accelerator_execution_verified"] = evidence["verified"]
+    except subprocess.TimeoutExpired as exc:
+        result["error"] = f"Case exceeded {args.timeout}s"
+        for name, text in (("stdout", exc.stdout), ("stderr", exc.stderr)):
+            if text:
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", errors="replace")
+                (directory / f"{stage}-{key}.{name}.log").write_text(text, encoding="utf-8")
+    result["process_wall_seconds"] = time.perf_counter() - t0
+    return result
+
+
+def annotate(rows: list[dict[str, Any]]) -> None:
+    refs = {Case(**r["case"]).key(): r["output_signature"] for r in rows
+            if r.get("status") == "ok" and r["case"]["profile"] == "cpu"
+            and r["case"]["speculation"] == "none"
+            and r.get("repeatable_output", True) is True}
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        ref = refs.get(Case(**row["case"]).cpu_reference().key())
+        row["matches_cpu_reference"] = None if ref is None else row["output_signature"] == ref
+        exact = row["matches_cpu_reference"] is True and row.get("repeatable_output", True)
+        cpu = row["case"]["profile"] == "cpu"
+        row["quality_validation"] = ("exact_cpu_match" if exact else
+            "unverified_no_cpu_reference" if ref is None else
+            "cpu_output_mismatch" if cpu else "unverified_accelerator_output_difference")
+        row["recommendation_eligible"] = exact and (cpu or row.get("accelerator_execution_verified") is True)
+        # Floating-point accelerator output differences need separate quality
+        # validation; they remain candidates for subsequent discovery runs.
+        row["discovery_eligible"] = exact or not cpu
+
+
+def best(rows: list[dict[str, Any]], n: int, matching_only: bool = False) -> list[Case]:
+    ranked = configurations(rows)
+    eligible = "recommendation_eligible" if matching_only else "discovery_eligible"
+    return [Case(**r["case"]) for r in ranked if r[eligible]][:n]
+
+
+def configurations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compare hardware/settings across the same complete set of prompts."""
+    annotate(rows)
+    prompts: set[int] = set()
+    groups: dict[Case, dict[int, dict[str, Any]]] = {}
+    for row in rows:
+        case = Case(**row["case"])
+        prompts.update(row.get("comparison_prompt_ids", [case.prompt]))
+        groups.setdefault(dataclasses.replace(case, prompt=0), {})[case.prompt] = row
+    output = []
+    for case, group in groups.items():
+        good = [r for r in group.values() if r.get("status") == "ok"]
+        if {r["case"]["prompt"] for r in good} != prompts:
+            continue
+        rates = [r["warm_median_tokens_per_second"] for r in good]
+        if not rates or any(not math.isfinite(x) or x <= 0 for x in rates):
+            continue
+        output.append({"stage": "refine" if any(r.get("stage") == "refine" for r in good) else "screen",
+                       "case": dataclasses.asdict(case),
+                       "prompt_count": len(good),
+                       "warm_geomean_tokens_per_second": math.exp(statistics.mean(math.log(x) for x in rates)),
+                       "matches_cpu_reference": all(r.get("matches_cpu_reference") is True for r in good),
+                       "quality_validation": "exact_cpu_match" if all(r["recommendation_eligible"] for r in good)
+                                             else "quality_unverified",
+                       "recommendation_eligible": all(r["recommendation_eligible"] for r in good),
+                       "discovery_eligible": all(r["discovery_eligible"] for r in good)})
+    return sorted(output, key=lambda r: r["warm_geomean_tokens_per_second"], reverse=True)
+
+
+def save_summary(directory: Path, rows: list[dict[str, Any]], args: argparse.Namespace) -> None:
+    annotate(rows)
+    ranked = sorted((r for r in rows if r.get("status") == "ok"),
+                    key=lambda r: r["warm_median_tokens_per_second"], reverse=True)
+    summary = {"measured_cases": len(rows), "successful_cases": len(ranked),
+               "os_file_cache": "uncontrolled; fresh-process is not a cold-SSD claim",
+               "accelerator_execution": "successful backend inference counters per sample; unavailable on older binaries; phase attribution requires a controlled phase-only run",
+               "recommendations_require_matching_cpu_output": True,
+               "quality_note": "Accelerator output differences are quality-unverified; they do not establish quality loss. Validate fixed-input logits/perplexity before recommending them.",
+               "best_discovery_cases": [dataclasses.asdict(x) for x in best(rows, args.top)],
+               "best_matching_cases": [dataclasses.asdict(x) for x in best(rows, args.top, matching_only=True)],
+               "ranked_complete_configurations": configurations(rows),
+               "ranked": ranked}
+    (directory / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--stage", choices=("screen", "refine", "both"), default="screen")
+    p.add_argument("--bench", type=Path, default=ROOT / "bin/aarch64-windows/janas-bench.exe")
+    p.add_argument("--model", type=Path, default=ROOT / "models/qwen3-next-80b-a3b-q4km.jns")
+    p.add_argument("--mtp", type=Path, default=ROOT / "models/qwen3-next-80b-a3b-mtp-q4k.jns")
+    p.add_argument("--output", type=Path)
+    p.add_argument("--previous", type=Path, help="results.jsonl for refinement")
+    p.add_argument("--prompt-file", type=Path, action="append", default=[])
+    p.add_argument("--profiles", default=",".join(PROFILES))
+    p.add_argument("--speculations", default="none,lookup,mtp,auto")
+    p.add_argument("--threads", default="4,8,12")
+    p.add_argument("--cache-gib", default="8,24,0", help="last value is used for screening; 0 is auto")
+    p.add_argument("--draft-tokens", default="2,4,8")
+    p.add_argument("--prefetch", choices=tuple(PREFETCH_POLICIES), default="auto",
+                   help="screen policy; refinement retains each winning case's policy (default auto)")
+    p.add_argument("--gpu-min-tokens", type=int, default=0,
+                   help="manual screen threshold 0..256; 0 clears the override; refinement retains it")
+    p.add_argument("--npu-min-tokens", type=int, default=0,
+                   help="manual screen threshold 0..256; 0 clears the override; refinement retains it")
+    p.add_argument("--npu-min-macs", type=int, default=0,
+                   help="minimum rows*columns*batch for Hexagon; 0 clears the optional work filter")
+    p.add_argument("--reserve-gib", type=float, default=12)
+    p.add_argument("--gen", type=int, default=64)
+    p.add_argument("--ctx", type=int, default=2048)
+    p.add_argument("--seed", type=int, default=20260926)
+    p.add_argument("--rounds", type=int, default=2)
+    p.add_argument("--warmups", type=int, default=0)
+    p.add_argument("--cooldown", type=float, default=5)
+    p.add_argument("--timeout", type=float, default=1800)
+    p.add_argument("--top", type=int, default=2)
+    p.add_argument("--max-cases", type=int, default=32)
+    p.add_argument("--plan", action="store_true", help="print cases without loading a model")
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    args.profiles = csv_values(args.profiles)
+    args.speculations = csv_values(args.speculations)
+    args.threads = csv_values(args.threads, int)
+    args.cache_gib = csv_values(args.cache_gib, float)
+    args.draft_tokens = csv_values(args.draft_tokens, int)
+    if (not args.profiles or any(x not in PROFILES for x in args.profiles)
+        or not args.speculations or any(x not in ("none", "lookup", "mtp", "auto") for x in args.speculations)
+        or not args.threads or any(x < 1 or x > 256 for x in args.threads)
+        or not args.cache_gib or any(not math.isfinite(x) or x < 0 for x in args.cache_gib)
+        or not args.draft_tokens or any(x < 1 or x > 16 for x in args.draft_tokens)
+        or not 0 <= args.gpu_min_tokens <= 256 or not 0 <= args.npu_min_tokens <= 256
+        or not 0 <= args.npu_min_macs <= (1 << 63) - 1
+        or args.gen < 1 or args.gen > (1 << 31) - 1 or args.ctx <= args.gen
+        or args.rounds < 1 or args.rounds > 1000 or args.warmups < 0 or args.warmups > 1000
+        or args.top < 1 or args.max_cases < 1 or args.seed < 1 or args.seed > (1 << 63) - 1
+        or not math.isfinite(args.reserve_gib) or args.reserve_gib < 0
+        or not math.isfinite(args.cooldown) or args.cooldown < 0
+        or not math.isfinite(args.timeout) or args.timeout <= 0):
+        raise ValueError("Invalid benchmark settings")
+    prompts = [(p.stem, p.read_text(encoding="utf-8")) for p in args.prompt_file] or PROMPTS
+    args.n_prompts = len(prompts)
+    previous = []
+    if args.previous:
+        previous = [json.loads(x) for x in args.previous.read_text(encoding="utf-8").splitlines() if x.strip()]
+    cases = screen_cases(args) if args.stage != "refine" else refinement_cases(args, best(previous, args.top), len(prompts))
+    if args.stage == "refine" and not cases:
+        raise ValueError("Refinement needs --previous results with successful complete configurations")
+    if args.plan:
+        print(json.dumps({"stage": args.stage, "sequential": True,
+                          "screen_prompt": prompts[0][0], "refinement_prompts": [x[0] for x in prompts],
+                          "cases": [dataclasses.asdict(x) for x in cases[:args.max_cases]],
+                          "candidate_cases": len(cases), "maximum_cases": args.max_cases,
+                          "fresh_process_os_cache": "uncontrolled",
+                          "refinement": "one-factor changes on top discovery cases, retaining quality-unverified accelerators; no full Cartesian product"}, indent=2))
+        return 0
+    if os.name != "nt" or platform.machine().lower() not in ("arm64", "aarch64"):
+        raise RuntimeError("Run with native ARM64 Windows Python; --plan is available on any host")
+    for name in ("bench", "model", "mtp"):
+        setattr(args, name, getattr(args, name).resolve())
+    if not args.bench.is_file() or not args.model.is_file():
+        raise FileNotFoundError("The native benchmark executable and complete model must exist")
+    if any(x in ("mtp", "auto") for x in args.speculations) and not args.mtp.is_file():
+        raise FileNotFoundError("The requested MTP/auto cases require the MTP sidecar")
+    help_text = validate_cli(args.bench)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / ".cache"))) / "Janas/benchmarks"
+    directory = (args.output or base / stamp).resolve()
+    directory.mkdir(parents=True, exist_ok=False)
+    frozen = identity(args.model)
+    mtp_frozen = identity(args.mtp) if args.mtp.is_file() else None
+    prompt_paths = []
+    manifest_prompts = []
+    for i, (name, text) in enumerate(prompts):
+        encoded = text.encode("utf-8")
+        path = directory / f"prompt-{i}.txt"
+        path.write_bytes(encoded)
+        prompt_paths.append(path)
+        manifest_prompts.append({"name": name, "path": str(path), "sha256": hashlib.sha256(encoded).hexdigest()})
+    manifest = {"created": stamp, "python": sys.version, "machine": platform.machine(),
+                "model": frozen, "mtp": mtp_frozen, "prompts": manifest_prompts,
+                "bench_sha256": hashlib.sha256(args.bench.read_bytes()).hexdigest(),
+                "settings": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                "model_hash_note": "first MiB hash plus fixed size/mtime; full-file hash omitted to avoid reading the full model before measuring",
+                "quality": "high; original expert/head precision; no expert skipping",
+                "performance_environment_by_case": {},
+                "fresh_process": "no previous chat tokens or expected continuation supplied"}
+    (directory / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    (directory / "cli-help.txt").write_text(help_text, encoding="utf-8")
+    rows: list[dict[str, Any]] = []
+    done: set[Case] = set()
+    queue = list(cases)
+    screen_done = False
+    with (directory / "results.jsonl").open("w", encoding="utf-8") as output:
+        while queue and len(rows) < args.max_cases:
+            case = queue.pop(0)
+            if case in done:
+                continue
+            done.add(case)
+            unchanged(args.model, frozen)
+            if mtp_frozen:
+                unchanged(args.mtp, mtp_frozen)
+            stage = "refine" if args.stage == "refine" or screen_done else "screen"
+            print(f"[{len(rows) + 1}/{args.max_cases}] {stage}: {case}", flush=True)
+            row = run_case(args, case, prompt_paths[case.prompt], directory, stage)
+            unchanged(args.model, frozen)
+            if mtp_frozen:
+                unchanged(args.mtp, mtp_frozen)
+            rows.append(row)
+            manifest["performance_environment_by_case"][row["key"]] = row["performance_environment"]
+            (directory / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+            output.write(json.dumps(row) + "\n")
+            output.flush()
+            save_summary(directory, rows, args)
+            if not queue and args.stage == "both" and not screen_done:
+                screen_done = True
+                queue = refinement_cases(args, best(rows, args.top), len(prompts))
+            if queue and args.cooldown:
+                time.sleep(args.cooldown)
+    print(f"Results: {directory}", flush=True)
+    return 0 if any(r["status"] == "ok" for r in rows) else 1
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, RuntimeError, FileNotFoundError) as exc:
+        print(f"benchmark-snapdragon: {exc}", file=sys.stderr)
+        raise SystemExit(2)

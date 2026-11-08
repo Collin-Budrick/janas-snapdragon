@@ -47,7 +47,28 @@ const char *janas_npu_name(const struct janas_npu *u);
 void *janas_npu_alloc(struct janas_npu *u, size_t bytes);
 void janas_npu_free(struct janas_npu *u, void *p);
 
-enum { JANAS_NPU_F16 = 0, JANAS_NPU_I8 = 1 };
+enum {
+    JANAS_NPU_F16 = 0,
+    JANAS_NPU_I8 = 1,
+    /* Original GGUF blocks, for backends that can keep packed weights. */
+    JANAS_NPU_Q4_0,
+    JANAS_NPU_Q4_1,
+    JANAS_NPU_Q8_0,
+    JANAS_NPU_IQ4_NL,
+    JANAS_NPU_MXFP4,
+    JANAS_NPU_Q4_K,
+    JANAS_NPU_Q5_K,
+    JANAS_NPU_Q6_K,
+};
+
+/* Packed formats are attempted only on this optional provider; an
+   unsupported shape or format still returns NULL from mm_create. */
+int janas_npu_is_hexagon(const struct janas_npu *u);
+/* Actual owned weight-buffer bytes where the provider exposes them, or 0. */
+size_t janas_npu_mm_weight_bytes(const struct janas_npu_mm *p);
+/* Unique owned device weight bytes, shared batch plans counted once.
+   Providers without this accounting report 0 (currently Intel). */
+size_t janas_npu_weight_bytes(const struct janas_npu *u);
 
 /*
  * Quantizes n rows of k floats to INT8 with a scale a row (symmetric, -127
@@ -64,6 +85,8 @@ void janas_npu_quant_rows(const float *w, size_t n, size_t k, int8_t *q,
  * (scale NULL). x (m x k floats) and y (m x n floats) from janas_npu_alloc.
  * NULL with a reason in err on failure. It runs once before returning (the
  * first run after a compilation is slow), on whatever x holds.
+ * Hexagon also accepts the packed JANAS_NPU_* formats above with scale NULL;
+ * unsupported formats/shapes return NULL and remain on the CPU.
  */
 struct janas_npu_mm *janas_npu_mm_create(struct janas_npu *u, int m, int n,
                                          int k, int wtype, const void *w,
@@ -102,6 +125,13 @@ struct janas_npu_mm *janas_npu_ffn_create(struct janas_npu *u, int m, int d,
                                           const uint16_t *us, const int8_t *dq,
                                           const uint16_t *ds, float *x,
                                           float *y, char *err, size_t err_len);
+/* Creates another batch shape sharing the source's owned weights, with new
+   input/output bindings. Either product may be destroyed first. As create,
+   runs once before returning. NULL when sharing is unsupported (Intel),
+   the source is in flight, or the new shape cannot run on this provider. */
+struct janas_npu_mm *janas_npu_mm_rebatch(const struct janas_npu_mm *source,
+                                          int m, float *x, float *y,
+                                          char *err, size_t err_len);
 
 /* Its arguments bound to other memory (as at creation: inputs, then
    outputs; janas_npu_alloc), for the runs that follow; not while in

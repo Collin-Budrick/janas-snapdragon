@@ -805,7 +805,10 @@ void janas_npu_stats(const struct janas_npu *u, int *products, int *cached,
     *compile_seconds = u->compile_s;
 }
 
-#else /* no Level Zero here */
+#elif defined(_WIN32) && defined(__aarch64__) && defined(JANAS_HEXAGON)
+/* The matching public interface is implemented in npu_hx.c. */
+
+#else /* no optional provider built here */
 
 struct janas_npu *janas_npu_create(char *err, size_t err_len)
 {
@@ -914,6 +917,38 @@ void janas_npu_stats(const struct janas_npu *u, int *products, int *cached,
     *compile_seconds = 0;
 }
 
+#endif
+
+int janas_npu_is_hexagon(const struct janas_npu *u)
+{
+#if defined(_WIN32) && defined(__aarch64__) && defined(JANAS_HEXAGON)
+    return u != NULL;
+#else
+    (void)u;
+    return 0;
+#endif
+}
+
+#if !(defined(_WIN32) && defined(__aarch64__) && defined(JANAS_HEXAGON))
+size_t janas_npu_mm_weight_bytes(const struct janas_npu_mm *p)
+{
+    (void)p;
+    return 0;
+}
+size_t janas_npu_weight_bytes(const struct janas_npu *u)
+{
+    (void)u;
+    return 0;
+}
+struct janas_npu_mm *janas_npu_mm_rebatch(const struct janas_npu_mm *source,
+                                          int m, float *x, float *y,
+                                          char *err, size_t err_len)
+{
+    (void)source, (void)m, (void)x, (void)y;
+    if (err && err_len)
+        snprintf(err, err_len, "this NPU provider cannot share batch weights");
+    return NULL;
+}
 #endif
 
 int janas_npu_available(void)

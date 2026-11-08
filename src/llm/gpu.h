@@ -180,6 +180,13 @@ const char *janas_gpu_about(const struct janas_gpu *g);
    (from sysfs, through VK_EXT_pci_bus_info), into buf: what a report on
    a card with memory of its own needs to judge its numbers. */
 void janas_gpu_card(const struct janas_gpu *g, char *buf, size_t len);
+/* Successful product submissions and matrix products since create, after
+   the opening self-check. Partial row products count once; an experts-ID
+   dispatch counts its matrices, a fused FFN three products per expert.
+   Whole-model gpu_token passes use their own counter. Read between runs on
+   the calling thread; NULL GPU gives zeros, either output may be NULL. */
+void janas_gpu_product_counters(const struct janas_gpu *g,
+                                 uint64_t *submissions, uint64_t *products);
 /* What the check of the GPU's products against the CPU's on opening left
    out on this driver ("" if nothing; gpu_selfcheck.c). */
 const char *janas_gpu_check_note(const struct janas_gpu *g);

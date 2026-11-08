@@ -6,23 +6,30 @@
  * the blocks where it measures faster.
  *
  * Which, for any model: a product over JANAS_NPU_MIN_N vectors and more
- * (default 64) whose weights stay where they are - in the resident region
+ * (default 64 on Intel, 1 on Hexagon) whose weights stay where they are - in the resident region
  * (attention, recurrent layers, shared experts, the output head), or in the
  * experts' arena once it holds every expert and nothing changes there (a
  * dense model's feed-forwards) - in a type the engine dequantizes, while
  * the copies for the NPU fit JANAS_NPU_MAX_MB (default 4096). The routed
  * experts of a mixture whose experts do not all fit, a few tokens each,
- * stay on the CPU, which computes them while the NPU works. A matrix is
- * compiled the first time a block uses it (INT8, a scale a row, from its
- * rows dequantized), for blocks of the model's largest, and kept in
+ * stay on the CPU. Intel can overlap that work with its NPU submissions;
+ * Hexagon currently completes a synchronous tensor call before the CPU share.
+ * Intel compiles
+ * a matrix as INT8, a scale a row, for blocks of the model's largest, kept in
  * ~/.cache/janas/npu (JANAS_NPU_CACHE=<dir> elsewhere, empty for none) for
  * the next load: prepared once. Only in the passes whose tuner candidate has the NPU (npu_use):
- * the tuner and janas-bench weigh it against the CPU and the GPU.
+ * the tuner and janas-bench weigh it against the CPU and the GPU. Hexagon
+ * keeps supported original quantized blocks, or dequantizes them to FP16
+ * without another integer quantization, with a plan for each actual batch.
+ * JANAS_NPU_MIN_MACS optionally leaves small Hexagon products on the CPU
+ * (rows * columns * actual batch below that value; default 0 disables it).
  *
  * x reaches the NPU as the CPU's products see it (its Q8_K blocks expanded
- * to floats); the NPU computes in FP16, so the results are close to the
- * CPU's, not the same bits.
+ * to floats). Hexagon selects FP16 or quantized matrix kernels; packed
+ * small-batch kernels can quantize these activations again. The results
+ * need numerical validation and need not match the CPU bit for bit.
  */
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -51,15 +58,18 @@ struct npu_entry {
     const void *plane[2]; /* Q6_K_P: the planes it was compiled with */
     struct janas_npu_mm *mm;
     float *y;
-    size_t elems; /* rows x cols, against the budget */
+    size_t elems; /* new weight bytes charged here (a Hexagon clone: zero) */
+    size_t rows, cols;
+    int batch, type; /* products' cache key, including Hexagon's actual M */
     int bad;      /* could not be compiled: CPU */
-    int in_arena; /* from the experts' arena: stale when it changes */
+    int in_arena; /* dependencies: bit 0 main arena, bit 1 separate MTP */
 };
 
 struct janas_m_npu {
     struct janas_npu *u;
     int block, min_n;
-    size_t budget, used; /* bytes of INT8 copies allowed, made */
+    uint64_t min_macs; /* Hexagon only: minimum rows * columns * actual M */
+    size_t budget, used; /* bytes of weight copies allowed, made */
     /* the experts' arena as seen when this pass began, the cache idle
        (janas_expert_cache_resident says no between its begin and finish,
        where the feed-forwards' products are): NULL if it was not whole or
@@ -67,6 +77,8 @@ struct janas_m_npu {
        compiled at */
     const uint8_t *arena;
     uint64_t arena_bytes, arena_loads, compiled_loads;
+    const uint8_t *mtp_arena;
+    uint64_t mtp_arena_bytes, mtp_arena_loads, mtp_compiled_loads;
     struct npu_entry e[NPU_SLOTS];
     struct {
         size_t cols;
@@ -78,21 +90,23 @@ struct janas_m_npu {
     double compile_s;
     uint64_t runs, cpu_fallbacks;
     /* products left to the CPU, by reason: too few vectors, type or
-       layout, weights that may change */
-    uint64_t no_n, no_type, no_stable;
-    /* seconds: inputs expanded, the CPU's share of the groups, waiting for
-       the NPU after it, outputs copied (JANAS_NPU_STATS) */
+       layout, weights that may change, insufficient Hexagon work */
+    uint64_t no_n, no_type, no_stable, no_work;
+    /* seconds: inputs expanded, the CPU's share of the groups, finishing
+       after it (Hexagon bookkeeping, Intel wait), outputs copied */
     double t_expand, t_cpu, t_wait, t_copy;
     /* the matrices looked up (and the first time loaded or compiled), the
-       runs begun, and the whole of the products' calls that use the NPU */
+       runs begun (Hexagon executes synchronously here), and the whole of
+       the products' calls that use the NPU */
     double t_entry, t_begin, t_calls;
-    /* by shape (JANAS_NPU_STATS=2): runs and their wait, and the products
+    /* by shape (JANAS_NPU_STATS=2): runs and their execution/finish time,
+       and the products
        refused with that shape, by reason (0 vectors, 1 type or layout,
-       2 weights that may change) */
+       2 weights that may change, 3 below minimum MACs) */
     struct {
         size_t rows, cols;
         int type;
-        uint64_t runs, refused[3];
+        uint64_t runs, refused[4];
         double wait;
     } sh[32];
     int nsh;
@@ -244,8 +258,29 @@ void janas_m_npu_open(struct janas_llm_model *m)
     if (c && *c && janas_npu_set_cache(n->u, c))
         fprintf(stderr, "janas: NPU cache %s not usable\n", c);
     const char *mn = getenv("JANAS_NPU_MIN_N");
-    n->min_n = mn && atoi(mn) > 0 ? atoi(mn) : 64;
+    n->min_n = mn && atoi(mn) > 0 ? atoi(mn)
+                                    : janas_npu_is_hexagon(n->u) ? 1 : 64;
+    const char *macs = getenv("JANAS_NPU_MIN_MACS");
+    if (janas_npu_is_hexagon(n->u) && macs && *macs) {
+        uint64_t v = 0;
+        int valid = 1;
+        for (const unsigned char *p = (const unsigned char *)macs; *p; p++) {
+            if (*p < '0' || *p > '9' || v > (UINT64_MAX - (*p - '0')) / 10) {
+                valid = 0;
+                break;
+            }
+            v = v * 10 + (*p - '0');
+        }
+        if (valid && v <= INT64_MAX)
+            n->min_macs = v;
+        else
+            fprintf(stderr, "janas: JANAS_NPU_MIN_MACS requires a decimal in "
+                            "0..9223372036854775807; ignored\n");
+    }
     n->block = (int)janas_llm_model_max_block(m);
+    /* The Hexagon provider implements products, not OpenVINO IR graphs. */
+    if (janas_npu_is_hexagon(n->u))
+        n->lmode = -1;
     const char *mb = getenv("JANAS_NPU_MAX_MB");
     n->budget = (size_t)(mb && atol(mb) > 0 ? atol(mb) : 4096) << 20;
     m->npu = n;
@@ -260,6 +295,11 @@ void janas_m_npu_open(struct janas_llm_model *m)
 int janas_m_npu_takes(const struct janas_llm_model *m, uint32_t n)
 {
     return m->npu && m->npu_use && (int)n >= m->npu->min_n;
+}
+
+int janas_m_npu_token_capable(const struct janas_llm_model *m)
+{
+    return m->npu && janas_npu_is_hexagon(m->npu->u);
 }
 
 void janas_m_npu_awake(struct janas_llm_model *m, uint32_t n)
@@ -282,6 +322,31 @@ const char *janas_llm_model_npu_why(const struct janas_llm_model *m)
     return m->npu_why;
 }
 
+void janas_llm_model_accel_counters(const struct janas_llm_model *m,
+                                    struct janas_llm_accel_counters *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof(*out));
+    if (!m)
+        return;
+    if (m->npu) {
+        const struct janas_m_npu *n = m->npu;
+        out->npu_products = n->runs;
+        out->npu_ffns = n->ffn_runs;
+        out->npu_layer_passes = n->layer_passes;
+        out->npu_weight_bytes = janas_npu_weight_bytes(n->u);
+        int made, cached;
+        double seconds;
+        janas_npu_stats(n->u, &made, &cached, &seconds);
+        out->npu_prepared_plans = made > 0 ? (uint64_t)made : 0;
+    }
+    janas_gpu_product_counters(m->gpu, &out->gpu_product_submissions,
+                               &out->gpu_products);
+    for (size_t i = 0; i < sizeof m->gtok_runs / sizeof m->gtok_runs[0]; i++)
+        out->gpu_whole_passes += m->gtok_runs[i];
+}
+
 void janas_m_npu_close(struct janas_llm_model *m)
 {
     struct janas_m_npu *n = m->npu;
@@ -295,18 +360,24 @@ void janas_m_npu_close(struct janas_llm_model *m)
                 "janas: NPU %d matrices (%d from the cache, %.1f s), %llu "
                 "products, %llu to the CPU; left to the CPU: %llu too few "
                 "vectors, %llu type or layout, %llu weights that may "
-                "change\n",
+                "change, %llu below minimum MACs\n",
                 np, nc, cs, (unsigned long long)n->runs,
                 (unsigned long long)n->cpu_fallbacks,
                 (unsigned long long)n->no_n, (unsigned long long)n->no_type,
-                (unsigned long long)n->no_stable);
+                (unsigned long long)n->no_stable,
+                (unsigned long long)n->no_work);
     if (getenv("JANAS_NPU_STATS"))
         fprintf(stderr,
                 "janas: NPU time: inputs expanded %.2f s, the CPU's share of "
-                "the groups %.2f s, waiting for the NPU %.2f s, outputs "
-                "copied %.2f s; matrices looked up %.2f s, runs begun %.2f "
-                "s, the products' calls %.2f s\n",
-                n->t_expand, n->t_cpu, n->t_wait, n->t_copy, n->t_entry,
+                "the groups %.2f s, %s %.2f s, outputs copied %.2f s; "
+                "matrices looked up %.2f s, %s %.2f s, the products' "
+                "calls %.2f s\n",
+                n->t_expand, n->t_cpu,
+                janas_npu_is_hexagon(n->u) ? "finish bookkeeping"
+                                          : "waiting for the NPU",
+                n->t_wait, n->t_copy, n->t_entry,
+                janas_npu_is_hexagon(n->u) ? "synchronous NPU calls"
+                                          : "runs begun",
                 n->t_begin, n->t_calls);
     if (getenv("JANAS_NPU_STATS"))
         fprintf(stderr,
@@ -319,14 +390,16 @@ void janas_m_npu_close(struct janas_llm_model *m)
     for (int i = 0; st && atoi(st) >= 2 && i < n->nsh; i++)
         fprintf(stderr,
                 "janas: NPU %5zu x %5zu type %3d: %6llu runs, %.2f ms each "
-                "waited; refused %llu (vectors) %llu (type, layout) %llu "
-                "(weights)\n",
+                "%s; refused %llu (vectors) %llu (type, layout) %llu "
+                "(weights) %llu (minimum MACs)\n",
                 n->sh[i].rows, n->sh[i].cols, n->sh[i].type,
                 (unsigned long long)n->sh[i].runs,
                 n->sh[i].runs ? n->sh[i].wait / n->sh[i].runs * 1e3 : 0,
+                janas_npu_is_hexagon(n->u) ? "executing/finishing" : "waited",
                 (unsigned long long)n->sh[i].refused[0],
                 (unsigned long long)n->sh[i].refused[1],
-                (unsigned long long)n->sh[i].refused[2]);
+                (unsigned long long)n->sh[i].refused[2],
+                (unsigned long long)n->sh[i].refused[3]);
     if (getenv("JANAS_NPU_STATS") && n->layer_passes)
         fprintf(stderr,
                 "janas: NPU whole layers: %u of %u, %llu blocks, %.2f s "
@@ -408,10 +481,13 @@ static float *xbuf(struct janas_m_npu *n, size_t cols)
    slot stays its own, compiled again at its next use */
 static void drop(struct janas_m_npu *n, struct npu_entry *e)
 {
+    int hx = janas_npu_is_hexagon(n->u);
     janas_npu_mm_destroy(e->mm);
-    if (e->mm)
+    if (hx)
+        n->used = janas_npu_weight_bytes(n->u);
+    else if (e->mm)
         n->used -= e->elems;
-    e->mm = NULL, e->y = NULL, e->bad = 0;
+    e->mm = NULL, e->y = NULL, e->bad = 0, e->elems = 0;
 }
 
 /* JANAS_NPU_CHECK=1: each result of the NPU scanned - not finite, and the
@@ -474,6 +550,8 @@ struct prep_job {
     float *wf;
     int8_t *q;
     uint16_t *s, *f16;
+    int finite_half;
+    atomic_int bad;
     atomic_size_t next;
 };
 
@@ -491,48 +569,238 @@ static void prep_worker(void *arg, int tid, int n_threads)
         size_t nr = r0 + PREP_ROWS < p->rows ? PREP_ROWS : p->rows - r0;
         size_t a = r0 * p->cols, c = nr * p->cols;
         if (p->type < 0) {
-            for (size_t k = a; k < a + c; k++)
-                p->f16[k] =
-                    janas_fp32_to_fp16(janas_u2f((uint32_t)p->b[k] << 16));
+            for (size_t k = a; k < a + c; k++) {
+                float f = janas_u2f((uint32_t)p->b[k] << 16);
+                if (p->finite_half && (!isfinite(f) || fabsf(f) > 65504.0f))
+                    atomic_store(&p->bad, 1);
+                p->f16[k] = janas_fp32_to_fp16(f);
+            }
             continue;
         }
         janas_dequantize(p->type, p->w + r0 * p->row_bytes, p->wf + a, c);
-        janas_npu_quant_rows(p->wf + a, nr, p->cols, p->q + a, p->s + r0);
+        if (p->f16) {
+            for (size_t k = a; k < a + c; k++) {
+                float f = p->wf[k];
+                if (!isfinite(f) || fabsf(f) > 65504.0f)
+                    atomic_store(&p->bad, 1);
+                p->f16[k] = janas_fp32_to_fp16(f);
+            }
+        } else
+            janas_npu_quant_rows(p->wf + a, nr, p->cols, p->q + a, p->s + r0);
     }
 }
 
 static void prep_rows(struct janas_llm_model *m, struct prep_job *p)
 {
     atomic_init(&p->next, 0);
+    atomic_init(&p->bad, 0);
     janas_pool_run(m->compute, prep_worker, p);
+}
+
+/* These Janas formats have the original GGML block layouts. Q6_K_P is a
+   different representation whose optional planes must be dequantized. */
+static int hexagon_type(int type)
+{
+    switch (type) {
+    case JANAS_Q4_0: return JANAS_NPU_Q4_0;
+    case JANAS_Q4_1: return JANAS_NPU_Q4_1;
+    case JANAS_Q8_0: return JANAS_NPU_Q8_0;
+    case JANAS_IQ4_NL: return JANAS_NPU_IQ4_NL;
+    case JANAS_MXFP4: return JANAS_NPU_MXFP4;
+    case JANAS_Q4_K: return JANAS_NPU_Q4_K;
+    case JANAS_Q5_K: return JANAS_NPU_Q5_K;
+    case JANAS_Q6_K: return JANAS_NPU_Q6_K;
+    default: return -1;
+    }
+}
+
+static int weight_bytes(size_t rows, size_t row_bytes, size_t *bytes)
+{
+    if (!rows || !row_bytes || rows > SIZE_MAX / row_bytes)
+        return -1;
+    *bytes = rows * row_bytes;
+    return 0;
+}
+
+static int weight_fits(const struct janas_m_npu *n, size_t bytes)
+{
+    return bytes <= n->budget && n->used <= n->budget - bytes;
+}
+
+/* Repacking can enlarge the copy, and several batch plans share it. The
+   provider owns the unique-byte count even if the original plan is dropped. */
+static int hexagon_charge(struct janas_m_npu *n, struct npu_entry *e)
+{
+    size_t total = janas_npu_weight_bytes(n->u);
+    if (total > n->budget) {
+        janas_npu_mm_destroy(e->mm);
+        e->mm = NULL;
+        n->used = janas_npu_weight_bytes(n->u);
+        return -1;
+    }
+    e->elems = total > n->used ? total - n->used : 0;
+    n->used = total;
+    return 0;
+}
+
+/* Only callers whose weights passed stable() reach here. A batch sibling
+   owns a copy of this same matrix, including the currently loaded planes. */
+static struct npu_entry *shared_weights(struct janas_m_npu *n, const void *w,
+                                         int type, size_t rows, size_t cols,
+                                         const void *p1, const void *p0)
+{
+    for (size_t i = 0; i < NPU_SLOTS; i++) {
+        struct npu_entry *e = &n->e[i];
+        if (e->mm && e->w == w && e->type == type && e->rows == rows &&
+            e->cols == cols &&
+            (type != JANAS_Q6_K_P ||
+             (e->plane[0] == p1 && e->plane[1] == p0)))
+            return e;
+    }
+    return NULL;
+}
+
+static void rebatch_entry(struct janas_m_npu *n, struct npu_entry *e,
+                           const struct npu_entry *source, int ord)
+{
+    float *x = xbuf(n, e->cols);
+    e->y = x ? ybuf(n, e->rows, ord) : NULL;
+    if (!e->y)
+        return;
+    char err[256];
+    e->mm = janas_npu_mm_rebatch(source->mm, e->batch, x, e->y, err, sizeof err);
+    if (e->mm && hexagon_charge(n, e))
+        snprintf(err, sizeof err, "weight buffers exceed NPU budget");
+    if (!e->mm)
+        fprintf(stderr, "janas: NPU: %zu x %zu batch %d on the CPU: %s\n",
+                e->rows, e->cols, e->batch, err);
+}
+
+/* Original quantization on Hexagon, falling back to FP16 values of those
+   same weights when its runtime does not support the packed operation. */
+static void hexagon_entry(struct janas_llm_model *m, struct janas_m_npu *n,
+                           const struct janas_matvec_task *t,
+                           struct npu_entry *e, int ord)
+{
+    size_t rb = janas_qtype_row_bytes(t->type, t->cols), bytes = 0;
+    int type = hexagon_type(t->type);
+    char err[256] = "no memory";
+    float *x = NULL;
+    if (type >= 0 && weight_bytes(t->rows, rb, &bytes) == 0 &&
+        weight_fits(n, bytes)) {
+        x = xbuf(n, t->cols);
+        e->y = x ? ybuf(n, t->rows, ord) : NULL;
+        if (!e->y)
+            return;
+        e->mm = janas_npu_mm_create(n->u, e->batch, (int)t->rows,
+                                    (int)t->cols, type, t->w, NULL, x, e->y,
+                                    err, sizeof err);
+        if (e->mm) {
+            hexagon_charge(n, e);
+            return;
+        }
+    }
+    size_t rc;
+    if (weight_bytes(t->rows, t->cols, &rc) || rc > SIZE_MAX / sizeof(float) ||
+        weight_bytes(rc, sizeof(uint16_t), &bytes) || !weight_fits(n, bytes))
+        return;
+    if (!x)
+        x = xbuf(n, t->cols);
+    if (!e->y)
+        e->y = x ? ybuf(n, t->rows, ord) : NULL;
+    float *wf = e->y ? malloc(sizeof(float) * rc) : NULL;
+    uint16_t *f16 = wf ? malloc(bytes) : NULL;
+    if (f16) {
+        int bad = 0;
+        if (t->type != JANAS_Q6_K_P && t->cols % JANAS_QK == 0 && rb) {
+            struct prep_job p = {.type = t->type,
+                                 .w = t->w,
+                                 .row_bytes = rb,
+                                 .rows = t->rows,
+                                 .cols = t->cols,
+                                 .wf = wf,
+                                 .f16 = f16};
+            prep_rows(m, &p);
+            bad = atomic_load(&p.bad);
+        } else {
+            if (t->type == JANAS_Q6_K_P)
+                janas_q6kp_dequantize(t->w, t->plane[0], t->plane[1], wf, rc);
+            else
+                janas_dequantize(t->type, t->w, wf, rc);
+            for (size_t i = 0; i < rc; i++) {
+                float f = wf[i];
+                if (!isfinite(f) || fabsf(f) > 65504.0f)
+                    bad = 1;
+                f16[i] = janas_fp32_to_fp16(f);
+            }
+        }
+        if (bad)
+            snprintf(err, sizeof err, "weights outside finite FP16 range");
+        else {
+            e->mm = janas_npu_mm_create(n->u, e->batch, (int)t->rows,
+                                        (int)t->cols, JANAS_NPU_F16, f16,
+                                        NULL, x, e->y, err, sizeof err);
+            if (e->mm)
+                hexagon_charge(n, e);
+        }
+    }
+    if (!e->mm)
+        fprintf(stderr, "janas: NPU: %zu x %zu on the CPU: %s\n", t->rows,
+                t->cols, err);
+    free(wf), free(f16);
 }
 
 static struct npu_entry *entry(struct janas_llm_model *m, struct janas_m_npu *n,
                                const struct janas_matvec_task *t, int arena,
                                int ord)
 {
-    size_t h = ((uintptr_t)t->w >> 6) % NPU_SLOTS;
+    int hx = janas_npu_is_hexagon(n->u);
+    int batch = hx ? (int)t->n_vec : n->block;
+    size_t h = (((uintptr_t)t->w >> 6) ^ (size_t)batch) % NPU_SLOTS;
     for (size_t i = 0; i < NPU_SLOTS; i++, h = (h + 1) % NPU_SLOTS) {
         struct npu_entry *e = &n->e[h];
-        if (e->w == t->w && e->mm &&
-            (t->type != JANAS_Q6_K_P ||
-             (e->plane[0] == t->plane[0] && e->plane[1] == t->plane[1])))
+        int same = e->w == t->w && e->batch == batch &&
+                   e->type == t->type && e->rows == t->rows &&
+                   e->cols == t->cols;
+        int planes = t->type != JANAS_Q6_K_P ||
+                     (e->plane[0] == t->plane[0] &&
+                      e->plane[1] == t->plane[1]);
+        if (same && planes && e->mm)
             return e;
-        if (e->w == t->w && e->bad)
+        if (same && planes && e->bad)
             return NULL;
-        if (e->w && e->w != t->w)
+        if (e->w && !same)
             continue;
         if (e->w)
             drop(n, e); /* other planes, or given up: again */
         double t_setup = now();
         e->w = t->w, e->bad = 1, e->in_arena = arena;
         e->plane[0] = t->plane[0], e->plane[1] = t->plane[1];
-        e->elems = t->rows * t->cols;
-        if (n->used + t->rows * t->cols > n->budget)
+        e->batch = batch, e->type = t->type;
+        e->rows = t->rows, e->cols = t->cols;
+        size_t rc;
+        if (weight_bytes(t->rows, t->cols, &rc) ||
+            (!hx && !weight_fits(n, rc)))
             return NULL; /* stays on the CPU for good */
         prep_begin(n, 0);
+        if (hx) {
+            struct npu_entry *source = shared_weights(n, t->w, t->type,
+                                                       t->rows, t->cols,
+                                                       t->plane[0], t->plane[1]);
+            if (source)
+                rebatch_entry(n, e, source, ord);
+            else
+                hexagon_entry(m, n, t, e, ord);
+            atomic_fetch_add(&n->prep_done, 1);
+            e->bad = !e->mm;
+            n->used = janas_npu_weight_bytes(n->u);
+            if (e->bad)
+                e->y = NULL;
+            n->setup_s += now() - t_setup;
+            return e->bad ? NULL : e;
+        }
+        e->elems = rc;
         float *x = xbuf(n, t->cols);
-        size_t rc = t->rows * t->cols;
         float *wf = x ? malloc(sizeof(float) * rc) : NULL;
         int8_t *q = wf ? malloc(rc) : NULL;
         uint16_t *s = q ? malloc(2 * t->rows) : NULL;
@@ -580,34 +848,66 @@ static struct npu_entry *entry(struct janas_llm_model *m, struct janas_m_npu *n,
     return NULL;
 }
 
-/* weights that stay as they are: the resident region, or the experts'
-   arena while it holds every expert (nothing more is loaded into it) */
-/* 1: in the resident region, 2: in the arena as this pass found it whole,
-   0: weights that may change */
+/* Integer ranges avoid comparing pointers from unrelated allocations or
+   overflowing their end addresses (including when no resident region exists). */
+static int contains(const void *base, uint64_t bytes, const void *p)
+{
+    uintptr_t b = (uintptr_t)base, w = (uintptr_t)p;
+    return base && bytes && bytes <= UINTPTR_MAX - b && w >= b &&
+           (uint64_t)(w - b) < bytes;
+}
+
+/* 1: immutable main/MTP resident region, 2: fully resident main arena,
+   3: fully resident separate MTP arena, 0: weights that may change. */
 static int stable(const struct janas_llm_model *m, const struct janas_m_npu *n,
                   const void *p)
 {
-    const uint8_t *w = p, *r = m->resident;
-    if (!w)
+    if (!p)
         return 1; /* a plane not in memory: nothing to read */
-    if (w >= r && w < r + m->j.h.resident_bytes)
+    if (contains(m->resident, m->j.h.resident_bytes, p) ||
+        contains(m->mtp_res, m->mtp_j.h.resident_bytes, p))
         return 1;
-    return n->arena && w >= n->arena && w < n->arena + n->arena_bytes ? 2 : 0;
+    if (contains(n->arena, n->arena_bytes, p))
+        return 2;
+    return contains(n->mtp_arena, n->mtp_arena_bytes, p) ? 3 : 0;
 }
 
-/* at a pass's start, the cache idle: the arena whole or not, and the
-   matrices compiled from it given up if it changed since */
+static int arena_dependency(int st)
+{
+    return st == 2 ? 1 : st == 3 ? 2 : 0;
+}
+
+/* Snapshot only an idle cache that holds every expert. Invalidate its own
+   plans when the allocation, size, load generation or residency changes. */
+static void see_one_arena(struct janas_m_npu *n, struct janas_expert_cache *cache,
+                           int dependency, const uint8_t **seen,
+                           uint64_t *seen_bytes, uint64_t *seen_loads,
+                           uint64_t *compiled_loads)
+{
+    uint64_t bytes = 0, loads = 0;
+    const uint8_t *arena = cache ? janas_expert_cache_resident(cache, &bytes,
+                                                               &loads)
+                                  : NULL;
+    if (arena != *seen || bytes != *seen_bytes || loads != *compiled_loads)
+        for (size_t i = 0; i < NPU_SLOTS; i++)
+            if (n->e[i].w && (n->e[i].in_arena & dependency))
+                drop(n, &n->e[i]);
+    *seen = arena;
+    *seen_bytes = arena ? bytes : 0;
+    *seen_loads = *compiled_loads = loads;
+}
+
+/* At a pass's start, both caches are idle. A shared/embedded MTP cache is
+   already covered by the main snapshot; separate MTP storage has its own
+   generation and cannot inherit the main arena's pointer/loads. */
 static void see_arena(struct janas_llm_model *m, struct janas_m_npu *n)
 {
-    n->arena = m->cache ? janas_expert_cache_resident(m->cache, &n->arena_bytes,
-                                                      &n->arena_loads)
-                        : NULL;
-    if (!n->arena || n->arena_loads == n->compiled_loads)
-        return;
-    for (size_t i = 0; i < NPU_SLOTS; i++)
-        if (n->e[i].w && n->e[i].in_arena && n->e[i].mm)
-            drop(n, &n->e[i]);
-    n->compiled_loads = n->arena_loads;
+    see_one_arena(n, m->cache, 1, &n->arena, &n->arena_bytes,
+                  &n->arena_loads, &n->compiled_loads);
+    struct janas_expert_cache *mtp =
+        m->mtp_own_cache && m->mtp_cache != m->cache ? m->mtp_cache : NULL;
+    see_one_arena(n, mtp, 2, &n->mtp_arena, &n->mtp_arena_bytes,
+                  &n->mtp_arena_loads, &n->mtp_compiled_loads);
 }
 
 static int shape(struct janas_m_npu *n, const struct janas_matvec_task *t)
@@ -631,8 +931,27 @@ static void refused(struct janas_m_npu *n, const struct janas_matvec_task *t,
         n->sh[i].refused[why]++;
 }
 
+/* Saturation preserves comparison against any uint64_t threshold without
+   wrapping a large product into the range intended for tiny operations. */
+static uint64_t product_macs(size_t rows, size_t cols, size_t vectors)
+{
+    uint64_t r = (uint64_t)rows, c = (uint64_t)cols;
+    uint64_t m = vectors ? (uint64_t)vectors : 1;
+    if (c && r > UINT64_MAX / c)
+        return UINT64_MAX;
+    uint64_t rc = r * c;
+    return m && rc > UINT64_MAX / m ? UINT64_MAX : rc * m;
+}
+
+static int enough_work(const struct janas_m_npu *n, size_t rows, size_t cols,
+                         size_t vectors)
+{
+    return !n->min_macs || !janas_npu_is_hexagon(n->u) ||
+           product_macs(rows, cols, vectors) >= n->min_macs;
+}
+
 static int eligible(const struct janas_llm_model *m, struct janas_m_npu *n,
-                    const struct janas_matvec_task *t)
+                     const struct janas_matvec_task *t, int *arena)
 {
     /* a row may end inside a group of 256 (qwen4exp's 640): its
        activations' last group whole. Outputs further apart than their rows
@@ -647,17 +966,25 @@ static int eligible(const struct janas_llm_model *m, struct janas_m_npu *n,
     if (!t->w || (int)t->n_vec < n->min_n || (int)t->n_vec > n->block) {
         return refused(n, t, 0), n->no_n++, 0;
     }
-    if (!npu_type(t->type) ||
+    if (!t->rows || !t->cols || t->rows > INT_MAX || t->cols > INT_MAX ||
+        !npu_type(t->type) ||
         (t->cols % JANAS_QK &&
          (t->type == JANAS_Q6_K_P ||
           janas_qtype_row_bytes(t->type, t->cols) == 0)) ||
         (t->x_stride && t->x_stride != nb) ||
         (t->y_stride && t->y_stride < t->rows))
         return refused(n, t, 1), n->no_type++, 0;
+    if (!enough_work(n, t->rows, t->cols, t->n_vec))
+        return refused(n, t, 3), n->no_work++, 0;
     int st = stable(m, n, t->w);
-    if (t->type == JANAS_Q6_K_P && st &&
-        (stable(m, n, t->plane[0]) == 0 || stable(m, n, t->plane[1]) == 0))
-        st = 0;
+    *arena = arena_dependency(st);
+    if (t->type == JANAS_Q6_K_P && st)
+        for (int i = 0; i < 2; i++) {
+            int ps = stable(m, n, t->plane[i]);
+            if (!ps)
+                st = 0;
+            *arena |= arena_dependency(ps);
+        }
     if (!st)
         return refused(n, t, 2), n->no_stable++, 0;
     return st;
@@ -786,23 +1113,35 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
         return;
     }
     enum { MAXT = 64 };
+    struct janas_matvec_task normalized[MAXT];
     struct janas_matvec_task cpu[MAXT];
     struct npu_entry *on[MAXT];
     const struct janas_matvec_task *ont[MAXT];
+    double on_begin[MAXT];
     size_t nc = 0, nn = 0;
     if (nt > MAXT) {
         janas_gpu_matvec_group(g, m->compute, t, nt);
         return;
+    }
+    /* The matvec API defines zero n_vec as one vector. Intel's existing
+       block-only policy is unchanged; Hexagon can compile that actual M. */
+    int hx = janas_npu_is_hexagon(n->u);
+    if (hx) {
+        memcpy(normalized, t, nt * sizeof(*t));
+        for (size_t i = 0; i < nt; i++)
+            if (!normalized[i].n_vec)
+                normalized[i].n_vec = 1;
+        t = normalized;
     }
     double t_call = now();
     for (int i = 0; i < n->nx; i++)
         n->xb[i].src = NULL; /* the engine rewrites its inputs between calls */
     for (size_t i = 0; i < nt; i++) {
         double tl = now();
-        int st = eligible(m, n, &t[i]), ord = 0;
+        int arena = 0, st = eligible(m, n, &t[i], &arena), ord = 0;
         for (size_t j = 0; st && j < nn; j++)
             ord += ont[j]->rows == t[i].rows;
-        struct npu_entry *e = st ? entry(m, n, &t[i], st == 2, ord) : NULL;
+        struct npu_entry *e = st ? entry(m, n, &t[i], arena, ord) : NULL;
         n->t_entry += now() - tl;
         for (size_t j = 0; e && j < nn; j++)
             if (on[j]->y == e->y) { /* another order than when compiled */
@@ -813,10 +1152,17 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
         int ok = e && expand(m, n, &t[i]) == 0;
         n->t_expand += now() - te;
         if (ok) {
+            /* Hexagon begin runs synchronously. Idle CPU workers must be
+               quiet during that work, before the CPU's share starts. */
+            int begin_spin = hx ? npu_quiet(m) : 0;
             double tb = now();
             int begun = janas_npu_mm_begin(e->mm) == 0;
-            n->t_begin += now() - tb;
+            double dt = now() - tb;
+            n->t_begin += dt;
+            if (hx)
+                npu_loud(m, begin_spin);
             if (begun) {
+                on_begin[nn] = hx ? dt : 0;
                 on[nn] = e, ont[nn++] = &t[i];
                 continue;
             }
@@ -829,7 +1175,7 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
         janas_gpu_matvec_group(g, m->compute, cpu, nc);
     double t1 = now();
     n->t_cpu += t1 - t0;
-    int spin = nn ? npu_quiet(m) : 0; /* from here the CPU only waits */
+    int spin = nn && !hx ? npu_quiet(m) : 0; /* Intel waits after CPU work */
     for (size_t i = 0; i < nn; i++) {
         const struct janas_matvec_task *k = ont[i];
         double tw = now();
@@ -838,7 +1184,7 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
         n->t_wait += tc - tw;
         int si = shape(n, k);
         if (si >= 0)
-            n->sh[si].runs++, n->sh[si].wait += tc - tw;
+            n->sh[si].runs++, n->sh[si].wait += on_begin[i] + tc - tw;
         if (failed) {
             /* the NPU failed: this product on the CPU after all */
             n->cpu_fallbacks++;
@@ -862,7 +1208,7 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
         n->t_copy += now() - tc;
         n->runs++;
     }
-    if (nn)
+    if (nn && !hx)
         npu_loud(m, spin);
     n->t_calls += now() - t_call;
 }
@@ -874,44 +1220,69 @@ void janas_m_products(struct janas_llm_model *m, struct janas_gpu *g,
    w as the products'; NULL if it stays on the CPU */
 static struct npu_entry *entry16(struct janas_llm_model *m,
                                  struct janas_m_npu *n, const uint16_t *w,
-                                 size_t rows, size_t cols)
+                                  size_t rows, size_t cols, uint32_t nv)
 {
-    size_t h = ((uintptr_t)w >> 6) % NPU_SLOTS;
+    int hx = janas_npu_is_hexagon(n->u);
+    int batch = hx ? (int)nv : n->block;
+    size_t h = (((uintptr_t)w >> 6) ^ (size_t)batch) % NPU_SLOTS;
     for (size_t i = 0; i < NPU_SLOTS; i++, h = (h + 1) % NPU_SLOTS) {
         struct npu_entry *e = &n->e[h];
-        if (e->w == w && e->mm)
+        int same = e->w == w && e->batch == batch && e->type == -1 &&
+                   e->rows == rows && e->cols == cols;
+        if (same && e->mm)
             return e;
-        if (e->w == w && e->bad)
+        if (same && e->bad)
             return NULL;
-        if (e->w && e->w != w)
+        if (e->w && !same)
             continue;
+        if (e->w)
+            drop(n, e);
         double t_setup = now();
         e->w = w, e->bad = 1, e->in_arena = 0;
         e->plane[0] = e->plane[1] = NULL;
-        e->elems = 2 * rows * cols; /* two bytes a weight, against the
-                                       budget of INT8 copies */
-        if (n->used + e->elems > n->budget)
+        e->batch = batch, e->type = -1, e->rows = rows, e->cols = cols;
+        struct npu_entry *source = hx ? shared_weights(n, w, -1, rows, cols,
+                                                        NULL, NULL)
+                                      : NULL;
+        size_t rc;
+        if (weight_bytes(rows, cols, &rc) ||
+            weight_bytes(rc, sizeof(uint16_t), &e->elems) ||
+            (!source && !weight_fits(n, e->elems)))
             return NULL; /* stays on the CPU for good */
         prep_begin(n, 0);
+        if (source) {
+            rebatch_entry(n, e, source, 0);
+            goto ready;
+        }
         float *x = xbuf(n, cols);
         uint16_t *f16 = x ? malloc(2 * rows * cols) : NULL;
         e->y = f16 ? ybuf(n, rows, 0) : NULL;
         if (e->y) {
-            struct prep_job p = {
-                .type = -1, .b = w, .rows = rows, .cols = cols, .f16 = f16};
+            struct prep_job p = {.type = -1,
+                                 .b = w,
+                                 .rows = rows,
+                                 .cols = cols,
+                                 .f16 = f16,
+                                 .finite_half = hx};
             prep_rows(m, &p);
-            char err[256];
-            e->mm = janas_npu_mm_create(n->u, n->block, (int)rows, (int)cols,
-                                        JANAS_NPU_F16, f16, NULL, x, e->y, err,
-                                        sizeof err);
+            char err[256] = "weights outside finite FP16 range";
+            if (!atomic_load(&p.bad))
+                e->mm = janas_npu_mm_create(n->u, batch, (int)rows, (int)cols,
+                                            JANAS_NPU_F16, f16, NULL, x,
+                                            e->y, err, sizeof err);
+            if (e->mm && hx && hexagon_charge(n, e))
+                snprintf(err, sizeof err, "weight buffer exceeds NPU budget");
             if (!e->mm)
                 fprintf(stderr, "janas: NPU: %zu x %zu (bf16) on the CPU: %s\n",
                         rows, cols, err);
         }
         free(f16);
+ready:
         atomic_fetch_add(&n->prep_done, 1);
         e->bad = !e->mm;
-        if (e->mm)
+        if (hx)
+            n->used = janas_npu_weight_bytes(n->u);
+        else if (e->mm)
             n->used += e->elems;
         if (e->bad)
             e->y = NULL;
@@ -930,9 +1301,14 @@ int janas_m_npu_dense(struct janas_llm_model *m, const uint16_t *w,
     /* not the narrow ones (a mix's inject, 4 rows): a run's fixed cost,
        some 0.45 ms, is more than the CPU takes */
     if (!n || (int)nv < n->min_n || (int)nv > n->block || rows < 64 ||
+        rows > INT_MAX || !cols || cols > INT_MAX ||
         stable(m, n, w) != 1)
         return -1;
-    struct npu_entry *e = entry16(m, n, w, rows, cols);
+    if (!enough_work(n, rows, cols, nv)) {
+        n->no_work++;
+        return -1;
+    }
+    struct npu_entry *e = entry16(m, n, w, rows, cols, nv);
     if (!e)
         return -1;
     int i = 0;
@@ -952,7 +1328,10 @@ int janas_m_npu_dense(struct janas_llm_model *m, const uint16_t *w,
     double tw = now();
     int r = janas_npu_mm_run(e->mm);
     double tc = now();
-    n->t_wait += tc - tw;
+    if (janas_npu_is_hexagon(n->u))
+        n->t_begin += tc - tw;
+    else
+        n->t_wait += tc - tw;
     npu_loud(m, spin);
     if (r != 0) {
         n->cpu_fallbacks++;
@@ -1101,7 +1480,8 @@ int janas_m_npu_ffn_begin(struct janas_llm_model *m, const uint8_t *const w[3],
     struct janas_m_npu *n =
         m->npu_use && m->npu && m->npu->lmode != 1 ? m->npu : NULL;
     job->e = NULL;
-    if (!n || (int)n_vec < n->min_n || (int)n_vec > n->block)
+    if (!n || janas_npu_is_hexagon(n->u) || (int)n_vec < n->min_n ||
+        (int)n_vec > n->block)
         return -1;
     /* the Ana-Net probes and the down by neuron read the intermediate */
     if (m->ana_mode || m->ana_tok || m->ana_agree || m->ana_coarse ||
@@ -1123,11 +1503,17 @@ int janas_m_npu_ffn_begin(struct janas_llm_model *m, const uint8_t *const w[3],
     const uint8_t *wm[3] = {w[0] + g->offset, w[1] + u->offset,
                             w[2] + d->offset};
     int st = stable(m, n, wm[0]);
-    if (st && (stable(m, n, wm[1]) != st || stable(m, n, wm[2]) != st ||
-               (d->type == JANAS_Q6_K_P &&
-                (!stable(m, n, plane[0]) || !stable(m, n, plane[1])))))
+    int arena = arena_dependency(st);
+    if (st && (stable(m, n, wm[1]) != st || stable(m, n, wm[2]) != st))
         st = 0;
-    struct npu_entry *e = st ? ffn_entry(m, n, wm, plane, mx, st == 2) : NULL;
+    if (st && d->type == JANAS_Q6_K_P)
+        for (int i = 0; i < 2; i++) {
+            int ps = stable(m, n, plane[i]);
+            if (!ps)
+                st = 0;
+            arena |= arena_dependency(ps);
+        }
+    struct npu_entry *e = st ? ffn_entry(m, n, wm, plane, mx, arena) : NULL;
     if (!e) {
         n->ffn_refused++;
         return -1;
