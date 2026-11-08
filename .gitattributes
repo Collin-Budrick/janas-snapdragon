@@ -1,0 +1,2 @@
+# Shell entrypoints must also run from WSL and MSYS2 checkouts.
+*.sh text eol=lf

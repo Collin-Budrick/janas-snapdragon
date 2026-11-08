@@ -69,4 +69,9 @@ uint64_t janas_rss_bytes(void);
 /* The level-2 cache of the first CPU, in bytes (0 if unknown). */
 size_t janas_l2_bytes(void);
 
+/* ARM64: whether the CPU has the dot-product instructions (SDOT, Armv8.2)
+   and the 8-bit integer matrix ones (SMMLA, I8MM). 0 elsewhere. */
+int janas_cpu_arm_dotprod(void);
+int janas_cpu_arm_i8mm(void);
+
 #endif

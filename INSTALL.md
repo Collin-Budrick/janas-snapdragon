@@ -57,6 +57,52 @@ build.bat release test   :: and the tests
 
 `build.bat` runs `build.sh` in MSYS2's MINGW64 shell, which `build.sh` recognizes (so does UCRT64's). It is new and has not been run on Windows yet: if it stops, an issue with its output helps.
 
+### Windows ARM64 (Snapdragon fork)
+
+Use an [LLVM-MinGW](https://github.com/mstorsjo/llvm-mingw/releases) UCRT toolchain
+with the `aarch64-w64-mingw32` target. Put its `bin` directory on `PATH`, then
+run in Git Bash or MSYS2:
+
+```sh
+JANAS_OS=windows CC=aarch64-w64-mingw32-clang AR=llvm-ar \
+    WINDRES=aarch64-w64-mingw32-windres ./build.sh release test
+```
+
+The compiler target selects `bin/aarch64-windows/`. `build.bat setup` still
+installs the upstream x86-64 toolchain; use the explicit ARM64 command above.
+The NEON kernels are selected at runtime; `JANAS_KERNELS=ref` selects their
+scalar references for comparison.
+
+From ARM64 Linux or WSL, the same command with `release build` cross-compiles
+using the Linux ARM64 LLVM-MinGW toolchain. On WSL, run the resulting Windows
+test programs through Windows interoperability, rather than the build script's
+Linux `test` action, which uses Wine:
+
+```sh
+python3 - <<'PY'
+from pathlib import Path
+import subprocess
+
+tests = sorted(Path("bin/aarch64-windows").glob("test_*.exe"))
+if not tests:
+    raise SystemExit("Build the Windows ARM64 tests first")
+for test in tests:
+    executable = str(test.resolve())
+    native = subprocess.check_output(["wslpath", "-w", executable], text=True).strip()
+    subprocess.run([native], executable=executable, check=True)
+PY
+```
+
+The native Windows argument supplies the path used to find sibling test
+helpers; a WSL `/mnt/c/...` argument does not work for that lookup.
+
+These changes provide CPU support. Qualcomm Hexagon NPU acceleration is not
+implemented in this fork yet.
+
+The ARM64 port incorporates upstream PRs #25, #32 and #33. Current `main`
+already contains the replacement aligned allocator for #31 and the bounded
+main/MTP split cache for #34; this branch retains those newer implementations.
+
 The GPU's support comes in when `glslangValidator` and the Vulkan headers are there, as for Linux. The programs need nothing but Windows's own DLLs. On Windows what Janas keeps goes to `%LOCALAPPDATA%\janas` (the models, what it learns about the machine) and `%APPDATA%\janas` (the settings, the MCP servers).
 
 ## Preparing a model

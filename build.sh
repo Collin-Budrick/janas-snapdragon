@@ -71,12 +71,15 @@ Environment
   AR            the archiver, ar by default (gcc-ar for -flto)
   JANAS_CFLAGS  flags added to the variant, to try a compiler out:
                 JANAS_CFLAGS="-O3 -flto" ./build.sh
-  JANAS_OS      windows: the same sources for Windows x86-64, with
-                MinGW-w64 (x86_64-w64-mingw32-gcc), into
-                bin/x86_64-windows/ (.exe, .dll); release and debug only.
+  JANAS_OS      windows: the same sources for Windows x86-64 or ARM64,
+                with MinGW-w64, into bin/<cpu>-windows/ (.exe, .dll);
+                release and debug only. Set CC and AR for ARM64.
                 The tests run under Wine when the build is not on Windows.
-                On Windows itself, in MSYS2's MINGW64 or UCRT64 shell, it is
-                set by itself, with that shell's gcc (build.bat starts it)
+                On Windows itself, in MSYS2's MINGW64, UCRT64 or CLANGARM64
+                shell, it is set by itself, with that shell's compiler
+                (build.bat starts MINGW64)
+  WINDRES       Windows resource compiler; <cpu>-w64-mingw32-windres by
+                default. Set it explicitly if the tool has another name.
 
 Before a commit: ./build.sh release test and at least asan; tsan too
 when concurrent code was touched.
@@ -101,9 +104,8 @@ VARIANT="${1:-release}"
 ACTION="${2:-build}"
 JANAS_OS="${JANAS_OS:-}"
 EXE=""
-# On Windows itself: MSYS2's MINGW64 or UCRT64 shell, with its gcc, glslang
-# and Vulkan headers (build.bat starts it): the same build as from Linux,
-# with the compilers of the shell
+# On Windows itself: the compilers of MSYS2's selected shell.
+# build.bat starts MINGW64; CLANGARM64 runs this script directly.
 case "$(uname -s)" in
 MINGW64_NT* | UCRT64_NT*)
     JANAS_OS=windows
@@ -111,9 +113,15 @@ MINGW64_NT* | UCRT64_NT*)
     AR="${AR:-ar}"
     HOSTCC="${HOSTCC:-gcc}"
     ;;
+CLANGARM64_NT*)
+    JANAS_OS=windows
+    CC="${CC:-clang}"
+    AR="${AR:-llvm-ar}"
+    HOSTCC="${HOSTCC:-clang}"
+    ;;
 MSYS_NT* | MINGW32_NT* | CLANG*_NT* | CYGWIN_NT*)
-    echo "build.sh: on Windows, build in MSYS2's MINGW64 or UCRT64 shell" \
-        "(build.bat starts it)" >&2
+    echo "build.sh: on Windows, build in MSYS2's MINGW64, UCRT64 or" \
+        "CLANGARM64 shell (build.bat starts MINGW64)" >&2
     exit 2
     ;;
 esac
@@ -135,9 +143,13 @@ elif [ -n "$JANAS_OS" ]; then
 fi
 CC="${CC:-gcc}"
 
-CPU="$(uname -m)"
+# the CPU the compiler builds for (aarch64-w64-windows-gnu: aarch64), not
+# the shell's: an x86-64 Git Bash on an ARM64 machine says x86_64
+CPU="$("$CC" -dumpmachine 2>/dev/null | cut -d- -f1 || true)"
+[ -n "$CPU" ] || CPU="$(uname -m)"
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 [ "$JANAS_OS" = windows ] && OS=windows
+[ "$OS" != windows ] || WINDRES="${WINDRES:-$CPU-w64-mingw32-windres}"
 OBJ="lib/$CPU-$OS-$VARIANT"
 BIN="bin/$CPU-$OS"
 SUFFIX=""
@@ -661,7 +673,7 @@ if [ "$OS" = windows ]; then
     if [ ! -f "$res" ] || [ src/common/win/janas.manifest -nt "$res" ] ||
         [ src/common/win/janas.rc -nt "$res" ]; then
         echo "RC  src/common/win/janas.rc"
-        "${WINDRES:-x86_64-w64-mingw32-windres}" -i src/common/win/janas.rc \
+        "$WINDRES" -i src/common/win/janas.rc \
             -I src/common/win -O coff -o "$res"
     fi
     START=("$OBJ/win_start.o" "$res")

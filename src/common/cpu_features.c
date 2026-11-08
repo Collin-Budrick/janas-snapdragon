@@ -7,7 +7,8 @@
  * a user's report then says what the machine could do, not only what it
  * did. On x86-64 from cpuid, each family counted only where the system has
  * enabled its registers (XCR0: AVX's, AVX-512's, AMX's); on ARM from what
- * the kernel says of the processor (Linux's auxiliary vector).
+ * the system says of the processor (Linux's auxiliary vector or Windows's
+ * processor-feature queries).
  */
 #include <stdio.h>
 #include <string.h>
@@ -24,6 +25,7 @@ static unsigned long long xcr0(void)
     return (unsigned long long)hi << 32 | lo;
 }
 #elif defined(__aarch64__) && defined(__linux__)
+#include <asm/hwcap.h>
 #include <sys/auxv.h>
 #endif
 
@@ -111,6 +113,12 @@ void janas_cpu_features(char *buf, size_t len)
         if (a71 >> 21 & 1)
             add(buf, len, "amx-fp16");
     }
+#elif defined(__aarch64__) && defined(_WIN32)
+    add(buf, len, "neon");
+    if (janas_cpu_arm_dotprod())
+        add(buf, len, "dotprod");
+    if (janas_cpu_arm_i8mm())
+        add(buf, len, "i8mm");
 #elif defined(__aarch64__) && defined(__linux__)
     unsigned long h = getauxval(AT_HWCAP), h2 = getauxval(AT_HWCAP2);
     (void)h2;
