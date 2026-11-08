@@ -6,10 +6,12 @@ optimizations, an optional Hexagon tensor backend, and controlled SSD/RAM,
 lookup and MTP benchmarks. Start with the [Snapdragon guide](docs/snapdragon.md)
 and [Hexagon build instructions](docs/snapdragon-hexagon.md).
 
-On the tested 64 GB Snapdragon X Elite, Qwen3-Next-80B-A3B reached a median
-16.4 generated tokens/s on the repeated code workload using the SSD-backed
-expert cache and CPU MTP drafting. The [recorded results](docs/benchmarks/snapdragon80b-20261108-results.json)
-include prose, cache-size, lookup, Hexagon and native llama.cpp comparisons;
+On the tested 64 GB Snapdragon X Elite, exact CPU SIMD changes raised the
+paired median from 9.60 to **18.62 generated tokens/s** on repeated code and
+from 8.38 to **15.64** on prose, using the SSD-backed expert cache and MTP
+drafting. The [paired results](docs/benchmarks/snapdragon80b-20261108-simd.json)
+record individual samples and numerical checks. The [earlier results](docs/benchmarks/snapdragon80b-20261108-results.json)
+include cache-size, lookup, Hexagon and native llama.cpp comparisons;
 the [guide](docs/snapdragon.md#measured-settings-and-starting-the-server)
 provides the measured launch profiles and their validation limits.
 

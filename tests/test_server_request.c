@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/pool.h"
 #include "server/engine.c"
 #include "server/fim.c"
 #include "server/images.c"
@@ -47,6 +48,85 @@ static int failures;
             failures++;                                                        \
         }                                                                      \
     } while (0)
+
+struct affinity_probe {
+    struct srv_engine engine;
+    _Alignas(max_align_t) unsigned char incoming[JANAS_CPU_SAVE_BYTES];
+    _Alignas(max_align_t) unsigned char actual[JANAS_CPU_SAVE_BYTES];
+    int incoming_ok, actual_saved;
+};
+
+static void *probe_engine_affinity(void *arg)
+{
+    struct affinity_probe *p = arg;
+    _Alignas(max_align_t) unsigned char before[JANAS_CPU_SAVE_BYTES] = {0};
+    /* Model Windows pthread startup on every host: the new engine thread
+       arrives with a mask different from the model-opening thread's pin. */
+    janas_cpus_restore(p->incoming);
+    p->incoming_ok = janas_cpus_save(before) == 0 &&
+                     !memcmp(before, p->incoming, sizeof before);
+    engine_main(&p->engine); /* stop=1: no queue, model or inference */
+    p->actual_saved = janas_cpus_save(p->actual) == 0;
+    return NULL;
+}
+
+static void engine_affinity(void)
+{
+    _Alignas(max_align_t) unsigned char original[JANAS_CPU_SAVE_BYTES] = {0};
+    _Alignas(max_align_t) unsigned char opener[JANAS_CPU_SAVE_BYTES] = {0};
+    struct janas_cpu_layout layout;
+    if (janas_cpus_save(original) != 0 ||
+        janas_cpu_layout(NULL, 0, &layout) != 0) {
+        puts("engine affinity: skipped (affinity information unavailable)");
+        return;
+    }
+    if (layout.n < 2) {
+        puts("engine affinity: skipped (fewer than two available CPUs)");
+        return;
+    }
+    janas_pin_current_thread(layout.cpus[0]);
+    if (janas_cpus_save(opener) != 0 ||
+        !memcmp(original, opener, sizeof opener)) {
+        puts("engine affinity: skipped (distinct opener pin unavailable)");
+        janas_cpus_restore(original);
+        return;
+    }
+    for (int have = 0; have <= 1; have++) {
+        struct affinity_probe p = {0};
+        p.engine.stop = 1;
+        p.engine.have_caller_cpus = have;
+        memcpy(p.engine.caller_cpus, opener, sizeof opener);
+        memcpy(p.incoming, original, sizeof original);
+        int mu = pthread_mutex_init(&p.engine.mu, NULL);
+        int cv = mu == 0 ? pthread_cond_init(&p.engine.cv, NULL) : -1;
+        CHECK(mu == 0 && cv == 0, "engine affinity: synchronization init failed");
+        if (mu == 0 && cv == 0) {
+            pthread_t thread;
+            int started = pthread_create(&thread, NULL, probe_engine_affinity, &p);
+            CHECK(started == 0, "engine affinity: cannot start probe thread");
+            if (started == 0) {
+                int joined = pthread_join(thread, NULL);
+                CHECK(joined == 0, "engine affinity: cannot join probe thread");
+                if (joined == 0) {
+                    CHECK(p.incoming_ok && p.actual_saved,
+                          "engine affinity: cannot establish/query actual masks");
+                    CHECK(!memcmp(p.actual, have ? opener : original,
+                                  sizeof p.actual),
+                          "engine affinity: %s mask not preserved",
+                          have ? "model-opening thread's" : "incoming (no saved)");
+                }
+            }
+            pthread_cond_destroy(&p.engine.cv);
+        }
+        if (mu == 0)
+            pthread_mutex_destroy(&p.engine.mu);
+    }
+    janas_cpus_restore(original);
+    _Alignas(max_align_t) unsigned char restored[JANAS_CPU_SAVE_BYTES] = {0};
+    CHECK(janas_cpus_save(restored) == 0 &&
+              !memcmp(original, restored, sizeof restored),
+          "engine affinity: failed to restore test opener's original mask");
+}
 
 /* Reads body; returns the error code (NULL when it was accepted). */
 static const char *parse(const char *body, int chat, struct srv_job **out)
@@ -345,6 +425,7 @@ static void indent(void)
 
 int main(void)
 {
+    engine_affinity();
     valid();
     invalid();
     mangled();

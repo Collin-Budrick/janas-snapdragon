@@ -44,7 +44,8 @@
     "warm_median_tokens_per_second": 16.7125777,
     "output_hash": "aad9221895bb6fe0",
     "output_matches_cpu_reference": true,
-    "notes": "Workload-specific warm measurements; original weight precision, HIGH, no expert skipping; default Janas INT8 KV and FP16 recurrent state. Configured context 2048, not a full-context validation. Automatic cache sizing retains a 12 GiB reserve; resolved capacity varies with available memory.",
-    "report": "docs/benchmarks/snapdragon80b-20261108-results.json"
+    "notes": "Historical pre-SIMD measurement; this configuration has not been rebenchmarked with the new kernels. Workload-specific warm measurements; original weight precision, HIGH, no expert skipping; default Janas INT8 KV and FP16 recurrent state. Configured context 2048, not a full-context validation. Automatic cache sizing retains a 12 GiB reserve; resolved capacity varies with available memory.",
+    "report": "docs/benchmarks/snapdragon80b-20261108-results.json",
+    "historical_bench_sha256": "a73070dd31de59fb5e333f08d1867c61ca308cd8da00c84e8a6f7766d133ed02"
   }
 }

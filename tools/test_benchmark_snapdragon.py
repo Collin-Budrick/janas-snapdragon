@@ -128,6 +128,7 @@ class BenchmarkTests(unittest.TestCase):
                  patch.dict(os.environ, {"JANAS_PREFETCH": "10,2", "JANAS_PREFETCH_PREFILL": "2",
                                           "JANAS_GPU_MIN_N": "128", "JANAS_NPU_MIN_N": "128",
                                           "JANAS_KV": "16", "JANAS_ATTN": "int16",
+                                          "JANAS_CPU_TILES": "1",
                                           "JANAS_API_KEY": "test-secret"}), \
                  patch.object(bench.subprocess, "run", return_value=response) as run:
                 case = bench.Case("cpu", "none", 12, 24, 4, prefetch=policy)
@@ -139,7 +140,8 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertNotIn("JANAS_API_KEY", recorded)
                 self.assertNotIn("JANAS_GPU_MIN_N", env)
                 self.assertNotIn("JANAS_NPU_MIN_N", env)
-                for key, value in (("JANAS_KV", "16"), ("JANAS_ATTN", "int16")):
+                for key, value in (("JANAS_KV", "16"), ("JANAS_ATTN", "int16"),
+                                   ("JANAS_CPU_TILES", "1")):
                     self.assertNotIn(key, env)
                     self.assertIsNone(recorded[key])
                     self.assertEqual(os.environ[key], value)
@@ -151,6 +153,9 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertEqual(forced_result["performance_environment"]["JANAS_NPU_MIN_N"], "8")
                 self.assertEqual(os.environ["JANAS_KV"], "16")
                 self.assertEqual(os.environ["JANAS_ATTN"], "int16")
+                self.assertNotIn("JANAS_CPU_TILES", forced_env)
+                self.assertIsNone(forced_result["performance_environment"]["JANAS_CPU_TILES"])
+                self.assertEqual(os.environ["JANAS_CPU_TILES"], "1")
 
     def test_preparing_weights_is_not_execution(self):
         samples = [{"phase": "warm", "accelerator_counters": {

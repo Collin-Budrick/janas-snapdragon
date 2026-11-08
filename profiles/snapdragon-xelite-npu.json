@@ -44,9 +44,10 @@
     "warm_median_tokens_per_second": 12.5197577,
     "output_hash": "aad9221895bb6fe0",
     "output_matches_cpu_reference": true,
-    "notes": "Experimental Hexagon-assisted MTP verification. Actual NPU completions verified and code output matches CPU reference; broader numerical probes differ. CPU model scheduling and unsupported operations remain active.",
+    "notes": "Historical pre-SIMD measurement; this configuration has not been rebenchmarked with the new kernels. Experimental Hexagon-assisted MTP verification. Actual NPU completions verified and code output matches CPU reference; broader numerical probes differ. CPU model scheduling and unsupported operations remain active.",
     "report": "docs/benchmarks/snapdragon80b-20261108-results.json",
-    "accelerator_execution_verified": true
+    "accelerator_execution_verified": true,
+    "historical_bench_sha256": "a73070dd31de59fb5e333f08d1867c61ca308cd8da00c84e8a6f7766d133ed02"
   },
   "runtime": {
     "hexagon_root": "../../.cache/janas-toolchains/llama-hexagon-kquants-runtime"

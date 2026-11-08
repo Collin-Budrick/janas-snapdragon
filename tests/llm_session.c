@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/sysinfo.h"
+#include "janas/llm.h"
 #include "../src/llm/generate.h"
 #include "../src/llm/model.h"
 
@@ -79,20 +81,56 @@ int main(int argc, char **argv)
     const char *mtp_path = NULL;
     if (argc > 3 && strncmp(argv[3], "mtp=", 4) == 0)
         mtp_path = argv[3] + 4;
-    int ccpus[12] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
-    int icpus[8] = {12, 13, 14, 15, 16, 17, 18, 19};
+    struct janas_cpu_layout layout;
+    if (janas_cpu_layout(NULL, 0, &layout) != 0 || layout.n < 1) {
+        fprintf(stderr, "cannot identify available compute CPUs\n");
+        return 1;
+    }
+    int ccpus[JANAS_MAX_CPUS], icpus[JANAS_MAX_CPUS], nc = 0, ni = 0;
+    int split = janas_cpu_split(ccpus, &nc, icpus, &ni, JANAS_MAX_CPUS);
+    int pinned_io = 0;
+    if (split > 0)
+        for (int i = 0; i < ni; i++)
+            for (int j = 0; j < layout.n; j++)
+                if (icpus[i] == layout.cpus[j]) {
+                    icpus[pinned_io++] = icpus[i];
+                    break;
+                }
+    const int *io_pin = pinned_io > 0 ? icpus : NULL;
+    if (split > 0)
+        ni = pinned_io; /* the process's affinity may exclude some I/O CPUs */
+    /* Homogeneous CPUs need unpinned I/O workers too. A zero count fails
+       model_load before it can produce a useful error message. */
+    if (split < 0 || ni < 1)
+        ni = 4;
+    if (ni > 255)
+        ni = 255;
+    if (layout.n > 255)
+        layout.n = 255;
+    if (setenv("JANAS_EXPERT_BITS", "6", 1) ||
+        setenv("JANAS_HEAD_BITS", "0", 1) ||
+        setenv("JANAS_MISS_SKIP", "0", 1)) {
+        perror("quality test environment");
+        return 1;
+    }
     struct janas_llm_options mo = {.cache_bytes = (uint64_t)20480 << 20,
                                    .n_ctx = 1024,
-                                   .compute_cpus = ccpus,
-                                   .n_compute = 12,
-                                   .io_cpus = icpus,
-                                   .n_io = 8,
-                                   .mtp_path = mtp_path};
-    char err[256];
+                                   .compute_cpus = layout.cpus,
+                                   .n_compute = layout.n,
+                                   .io_cpus = io_pin,
+                                   .n_io = ni,
+                                   .mtp_path = mtp_path,
+                                   .expert_bits = 6,
+                                   .head_bits = 0,
+                                   .min_quality = JANAS_LLM_QUALITY_HIGH,
+                                   .no_npu = 1};
+    char err[256] = {0};
     struct janas_llm_model *m =
         janas_llm_model_load(argv[1], &mo, err, sizeof(err));
     if (!m) {
-        fprintf(stderr, "%s: %s\n", argv[1], err);
+        fprintf(stderr, "%s: %s (compute threads %d, I/O threads %d%s)\n",
+                argv[1], err[0] ? err : "model load failed", layout.n, ni,
+                io_pin ? ", pinned" : ", unpinned");
         return 1;
     }
     struct janas_gen_options greedy = {.spec_k = 1, .eos = -1};

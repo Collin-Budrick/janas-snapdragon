@@ -59,7 +59,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual((profile["case"]["gpu_min_tokens"], profile["case"]["npu_min_tokens"]), (0, 0))
         inherited = {"JANAS_PREFETCH": "10,2", "JANAS_PREFETCH_PREFILL": "2",
             "JANAS_GPU_MIN_N": "128", "JANAS_NPU_MIN_N": "128",
-            "JANAS_KV": "16", "JANAS_ATTN": "int16"}
+            "JANAS_KV": "16", "JANAS_ATTN": "int16", "JANAS_CPU_TILES": "1"}
         before = inherited.copy()
         env = launcher.launch_environment(profile, inherited)
         self.assertNotIn("JANAS_PREFETCH", env)
@@ -68,6 +68,7 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn("JANAS_NPU_MIN_N", env)
         self.assertNotIn("JANAS_KV", env)
         self.assertNotIn("JANAS_ATTN", env)
+        self.assertNotIn("JANAS_CPU_TILES", env)
         self.assertEqual(inherited, before)
 
     def test_manual_accelerator_thresholds_override_only_when_positive(self):

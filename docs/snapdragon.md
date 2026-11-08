@@ -26,16 +26,36 @@ Weights and local runtime binaries stay outside Git.
 The selected profile uses eight CPU cores, a 32 GiB main expert cache, the
 separate MTP cache, a four-token draft ceiling and demand reads from the SSD.
 The 48.4 GB model stays on disk; only the needed experts enter the RAM cache.
-The MTP planner adjusts its actual draft length. On the repeated code workload,
-this profile generated **16.41 tokens/s**, the median of three warm samples.
-The decoded output hash and 128-token count matched the CPU reference in each
-sample.
+The MTP planner adjusts its actual draft length. Exact SIMD optimizations now
+accelerate routing, recurrent state updates and selected expert products.
+The latest matched trials used the same CPU/MTP settings in both builds:
+
+| Workload, 128 generated tokens | Saved build | SIMD build | Rate ratio | Warm samples per binary |
+|---|---:|---:|---:|---:|
+| Repeated code, 276 input tokens | 9.60 tok/s | **18.62 tok/s** | 1.94x | 5 |
+| General prose, 63 input tokens | 8.38 tok/s | **15.64 tok/s** | 1.87x | 5 |
+| Longer code prompt, 1,304 input tokens | 9.06 tok/s | **14.93 tok/s** | 1.65x | 3 |
+
+Code and prose use an ABBA process order; the longer prompt uses AB and three
+warm samples per binary. Its median prompt time fell from 113.28 to 57.92
+seconds, separately from generation. Decoded output hashes and token counts
+agree across both builds. Fixed-input logits, rejection/replay and seeded session checks also
+passed exactly. Absolute rates varied during sustained work, so the saved
+binary measured in these same trials is the comparison control. The older
+16.41 tok/s figure below comes from a separate experiment.
+
+See the [paired SIMD results](benchmarks/snapdragon80b-20261108-simd.json) for
+individual samples, prompt latency, memory and a longer-prompt trial. The
+[SIMD implementation note](snapdragon-simd.md) explains arithmetic, dispatch
+limits and the router packing that reuses existing RAM allocations.
+
+Earlier tuning results, before this SIMD stage:
 
 | Code workload, 128 generated tokens | Warm tokens/s | Samples |
 |---|---:|---:|
 | CPU before Q6_K_P NEON fix, no drafts, 8 cores | 6.86 | 1 |
 | CPU with Q6_K_P NEON, no drafts, 8 cores | 12.33 | 1 |
-| CPU + MTP, ceiling 4, 8 cores, 32 GiB cache | **16.41** | **3, median** |
+| CPU + MTP, ceiling 4, 8 cores, 32 GiB cache | 16.41 | 3, median |
 | CPU + MTP, ceiling 8, 12 cores, 32 GiB cache | 12.66 | 1 |
 | CPU + MTP, ceiling 8, 8 cores, 8 GiB cache | 8.17 | 1 |
 | CPU + lookup, ceiling 8, 8 cores, 32 GiB cache | 12.46 | 1 |
@@ -43,8 +63,9 @@ sample.
 | CPU + Hexagon draft products, MTP ceiling 8 | 12.52 | 1 |
 | Native llama.cpp CPU, 8 cores, F16 K/V | 11.39 | 2, median |
 
-These are workload-specific generation measurements, not end-to-end request
-rates. General prose reached 12.64 tokens/s without drafts and 12.65 with MTP;
+These earlier results are workload-specific generation measurements, not
+end-to-end request rates or controls for the new SIMD comparison.
+General prose reached 12.64 tokens/s without drafts and 12.65 with MTP;
 its drafts helped much less. Prefetch did not demonstrate a material gain.
 Eight cores beat twelve in the Janas trials. The native llama.cpp 12-core trial
 was stopped after 878.9 seconds without completion and receives no speed result.
@@ -54,7 +75,9 @@ and backend arithmetic. It is a baseline, not proof of identical engine output.
 Prompt time varied substantially in those llama.cpp runs and is not ranked here.
 
 Successful NPU operation counters verified real Hexagon execution in the
-draft-only configuration; it was slower than the selected CPU/MTP profile.
+earlier draft-only configuration; it was slower than that CPU/MTP comparison.
+The optional NPU and automatic-cache profiles retain explicitly historical
+performance evidence and have not been rebenchmarked in this SIMD stage.
 GPU chat trials fell back to the CPU after a startup self-check failure and
 are not counted as GPU acceleration. Numerical accelerator probes are discussed
 below. The [machine-readable report](benchmarks/snapdragon80b-20261108-results.json)

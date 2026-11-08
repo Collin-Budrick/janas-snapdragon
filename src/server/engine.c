@@ -14,7 +14,9 @@
  */
 #include "server.h"
 #include "fim.h"
+#include "common/sysinfo.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +27,8 @@ struct srv_engine {
     janas_llm *emb; /* the embedding model, or NULL */
     janas_llm_chat *chat;
     pthread_t th;
+    _Alignas(max_align_t) unsigned char caller_cpus[JANAS_CPU_SAVE_BYTES];
+    int have_caller_cpus;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     struct srv_job *head, *tail;
@@ -659,6 +663,10 @@ static void number_queue(struct srv_engine *e)
 static void *engine_main(void *arg)
 {
     struct srv_engine *e = arg;
+    /* The pool runs logical worker zero on this thread. Windows pthreads
+       do not inherit the model-opening thread's individual CPU affinity. */
+    if (e->have_caller_cpus)
+        janas_cpus_restore(e->caller_cpus);
     for (;;) {
         pthread_mutex_lock(&e->mu);
         while (!e->head && !e->stop)
@@ -784,6 +792,9 @@ struct srv_engine *srv_engine_start(const struct srv_config *cfg, char *err,
         free(e);
         return NULL;
     }
+    /* Save the main model's pinned caller before an optional embedding model
+       can repin it. Inference needs this same actual CPU/group mask. */
+    e->have_caller_cpus = janas_cpus_save(e->caller_cpus) == 0;
     if (janas_llm_chat_speculation(e->chat, e->speculation, cfg->max_drafts) !=
         JANAS_LLM_OK) {
         snprintf(err, err_len, "%s", janas_llm_last_error());

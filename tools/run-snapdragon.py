@@ -7,6 +7,7 @@ use that host's syntax or be project-relative; Windows paths are not mapped.
 This tool never chooses a benchmark winner or claims accelerator execution.
 Inherited JANAS_KV and JANAS_ATTN overrides are cleared to retain the model's
 architecture defaults; HIGH preserves weight precision, not FP32 cache storage.
+Inherited JANAS_CPU_TILES is cleared to retain automatic CPU tiling policy.
 
 Profile schema 1: model and optional mtp identities contain path, size and
 first_mib_sha256 (mtime_ns is optional). case contains profile (cpu, cpu+gpu,
@@ -50,12 +51,12 @@ PERFORMANCE_ENV = ("JANAS_KERNELS", "JANAS_EXPERTS", "JANAS_GPU_ALWAYS",
     "JANAS_NPU_ALWAYS", "JANAS_BLOCK_THREADS", "JANAS_GPU_TOKEN",
     "JANAS_GPU_WHOLE", "JANAS_GPU_FAST_PROMPT", "JANAS_GPU_EXPERT_SHARE",
     "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS", "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL",
-    "JANAS_KV", "JANAS_ATTN")
+    "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES")
 PROFILE_ENV = {"JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG",
     "JANAS_TUNE", "JANAS_TUNE_THREADS", "JANAS_WARM", "JANAS_MISS_SKIP",
     "JANAS_EXPERT_BITS", "JANAS_HEAD_BITS", "JANAS_HEXAGON_ROOT", "ADSP_LIBRARY_PATH",
     "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS",
-    "JANAS_KV", "JANAS_ATTN"}
+    "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES"}
 
 
 def number(value: Any, name: str, low: float, high: float, integer: bool = False) -> Any:
