@@ -812,6 +812,12 @@ static void variable_width_fallback(float temperature, unsigned shape)
           sb->metrics.source_drafted[JANAS_GEN_SOURCE_LOOKUP] == 0 &&
           !a.invalid_calls && !b.invalid_calls && !a.invalid_prepare && !b.invalid_prepare,
           "zero-probe fallback needs no lookup proposal or invalid target row");
+    CHECK(sa->st.passes == sb->st.passes && a.costs.head_calls == b.costs.head_calls &&
+          memcmp(sa->metrics.pass_width_count, sb->metrics.pass_width_count,
+                 sizeof(sa->metrics.pass_width_count)) == 0 &&
+          memcmp(sa->pl.tried, sb->pl.tried, sizeof(sa->pl.tried)) == 0 &&
+          memcmp(sa->pl.won, sb->pl.won, sizeof(sa->pl.won)) == 0,
+          "matching nonflat native costs preserve ordinary MTP counts, head work and confidence bins");
     janas_llm_session_destroy(sa); janas_llm_session_destroy(sb);
 }
 
@@ -1153,6 +1159,161 @@ static void cost_stops_and_context(void)
     janas_llm_session_destroy(s);
 }
 
+/* A lookup batch has different construction/recovery history from native
+ * MTP. Its real cost must teach the source selector without changing the
+ * calibrated fallback's target-width price table. */
+static void lookup_price_isolation(void)
+{
+    struct janas_llm_model m;
+    model_init(&m); m.period = 4; m.peaky = 1;
+    m.draft_conf = 0.5f;
+    m.draft_seconds = 0.004;
+    m.pass_seconds[1] = 0.100;
+    m.pass_seconds[2] = 0.115;
+    m.pass_seconds[3] = 0.300;
+    struct janas_gen_options o = cost_options(0);
+    o.spec_auto = 1; o.hybrid_lookup_max_drafts = 2;
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "source-isolated lookup pricing session created");
+    if (!s) return;
+    train_cost_lookup(s);
+    int32_t prompt[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3}, token = -1;
+    CHECK(janas_llm_session_append(s, prompt, 12) == 0,
+          "source-isolation fixture appends repeated canonical history");
+    s->pl.t[1] = 0.100; s->pl.t[2] = 0.115; s->pl.t[3] = 0.100;
+    s->pl.t[4] = s->pl.t[5] = 0.500;
+    janas_llm_session_reply_remaining(s, 4);
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 0 &&
+          s->pending.planner_source == JANAS_GEN_SOURCE_LOOKUP && s->n_mdraft == 2,
+          "actual controller chooses a two-draft lookup before its priced target pass");
+    double old_width_cost = s->pl.t[3];
+    double old_observed_cost = s->hybrid.lookup[1][0][2][2].seconds;
+    double old_width_samples = s->hybrid.width[1][0][3].count;
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 1 &&
+          s->metrics.last.pass_width == 3 && s->metrics.last.accepted_prefix == 2,
+          "real lookup verification executes the three-row target batch");
+    CHECK(s->pl.t[3] == old_width_cost && old_width_cost == 0.100,
+          "lookup's 0.300-second target pass cannot pollute MTP's 0.100-second width price");
+    for (int next = 2; next <= 3; next++)
+        CHECK(janas_llm_session_next(s, &token) == 0 && token == next,
+              "lookup pricing observation waits for its actually delivered prefix");
+    CHECK(s->hybrid.lookup[1][0][2][2].seconds - old_observed_cost >= 0.300 &&
+          s->hybrid.width[1][0][3].count == old_width_samples + 1,
+          "source controller still learns lookup's complete cost and actual target width");
+    /* Change only the offered source and the next MTP workload cost. Keep
+       the same conversation/table, so a lookup spike cannot be hidden by
+       append's ordinary per-turn timing reset. */
+    janas_hybrid_init(&s->hybrid, 92);
+    m.pass_seconds[3] = 0.100;
+    janas_llm_session_reply_remaining(s, 8);
+    uint64_t heads = m.costs.head_calls;
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 0 &&
+          s->pending.planner_source == JANAS_GEN_SOURCE_MTP && s->n_mdraft == 3 &&
+          m.costs.head_calls == heads + 3,
+          "foreign lookup spike cannot prematurely stop the next native MTP chain");
+    CHECK(plan_prepared_drafts(&s->pl, s->msurv, s->n_mdraft,
+                               s->pending.preparation_seconds) == 2,
+          "native verifier retains its useful two-draft prefix after a costly lookup");
+    CHECK(!m.invalid_calls && !m.invalid_prepare,
+          "source-isolated pricing leaves canonical target and draft state valid");
+    canonical_mtp(s, &m);
+    janas_llm_session_destroy(s);
+}
+
+static void incoming_recovery_pricing(int previous_lookup, int cost_mode,
+                                       int nonpositive_sample)
+{
+    struct janas_llm_model m;
+    model_init(&m); m.peaky = 1;
+    m.period = previous_lookup ? 4 : MOCK_VOCAB;
+    m.bad_drafts = !previous_lookup;
+    m.pass_seconds[1] = 0.100;
+    for (unsigned width = 2; width <= 5; width++) m.pass_seconds[width] = 0.140;
+    struct janas_gen_options o = cost_mode ? cost_options(0)
+                                           : options(JANAS_SPEC_MTP, 0, 0);
+    o.spec_auto = 1; o.hybrid_lookup_max_drafts = 2;
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "incoming source recovery pricing session created");
+    if (!s) return;
+    if (previous_lookup) train_cost_lookup(s);
+    int32_t prompt[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3}, token = -1;
+    CHECK(janas_llm_session_append(s, prompt, 12) == 0,
+          "recovery pricing fixture appends identical valid input positions");
+    janas_llm_session_reply_remaining(s, 32);
+    CHECK(janas_llm_session_next(s, &token) == 0 &&
+          s->pending.planner_source == (previous_lookup ? JANAS_GEN_SOURCE_LOOKUP
+                                                        : JANAS_GEN_SOURCE_MTP),
+          "preceding proposal is produced by the intended actual source");
+    if (previous_lookup) m.period = 1;
+    CHECK(janas_llm_session_next(s, &token) == 0 &&
+          s->metrics.last.planner_source == (previous_lookup ? JANAS_GEN_SOURCE_LOOKUP
+                                                           : JANAS_GEN_SOURCE_MTP) &&
+          s->metrics.last.accepted_prefix == 0 && s->metrics.last.rejected_rows > 0 &&
+          (!cost_mode || s->hybrid_waiting) &&
+          s->pending.planner_source == JANAS_GEN_SOURCE_MTP,
+          "actual rejection schedules MTP fallback with the rejected source retained for recovery");
+    for (unsigned width = 2; width <= 5; width++) {
+        s->pl.t[width] = nonpositive_sample ? 0.075 : previous_lookup ? 0.100 : 0;
+        m.pass_seconds[width] = nonpositive_sample ? 0.020 : 0.140;
+    }
+    m.recovery_on_next = 0.040;
+    double old_raw = s->metrics.verification_seconds;
+    double old_refund = s->hybrid_metrics.recovery_reassigned_seconds;
+    double expected_raw = nonpositive_sample ? 0.020 : 0.140;
+    CHECK(janas_llm_session_next(s, &token) == 0 &&
+          s->metrics.last.planner_source == JANAS_GEN_SOURCE_MTP &&
+          s->metrics.last.pass_width >= 2,
+          "MTP target verification executes after the preceding rejected source");
+    unsigned width = s->metrics.last.pass_width;
+    double expected_price = nonpositive_sample ? 0.075
+        : previous_lookup && cost_mode ? 0.100 : 0.140;
+    CHECK(fabs(s->pl.t[width] - expected_price) < 1e-9,
+          nonpositive_sample
+              ? "foreign recovery estimate covering the cost cannot replace a trusted MTP width price"
+              : previous_lookup
+                    ? "lookup recovery contaminates the sample, preserving the trusted MTP width price"
+                    : "native MTP-to-MTP replay preserves the full legacy 0.140-second width price");
+    CHECK(fabs(s->metrics.last.verification_seconds - expected_raw) < 1e-6 &&
+          fabs(s->metrics.verification_seconds - old_raw - expected_raw) < 1e-6,
+          "source-specific planner adjustment never subtracts recovery from measured wall statistics");
+    if (cost_mode) {
+        double transferred = nonpositive_sample ? s->metrics.last.verification_seconds : 0.040;
+        CHECK(fabs(s->hybrid_metrics.recovery_reassigned_seconds - old_refund - transferred) < 1e-9,
+              "existing causal ledger transfers preceding recovery exactly once");
+        if (previous_lookup) {
+            while (s->ret < s->n)
+                CHECK(janas_llm_session_next(s, &token) == 0,
+                      "accepted fallback prefix is delivered before final source accounting");
+            CHECK(fabs(s->hybrid_metrics.lookup_seconds + s->hybrid_metrics.mtp_seconds -
+                        s->metrics.cycle_seconds) < 1e-8,
+                  "planner-only cost correction leaves complete source and wall ledgers conserved");
+            double refunded = s->hybrid_metrics.recovery_reassigned_seconds;
+            finish_cycle(s);
+            hybrid_settle(s, 0.040);
+            CHECK(s->hybrid_metrics.recovery_reassigned_seconds == refunded,
+                  "finishing an already settled prefix cannot refund replay again");
+            /* A refusal is local to the contaminated pass. A later native
+               MTP pass must resume the same legacy timing update normally. */
+            double before_price[MAX_SPEC_K + 2];
+            memcpy(before_price, s->pl.t, sizeof(before_price));
+            for (unsigned next_width = 2; next_width <= 5; next_width++)
+                m.pass_seconds[next_width] = 0.200;
+            m.recovery_on_next = 0;
+            CHECK(janas_llm_session_next(s, &token) == 0 &&
+                  s->metrics.last.planner_source == JANAS_GEN_SOURCE_MTP,
+                  "next clean MTP verification runs after foreign recovery has settled");
+            unsigned clean_width = s->metrics.last.pass_width;
+            double expected_clean = 0.8 * before_price[clean_width] + 0.2 * 0.200;
+            CHECK(clean_width >= 2 && fabs(s->pl.t[clean_width] - expected_clean) < 1e-9,
+                  "clean MTP width samples resume learning after one contaminated observation is refused");
+        }
+    }
+    CHECK(!m.invalid_calls && !m.invalid_prepare,
+          "foreign/native replay pricing does not alter valid processed-input boundaries");
+    canonical_mtp(s, &m);
+    janas_llm_session_destroy(s);
+}
+
 int main(void)
 {
     {
@@ -1214,6 +1375,11 @@ int main(void)
     cost_lookup_maintenance_and_recovery();
     cost_recovery_conservation();
     cost_stops_and_context();
+    lookup_price_isolation();
+    incoming_recovery_pricing(1, 1, 0);
+    incoming_recovery_pricing(1, 1, 1);
+    incoming_recovery_pricing(0, 1, 0);
+    incoming_recovery_pricing(0, 0, 0);
     printf("test_generate_cycle: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

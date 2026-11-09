@@ -1204,7 +1204,9 @@ static int prepare_cycle(struct janas_llm_session *s, uint32_t pos,
     if (ongoing && cap && o->spec_mode != JANAS_SPEC_OFF) {
         if (o->spec_mode == JANAS_SPEC_LOOKUP || o->spec_mode == JANAS_SPEC_HYBRID) {
             double tl = now();
-            if (!s->index) s->index = janas_history_index_create(8u * 1024u * 1024u);
+            if (!s->index)
+                s->index = janas_history_index_create_for_tokens(
+                    8u * 1024u * 1024u, s->cap);
             int avail = 0, suffix = 0;
             unsigned lookup_cap = cap;
             if (cost_hybrid) {
@@ -1522,11 +1524,15 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     tr = now();
     janas_llm_model_runtime_stats(m, &runtime_after);
     s->hybrid_incoming_recovery = 0;
+    double foreign_recovery = 0;
     if (cost_hybrid && s->hybrid_waiting) {
+        unsigned previous_source = s->hybrid_wait.source;
         double recovery = runtime_after.gdn_recovery_seconds - runtime_before.gdn_recovery_seconds;
         recovery = fmin(dt, fmax(0, recovery));
         hybrid_settle(s, recovery);
         s->hybrid_incoming_recovery = recovery;
+        if (previous_source == JANAS_GEN_SOURCE_LOOKUP)
+            foreign_recovery = recovery;
     }
     if (runtime_after.expert_groups > runtime_before.expert_groups &&
         runtime_after.expert_assignments >= runtime_before.expert_assignments) {
@@ -1583,7 +1589,14 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
         s->st.pass_count[nd + 1]++;
         s->st.pass_seconds[nd + 1] += dt;
     }
-    if ((plan || copies) && !settling_now && learn) {
+    /* The legacy MTP constructor learns its own workload. Lookup still
+       teaches the hybrid width forecaster, but must not replace a calibrated
+       MTP width estimate. A pass carrying a lookup's deferred recovery is
+       also a mixed observation: skip it rather than subtracting the inexact
+       replay row-share estimate. Keep measured statistics and causal costs. */
+    if ((plan || copies) && !settling_now && learn &&
+        isfinite(cost) && !foreign_recovery &&
+        (!cost_hybrid || current.planner_source == JANAS_GEN_SOURCE_MTP)) {
         struct planner *p = cost_hybrid ? mtp_planner(s) : &s->pl;
         double *tt = &p->t[nd + 1];
         *tt = *tt > 0 ? 0.8 * *tt + 0.2 * cost : cost;

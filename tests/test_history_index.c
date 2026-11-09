@@ -6,6 +6,24 @@
 
 #include "llm/history_index.h"
 
+/* Local ownership/failure checks exercise the implementation without changing
+ * its API or asking the host allocator to exhaust memory. The normal archive
+ * linker does not pull a second history_index.o into this test. */
+static unsigned allocation_calls;
+static size_t last_allocation_bytes;
+static int fail_allocation;
+static void *index_test_calloc(size_t n, size_t bytes)
+{
+    allocation_calls++;
+    if (bytes && n > SIZE_MAX / bytes)
+        return NULL;
+    last_allocation_bytes = n * bytes;
+    return fail_allocation ? NULL : calloc(n, bytes);
+}
+#define calloc index_test_calloc
+#include "../src/llm/history_index.c"
+#undef calloc
+
 static int failures;
 #define CHECK(c, text) do { if (!(c)) { \
     printf("FAIL: %s (line %d)\n", text, __LINE__); failures++; \
@@ -43,8 +61,132 @@ static void compare(struct janas_history_index *index, const int32_t *tokens,
           memcmp(got, want, (size_t)wn * sizeof(*want)) == 0, text);
 }
 
+static void context_allocations(void)
+{
+    unsigned before = allocation_calls;
+    CHECK(janas_history_index_create_for_tokens(SIZE_MAX, 0) == NULL &&
+          janas_history_index_create_for_tokens(0, 2048) == NULL &&
+          janas_history_index_create_for_tokens(64, 2048) == NULL &&
+          allocation_calls == before,
+          "zero tokens and unusable budgets fail before allocation");
+    struct janas_history_index *minimum =
+        janas_history_index_create_for_tokens(JANAS_HISTORY_INDEX_MAX_BYTES, 1);
+    struct janas_history_index *context =
+        janas_history_index_create_for_tokens(JANAS_HISTORY_INDEX_MAX_BYTES, 2048);
+    struct janas_history_index *rounded =
+        janas_history_index_create_for_tokens(JANAS_HISTORY_INDEX_MAX_BYTES, 2049);
+    struct janas_history_index *legacy = janas_history_index_create(JANAS_HISTORY_INDEX_MAX_BYTES);
+    CHECK(minimum && context && rounded && legacy, "context allocation fixtures created");
+    if (!minimum || !context || !rounded || !legacy) goto done;
+    CHECK(minimum->slots == 256 && minimum->capacity == 16,
+          "tiny positive requests keep the minimum useful table");
+    CHECK(context->capacity == 2048 && context->slots == 32768 &&
+          context->bytes > 384u * 1024u && context->bytes < 400u * 1024u &&
+          context->bytes < legacy->bytes / 15,
+          "2048-token context owns about 392 KiB instead of the maximum table");
+    CHECK(rounded->capacity == 4096 && rounded->slots == context->slots * 2 &&
+          rounded->bytes <= legacy->bytes,
+          "2049-token request rounds to the next permitted capacity");
+    size_t exact = context->bytes;
+    struct janas_history_index *fit = janas_history_index_create_for_tokens(exact, 2048);
+    struct janas_history_index *less = janas_history_index_create_for_tokens(exact - 1, 2048);
+    struct janas_history_index *limited = janas_history_index_create_for_tokens(exact, 2049);
+    CHECK(fit && less && limited && fit->capacity == 2048 && fit->bytes == exact &&
+          less->capacity == 1024 && less->bytes < exact && limited->capacity == 2048,
+          "insufficient budget chooses the largest affordable bounded tail");
+    janas_history_index_destroy(fit); janas_history_index_destroy(less);
+    janas_history_index_destroy(limited);
+    const size_t budgets[] = {64, 4096, exact - 1, exact,
+                             JANAS_HISTORY_INDEX_MAX_BYTES, SIZE_MAX};
+    for (size_t i = 0; i < sizeof(budgets) / sizeof(*budgets); i++) {
+        struct janas_history_index *old = janas_history_index_create(budgets[i]);
+        struct janas_history_index *huge = janas_history_index_create_for_tokens(budgets[i], SIZE_MAX);
+        CHECK((!old && !huge) || (old && huge && old->bytes == huge->bytes &&
+              old->capacity == huge->capacity && old->slots == huge->slots &&
+              old->bytes <= JANAS_HISTORY_INDEX_MAX_BYTES),
+              "SIZE_MAX request safely retains exact legacy budget behavior");
+        janas_history_index_destroy(old); janas_history_index_destroy(huge);
+    }
+    size_t ignored;
+    CHECK(allocation_bytes(SIZE_MAX, &ignored) == -1 &&
+          allocation_bytes((SIZE_MAX - sizeof(struct janas_history_index)) /
+                           sizeof(struct history_entry), &ignored) == -1,
+          "both entry and token-storage size additions reject overflow");
+    before = allocation_calls;
+    fail_allocation = 1;
+    struct janas_history_index *failed =
+        janas_history_index_create_for_tokens(SIZE_MAX, 2048);
+    CHECK(failed == NULL && allocation_calls == before + 1 &&
+          last_allocation_bytes == exact,
+          "context allocation failure returns NULL after one bounded request");
+    CHECK(janas_history_index_create(4096) == NULL,
+          "legacy allocation failure still returns NULL");
+    fail_allocation = 0;
+    failed = janas_history_index_create_for_tokens(exact, 2048);
+    CHECK(failed && failed->bytes == exact && failed->capacity == 2048,
+          "allocation failure leaves no persistent state preventing retry");
+    janas_history_index_destroy(failed);
+done:
+    janas_history_index_destroy(minimum); janas_history_index_destroy(context);
+    janas_history_index_destroy(rounded); janas_history_index_destroy(legacy);
+}
+
+static void context_lookup_boundaries(void)
+{
+    struct janas_history_index *context =
+        janas_history_index_create_for_tokens(JANAS_HISTORY_INDEX_MAX_BYTES, 2048);
+    struct janas_history_index *rounded =
+        janas_history_index_create_for_tokens(JANAS_HISTORY_INDEX_MAX_BYTES, 2049);
+    struct janas_history_index *legacy = janas_history_index_create(JANAS_HISTORY_INDEX_MAX_BYTES);
+    CHECK(context && rounded && legacy, "bounded-context lookup fixtures created");
+    if (!context || !rounded || !legacy) goto done;
+    int32_t hist[2049], rejected[2048], out[16];
+    int prefix;
+    for (size_t n = 0; n <= 2048; n++) {
+        if (n) hist[n - 1] = (int32_t)((n * 17 + n / 11) % 53);
+        compare(context, hist, n, 0, "context-sized incremental history matches exact scan");
+        compare(legacy, hist, n, 0, "legacy creator matches the same context-sized scan");
+    }
+    memcpy(rejected, hist, sizeof(rejected));
+    for (size_t n = 2040; n < 2048; n++) rejected[n] = (int32_t)(900000 + n);
+    CHECK(janas_history_index_lookup(context, rejected, 2048, 16, out, &prefix) == 0 &&
+          janas_history_index_lookup(legacy, rejected, 2048, 16, out, &prefix) == 0,
+          "unverified replacement suffix cannot query a canonical-history index");
+    compare(context, hist, 2048, 0, "rejected suffix leaves canonical context lookup unchanged");
+    compare(legacy, hist, 2048, 0, "legacy canonical lookup agrees after rejected suffix");
+    compare(context, rejected, 2048, 0, "replacement snapshot sync is exact within context");
+    compare(context, hist, 2048, 0, "restoring canonical history removes replacement snapshot keys");
+    compare(legacy, rejected, 2048, 0, "legacy replacement snapshot sync is exact");
+    compare(legacy, hist, 2048, 0, "legacy restored snapshot agrees with bounded context");
+    const size_t lengths[] = {2047, 1024, 17, 8, 1, 0, 2048};
+    for (size_t i = 0; i < sizeof(lengths) / sizeof(*lengths); i++) {
+        compare(context, hist, lengths[i], 0, "context truncation/resync matches exact scan");
+        compare(legacy, hist, lengths[i], 0, "legacy truncation/resync matches the same scan");
+    }
+    compare(context, hist + 37, 2011, 37, "context-sized sliding history matches scan");
+    compare(legacy, hist + 37, 2011, 37, "legacy sliding history matches the same scan");
+    /* Beyond the configured window, the new creator intentionally retains a
+       bounded tail. A request of 2049 must retain this first occurrence; a
+       capacity of 2048 must exclude it. */
+    for (size_t i = 0; i < 2048; i++) hist[i] = (int32_t)(10000 + i);
+    hist[2048] = hist[0];
+    compare(legacy, hist, 2049, 0, "legacy full history includes boundary occurrence");
+    compare(rounded, hist, 2049, 0, "rounded 2049-token request retains the full exact match");
+    CHECK(janas_history_index_sync(context, hist, 2049, 0) == 0 &&
+          janas_history_index_lookup(context, hist, 2049, 16, out, &prefix) == 0 &&
+          prefix == 0,
+          "2048-token capacity excludes an occurrence just outside its retained tail");
+    compare(context, hist + 1, 2048, 1, "sliding to that same retained tail remains exact");
+    compare(context, hist, 2048, 0, "context boundary can be resynchronized after tail sliding");
+done:
+    janas_history_index_destroy(context); janas_history_index_destroy(rounded);
+    janas_history_index_destroy(legacy);
+}
+
 int main(void)
 {
+    context_allocations();
+    context_lookup_boundaries();
     CHECK(janas_history_index_create(0) == NULL, "zero budget rejected");
     CHECK(janas_history_index_create(64) == NULL, "tiny budget rejected");
     CHECK(janas_history_index_bytes(NULL) == 0, "NULL owns no bytes");

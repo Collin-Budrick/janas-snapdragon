@@ -39,23 +39,34 @@ static void clear_index(struct janas_history_index *index)
     index->ready = 0;
 }
 
-struct janas_history_index *janas_history_index_create(size_t budget_bytes)
+static int allocation_bytes(size_t slots, size_t *bytes)
 {
+    size_t need = sizeof(struct janas_history_index);
+    if (slots > (SIZE_MAX - need) / sizeof(struct history_entry))
+        return -1;
+    need += slots * sizeof(struct history_entry);
+    if (slots / 16 > (SIZE_MAX - need) / sizeof(int32_t))
+        return -1;
+    *bytes = need + (slots / 16) * sizeof(int32_t);
+    return 0;
+}
+
+struct janas_history_index *janas_history_index_create_for_tokens(
+    size_t budget_bytes, size_t max_tokens)
+{
+    if (!max_tokens)
+        return NULL;
     size_t budget = budget_bytes < JANAS_HISTORY_INDEX_MAX_BYTES ?
                     budget_bytes : JANAS_HISTORY_INDEX_MAX_BYTES;
     /* At most 8 suffix keys per token, with a maximum 1/2 table load. */
-    size_t slots = 256;
-    size_t need = sizeof(struct janas_history_index) +
-                  slots * sizeof(struct history_entry) +
-                  (slots / 16) * sizeof(int32_t);
-    if (need > budget)
+    size_t slots = 256, need;
+    if (allocation_bytes(slots, &need) != 0 || need > budget)
         return NULL;
-    while (slots <= SIZE_MAX / 2) {
-        size_t next = slots * 2;
-        size_t next_need = sizeof(struct janas_history_index) +
-                           next * sizeof(struct history_entry) +
-                           (next / 16) * sizeof(int32_t);
-        if (next_need > budget)
+    /* Compare capacities instead of multiplying max_tokens by 16: a request
+       as large as SIZE_MAX must safely stop at the caller's capped budget. */
+    while (slots / 16 < max_tokens && slots <= SIZE_MAX / 2) {
+        size_t next = slots * 2, next_need;
+        if (allocation_bytes(next, &next_need) != 0 || next_need > budget)
             break;
         slots = next;
         need = next_need;
@@ -69,6 +80,11 @@ struct janas_history_index *janas_history_index_create(size_t budget_bytes)
     index->entries = (struct history_entry *)(index + 1);
     index->tokens = (int32_t *)(index->entries + slots);
     return index;
+}
+
+struct janas_history_index *janas_history_index_create(size_t budget_bytes)
+{
+    return janas_history_index_create_for_tokens(budget_bytes, SIZE_MAX);
 }
 
 void janas_history_index_destroy(struct janas_history_index *index)

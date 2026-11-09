@@ -16,6 +16,12 @@ struct janas_history_index;
  * A budget too small for a useful index, or an allocation failure, returns
  * NULL. A bounded tail is retained when the history exceeds its capacity. */
 struct janas_history_index *janas_history_index_create(size_t budget_bytes);
+/* Use the smallest permitted power-of-two table that retains max_tokens.
+ * If the budget cannot hold that many, retain the largest bounded tail it
+ * permits, as create() does. The minimum table retains 16 tokens. Zero
+ * max_tokens returns NULL; all storage still fits min(budget_bytes, 8 MiB). */
+struct janas_history_index *janas_history_index_create_for_tokens(
+    size_t budget_bytes, size_t max_tokens);
 void janas_history_index_destroy(struct janas_history_index *index);
 size_t janas_history_index_bytes(const struct janas_history_index *index);
 
