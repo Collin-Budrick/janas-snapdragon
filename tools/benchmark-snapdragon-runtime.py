@@ -25,7 +25,84 @@ import struct
 import statistics
 import subprocess
 import sys
+import threading
 import time
+
+EXECUTION_STATE_TAG = "win32-system-display-required-v1"
+EXECUTION_STATE_SOURCE = "https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setthreadexecutionstate"
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+EXECUTION_STATE_FLAGS = ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+
+
+class BenchmarkExecutionState:
+    """Thread-scoped benchmark hold; no power-plan, QoS or priority changes."""
+    def __init__(self):
+        self.api = None
+        self.previous = None
+        self.thread_id = None
+        self.entered = False
+        self.output_directory = None
+        self.receipt = {"schema": 1, "protocol": EXECUTION_STATE_TAG,
+            "api": "kernel32.SetThreadExecutionState", "source": EXECUTION_STATE_SOURCE,
+            "scope": "benchmark runner thread, every arm and inter-process cooldown",
+            "enter_attempted": False, "enter_passed": False, "restore_attempted": False,
+            "restore_passed": False, "calls": [], "eligible": False,
+            "power_plan_changed": False, "qos_or_priority_changed": False,
+            "limitation": "Controls automatic system/display idle only; not CPU clocks, thermals, screen savers or user/lid-triggered sleep. Historical sleep is not inferred."}
+
+    def own_output(self, directory, reason):
+        self.output_directory = Path(directory)
+        self.receipt["output_ownership"] = reason
+
+    def _call(self, purpose, flags):
+        previous = int(self.api(flags))
+        row = {"purpose": purpose, "flags": flags, "flags_hex": f"0x{flags:08x}",
+               "returned_state": previous, "returned_state_hex": f"0x{previous:08x}",
+               "passed": previous != 0,
+               "utc": dt.datetime.now(dt.timezone.utc).isoformat()}
+        self.receipt["calls"].append(row)
+        if not previous:
+            raise RuntimeError("SetThreadExecutionState returned NULL during " + purpose)
+        return previous
+
+    def enter(self):
+        if self.receipt["enter_attempted"]:
+            raise RuntimeError("Benchmark execution-state hold entered twice")
+        self.receipt["enter_attempted"] = True
+        self.thread_id = threading.get_native_id()
+        self.receipt["thread_id"] = self.thread_id
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.api = kernel.SetThreadExecutionState
+        self.api.argtypes = [ctypes.c_uint32]
+        self.api.restype = ctypes.c_uint32
+        # Without ES_CONTINUOUS this resets idle timers and returns the
+        # current persistent requirements without replacing them. Retain
+        # all earlier flags, including an existing away-mode requirement.
+        self.previous = self._call("read_previous_requirements",
+                                   ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        self.receipt["previous_state"] = self.previous
+        requested = self.previous | EXECUTION_STATE_FLAGS
+        self.receipt["requested_state"] = requested
+        self._call("enter_hold", requested)
+        self.entered = True
+        self.receipt["enter_passed"] = True
+
+    def restore(self):
+        if self.previous is None:
+            self.receipt["restore_not_required"] = True
+            return
+        self.receipt["restore_attempted"] = True
+        if threading.get_native_id() != self.thread_id:
+            raise RuntimeError("Execution-state hold must be restored on its entering thread")
+        flags = self.previous | ES_CONTINUOUS
+        self.receipt["restore_state"] = flags
+        self._call("restore_previous_requirements", flags)
+        self.receipt["restore_passed"] = True
+        self.entered = False
+        self.receipt["eligible"] = self.receipt["enter_passed"]
+
 
 ROOT = Path(__file__).resolve().parents[1]
 PINS_FILE = ROOT / "tools/snapdragon-runtime-models.json"
@@ -431,6 +508,7 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
         command += ["--fair-retain-controller"]
     value = {"id": f"{sequence:02d}-{workload}-{label}-{case}", "workload": workload, "case": case,
              "binary": label, "binary_sha256": binary["sha256"], "warm_rounds": rounds,
+             "execution_state_protocol": EXECUTION_STATE_TAG,
              "comparison_kind": "same_binary_different_controls" if inputs["baseline"]["sha256"] == inputs["candidate"]["sha256"] else "different_binaries",
               "controller_protocol": controller_protocol,
              "control": control, "performance_controls": performance_controls(control), "command": command,
@@ -452,6 +530,10 @@ def make_manifest(args, protocol, runs, inputs):
         raise ValueError("--allow-same-binary-controls requires different effective baseline and candidate controls")
     contract = {"schema": 1, "protocol": protocol, "inputs": inputs, "plan": runs,
                  "comparison": comparison,
+                 "execution_state": {"protocol": EXECUTION_STATE_TAG,
+                    "api": "SetThreadExecutionState", "required_flags": EXECUTION_STATE_FLAGS,
+                    "retain_previous_requirements": True, "scope": "all arms and cooldowns during execute only",
+                    "source": EXECUTION_STATE_SOURCE},
                 "settings": {"compute_threads": 8, "parent_and_child_affinity": "0xff", "cache_gib": 32,
                     "reserve_gib": 12, "quality": "HIGH", "expert_bits": 6, "head_bits": 0,
                     "sampler": "greedy", "seed": 20260926, "context_tokens": 2048, "gen": 128,
@@ -752,7 +834,7 @@ def native_host():
     return os.name == "nt" and platform.machine().lower() in ("arm64", "aarch64")
 
 
-def _execute(manifest, args):
+def _execute(manifest, args, execution_state):
     if not native_host():
         raise RuntimeError("--execute requires native ARM64 Windows Python")
     contract = manifest["contract"]
@@ -776,6 +858,7 @@ def _execute(manifest, args):
             raise RuntimeError("Resume model-verification artifact changed")
     else:
         directory.mkdir(parents=True, exist_ok=False)
+        execution_state.own_output(directory, "created_new_directory")
         write_json(directory / "manifest.json", manifest)
         write_json(directory / "model-verification.json", contract["inputs"]["model_verification"])
     verify_inputs(contract["inputs"])
@@ -789,6 +872,9 @@ def _execute(manifest, args):
             raise RuntimeError("Resume requires completed runs to be an ordered prefix")
         else:
             records.append(row)
+    if args.resume:
+        execution_state.own_output(directory, "accepted_resume_manifest_and_prefix")
+    execution_state.enter()
     for run in contract["plan"][len(records):]:
         verify_inputs(contract["inputs"])
         folder = directory / run["id"]
@@ -817,22 +903,70 @@ def _execute(manifest, args):
 
 
 def execute(manifest, args):
+    execution_state = BenchmarkExecutionState()
+    benchmark_error = None
+    restore_error = None
+    benchmark_result = None
     try:
-        return _execute(manifest, args)
+        benchmark_result = _execute(manifest, args, execution_state)
+        execution_state.receipt["benchmark_exit_code"] = benchmark_result
+        return benchmark_result
+    except BaseException as error:
+        benchmark_error = error
+        execution_state.receipt["benchmark_error"] = {"type": type(error).__name__, "message": str(error)}
+        raise
     finally:
-        # Children only write private copies. Check the original even on an
-        # interrupted/failed run instead of silently accepting cache training.
+        try:
+            execution_state.restore()
+        except BaseException as error:
+            restore_error = error
+            execution_state.receipt["restore_error"] = {"type": type(error).__name__, "message": str(error)}
+            execution_state.receipt["eligible"] = False
+        if benchmark_error is not None or benchmark_result != 0:
+            execution_state.receipt["eligible"] = False
+        # Children only write private copies. Check originals after release,
+        # even on failure/cancellation; an error must not retain the hold.
         frozen = manifest["contract"]["inputs"]["calibration"]
-        verify_calibration_source(frozen)
         attention = manifest["contract"]["inputs"]["attention_calibration"]
-        verify_calibration_source(attention)
-        if args.output is not None and args.output.resolve().is_dir():
-            write_json(args.output.resolve() / "calibration-preserved.json", {
-                "original_unchanged": True, "state": frozen["state"],
-                "source_path": frozen["source_path"], "sha256": frozen["sha256"],
-                "private_copy_per_process": True,
-                "attention_source_path": attention["source_path"],
-                "attention_sha256": attention["sha256"], "attention_original_unchanged": True})
+        calibration_error = None
+        try:
+            verify_calibration_source(frozen)
+            verify_calibration_source(attention)
+        except BaseException as error:
+            calibration_error = error
+            execution_state.receipt["calibration_error"] = {"type": type(error).__name__, "message": str(error)}
+            execution_state.receipt["eligible"] = False
+        execution_state.receipt["calibration_preserved"] = calibration_error is None
+        if execution_state.output_directory is not None:
+            directory = execution_state.output_directory
+            state_path = directory / "execution-state.json"
+            write_json(state_path, execution_state.receipt)
+            summary_path = directory / "summary.json"
+            if summary_path.is_file():
+                value = read_json(summary_path)
+                value["execution_state"] = {"protocol": EXECUTION_STATE_TAG,
+                    "receipt": str(state_path), "sha256": sha(state_path),
+                    "eligible": execution_state.receipt["eligible"]}
+                value["promotion"]["execution_state_gate_passed"] = bool(execution_state.receipt["enter_passed"] and execution_state.receipt["restore_passed"])
+                value["promotion"]["calibration_gate_passed"] = calibration_error is None
+                value["promotion"]["passed"] = bool(value["promotion"]["passed"] and execution_state.receipt["eligible"])
+                write_json(summary_path, value)
+            if calibration_error is None:
+                write_json(directory / "calibration-preserved.json", {
+                    "original_unchanged": True, "state": frozen["state"],
+                    "source_path": frozen["source_path"], "sha256": frozen["sha256"],
+                    "private_copy_per_process": True,
+                    "attention_source_path": attention["source_path"],
+                    "attention_sha256": attention["sha256"], "attention_original_unchanged": True})
+        if restore_error is not None or calibration_error is not None:
+            parts = []
+            if restore_error is not None:
+                parts.append("Benchmark execution-state restoration failed: " + str(restore_error))
+            if calibration_error is not None:
+                parts.append("Benchmark calibration preservation failed: " + str(calibration_error))
+            if benchmark_error is not None:
+                parts.append("benchmark also failed: " + str(benchmark_error))
+            raise RuntimeError("; ".join(parts)) from (restore_error or calibration_error)
 
 
 def parser():

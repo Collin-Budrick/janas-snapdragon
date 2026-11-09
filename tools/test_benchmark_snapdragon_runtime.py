@@ -10,6 +10,7 @@ import json
 import struct
 from pathlib import Path
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -99,6 +100,7 @@ class RuntimeProtocolTests(unittest.TestCase):
         for mode in ("screen", "paired"):
             output = io.StringIO()
             with (mock.patch.object(tool.subprocess, "Popen", side_effect=AssertionError("child launched")),
+                  mock.patch.object(tool.ctypes, "WinDLL", side_effect=AssertionError("plan requested Windows execution state"), create=True),
                   mock.patch.object(tool, "execute", side_effect=AssertionError("execute entered")),
                   mock.patch.object(tool, "native_host", side_effect=AssertionError("host execution queried")),
                   mock.patch.object(tool, "source_identity", return_value={"fixture": True}),
@@ -448,6 +450,13 @@ class RuntimeProtocolTests(unittest.TestCase):
         output = self.folder / "executed"
         kernel = mock.Mock()
         kernel.GetCurrentProcess.return_value = 77
+        execution = {"state": tool.ES_CONTINUOUS}
+        def execution_request(flags):
+            previous = execution["state"]
+            if flags & tool.ES_CONTINUOUS:
+                execution["state"] = flags
+            return previous
+        kernel.SetThreadExecutionState.side_effect = execution_request
         def affinity(handle, process, system):
             value = getattr(handle, "value", handle)
             process._obj.value = 255 if value == 123 else 4095
@@ -502,7 +511,11 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertTrue(preserved["attention_original_unchanged"])
         self.assertEqual(preserved["sha256"], tool.sha(drafts))
         self.assertEqual(preserved["attention_sha256"], tool.sha(attention))
+        hold = tool.read_json(output / "execution-state.json")
+        self.assertTrue(hold["enter_passed"] and hold["restore_passed"] and hold["eligible"])
+        self.assertEqual(execution["state"], tool.ES_CONTINUOUS)
         with (mock.patch.object(tool, "native_host", return_value=True),
+              mock.patch.object(tool.ctypes, "WinDLL", return_value=kernel, create=True),
               mock.patch.object(tool, "source_identity", return_value={"fixture": True}),
               mock.patch.object(tool.subprocess, "Popen", side_effect=AssertionError("completed resume relaunched child")),
               contextlib.redirect_stdout(io.StringIO())):
@@ -530,6 +543,166 @@ class RuntimeProtocolTests(unittest.TestCase):
         screen = self.args("screen", ["--allow-same-binary-controls"])
         with self.assertRaisesRegex(ValueError, "paired mode"):
             tool.check_args(screen)
+
+    def execution_fixture(self, *, fail_call=None, child_error=None, previous=None):
+        previous = tool.ES_CONTINUOUS if previous is None else previous
+        output = self.folder / ("hold-" + str(len(list(self.folder.glob("hold-*")))))
+        output.mkdir()
+        tool.write_json(output / "summary.json", {"promotion": {"passed": True}})
+        args = types.SimpleNamespace(output=output)
+        manifest = {"contract": {"inputs": {
+            "calibration": tool.calibration_input(None),
+            "attention_calibration": tool.calibration_input(None, "attention")}}}
+        state = {"current": previous, "calls": []}
+        kernel = mock.Mock()
+        def request(flags):
+            state["calls"].append(flags)
+            before = state["current"]
+            if len(state["calls"]) == fail_call:
+                return 0
+            if flags & tool.ES_CONTINUOUS:
+                state["current"] = flags
+            return before
+        kernel.SetThreadExecutionState.side_effect = request
+        child = mock.Mock(side_effect=child_error, return_value=0)
+        def execute_body(_manifest, _args, hold):
+            hold.own_output(output, "fixture_owned_new_directory")
+            hold.enter()
+            return child()
+        raised = None
+        with mock.patch.object(tool.ctypes, "WinDLL", return_value=kernel, create=True), \
+             mock.patch.object(tool, "_execute", side_effect=execute_body):
+            try:
+                tool.execute(manifest, args)
+            except BaseException as error:
+                raised = error
+        return state, child, raised, tool.read_json(output / "execution-state.json"), tool.read_json(output / "summary.json")
+
+    def test_execution_state_contract_is_identical_for_all_arms(self):
+        manifest = tool.build_plan(self.args(), self.inputs())
+        policy = manifest["contract"]["execution_state"]
+        self.assertEqual(policy["protocol"], tool.EXECUTION_STATE_TAG)
+        self.assertEqual(policy["required_flags"], 0x80000003)
+        self.assertTrue(policy["retain_previous_requirements"])
+        self.assertTrue(all(r["execution_state_protocol"] == policy["protocol"] for r in manifest["contract"]["plan"]))
+
+    def test_execution_state_enters_and_restores_previous_requirements_on_success(self):
+        state, child, error, hold, summary = self.execution_fixture()
+        self.assertIsNone(error)
+        child.assert_called_once_with()
+        self.assertEqual(state["calls"], [3, 0x80000003, 0x80000000])
+        self.assertEqual(state["current"], 0x80000000)
+        self.assertTrue(hold["eligible"] and hold["enter_passed"] and hold["restore_passed"])
+        self.assertTrue(summary["promotion"]["execution_state_gate_passed"])
+
+    def test_execution_state_retains_existing_away_mode_and_system_request(self):
+        previous = tool.ES_CONTINUOUS | 0x40 | tool.ES_SYSTEM_REQUIRED
+        state, child, error, hold, summary = self.execution_fixture(previous=previous)
+        self.assertIsNone(error)
+        self.assertEqual(state["calls"], [3, previous | 3, previous])
+        self.assertEqual(state["current"], previous)
+        self.assertEqual(hold["previous_state"], previous)
+        self.assertEqual(hold["requested_state"], previous | 3)
+
+    def test_execution_state_restores_after_child_error_and_cancellation(self):
+        for error in (RuntimeError("fixture child failure"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                state, child, raised, hold, summary = self.execution_fixture(child_error=error)
+                self.assertIs(raised, error)
+                self.assertEqual(state["current"], tool.ES_CONTINUOUS)
+                self.assertTrue(hold["restore_passed"])
+                self.assertEqual(hold["benchmark_error"]["type"], type(error).__name__)
+                self.assertFalse(hold["eligible"] or summary["promotion"]["passed"])
+
+    def test_execution_state_initial_request_failure_prevents_child(self):
+        state, child, error, hold, summary = self.execution_fixture(fail_call=1)
+        child.assert_not_called()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("returned NULL", str(error))
+        self.assertEqual(state["calls"], [3])
+        self.assertFalse(hold["enter_passed"] or hold["eligible"])
+        self.assertTrue(hold["restore_not_required"])
+        self.assertFalse(summary["promotion"]["passed"])
+
+    def test_execution_state_acquisition_failure_prevents_child_and_restores_prior(self):
+        previous = tool.ES_CONTINUOUS | 0x40
+        state, child, error, hold, summary = self.execution_fixture(fail_call=2, previous=previous)
+        child.assert_not_called()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(state["current"], previous)
+        self.assertTrue(hold["restore_passed"])
+        self.assertFalse(hold["eligible"])
+
+    def test_execution_state_release_failure_is_explicit_and_blocks_promotion(self):
+        state, child, error, hold, summary = self.execution_fixture(fail_call=3)
+        child.assert_called_once_with()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("restoration failed", str(error))
+        self.assertTrue(hold["restore_attempted"])
+        self.assertFalse(hold["restore_passed"] or hold["eligible"])
+        self.assertIn("restore_error", hold)
+        self.assertFalse(summary["promotion"]["passed"])
+        self.assertFalse(summary["promotion"]["execution_state_gate_passed"])
+
+    def test_calibration_drift_is_raised_after_restoration_and_blocks_promotion(self):
+        def changed(_value):
+            raise RuntimeError("fixture frozen calibration drift")
+        with mock.patch.object(tool, "verify_calibration_source", side_effect=changed):
+            state, child, error, hold, summary = self.execution_fixture()
+        self.assertIsInstance(error, RuntimeError)
+        self.assertIn("calibration preservation failed", str(error))
+        self.assertEqual(state["current"], tool.ES_CONTINUOUS)
+        self.assertTrue(hold["restore_passed"])
+        self.assertFalse(hold["eligible"] or summary["promotion"]["passed"])
+        self.assertFalse(summary["promotion"]["calibration_gate_passed"])
+
+    def test_restoration_and_calibration_errors_are_both_reported(self):
+        with mock.patch.object(tool, "verify_calibration_source", side_effect=RuntimeError("fixture calibration drift")):
+            state, child, error, hold, summary = self.execution_fixture(fail_call=3)
+        self.assertIn("restoration failed", str(error))
+        self.assertIn("calibration preservation failed", str(error))
+        self.assertIn("restore_error", hold)
+        self.assertIn("calibration_error", hold)
+        self.assertFalse(summary["promotion"]["passed"])
+
+    def invalid_output_fixture(self, mode):
+        output = self.folder / ("old-output-" + mode)
+        output.mkdir()
+        attention = self.folder / "attn.txt"
+        attention.write_bytes(b"Snapdragon_X|8|16/2/256|0|2048 1024 1024\n")
+        extra = ["--execute", "--output", str(output), "--attention-calibration-file", str(attention)]
+        if mode != "existing":
+            extra.append("--resume")
+        args = self.args(extra=extra)
+        with mock.patch.object(tool, "source_identity", return_value={"fixture": True}):
+            inputs = tool.prepare_inputs(args)
+        manifest = tool.build_plan(args, inputs)
+        old = copy.deepcopy(manifest)
+        if mode == "contract":
+            old["contract"]["settings"]["cache_gib"] = 7
+            old["contract_sha256"] = tool.digest(old["contract"])
+        tool.write_json(output / "manifest.json", old)
+        tool.write_json(output / "model-verification.json", inputs["model_verification"])
+        for name in ("execution-state.json", "summary.json", "calibration-preserved.json"):
+            (output / name).write_bytes(b"preserve existing valid receipt bytes\n")
+        before = {p.name: p.read_bytes() for p in output.iterdir()}
+        with mock.patch.object(tool, "native_host", return_value=True), \
+             mock.patch.object(tool, "source_identity", return_value={"fixture": True}), \
+             mock.patch.object(tool.ctypes, "WinDLL", side_effect=AssertionError("invalid output requested execution state"), create=True), \
+             mock.patch.object(tool, "completed_run", side_effect=RuntimeError("fixture invalid completed prefix")), \
+             mock.patch.object(tool.subprocess, "Popen", side_effect=AssertionError("invalid output launched child")):
+            with self.assertRaises((RuntimeError, FileExistsError)):
+                tool.execute(manifest, args)
+        self.assertEqual({p.name: p.read_bytes() for p in output.iterdir()}, before)
+
+    def test_existing_nonresume_output_keeps_all_original_receipts(self):
+        self.invalid_output_fixture("existing")
+
+    def test_invalid_resume_contract_keeps_all_original_receipts(self):
+        self.invalid_output_fixture("contract")
+
+    def test_invalid_resume_prefix_keeps_all_original_receipts(self):
+        self.invalid_output_fixture("prefix")
 
     def test_promotion_requires_all_workloads_five_warm_and_guardrails(self):
         manifest = tool.build_plan(self.args(), self.inputs())
