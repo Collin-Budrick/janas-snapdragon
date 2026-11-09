@@ -61,6 +61,35 @@ def _sum16(address: UInt64, index: Int) -> Int32:
 
 
 @inline(.always)
+def _q4_correction(
+    address: UInt64, mn0: Ints, mn1: Ints
+) -> SIMD[.int32, 2]:
+    # Widen each neighboring Int16 sum before addition, as C integer
+    # promotion does. This also preserves arbitrary Int16 bsums metadata;
+    # a non-widening ADDP could overflow for metadata outside Q8_K's usual
+    # quantizer-produced bounds. No bsums2 representation is consulted.
+    var p = Pointer[Int16, ImmUntrackedOrigin](
+        unsafe_from_address=Int(address) + 260
+    )
+    var lo = llvm_intrinsic[
+        "llvm.aarch64.neon.saddlp.v4i32.v8i16", I4
+    ](p.unsafe_load[width=8, alignment=1]())
+    var hi = llvm_intrinsic[
+        "llvm.aarch64.neon.saddlp.v4i32.v8i16", I4
+    ](p.unsafe_offset(8).unsafe_load[width=8, alignment=1]())
+    var m00 = mn0.unsafe_load[width=4, alignment=1]()
+    var m01 = mn0.unsafe_offset(4).unsafe_load[width=4, alignment=1]()
+    var m10 = mn1.unsafe_load[width=4, alignment=1]()
+    var m11 = mn1.unsafe_offset(4).unsafe_load[width=4, alignment=1]()
+    # Only exact Int32 products/additions are regrouped. Each sum is below
+    # 2**26 even for full-range Int16 metadata and six-bit Q4_K minima.
+    return SIMD[.int32, 2](
+        (lo * m00 + hi * m01).reduce_add(),
+        (lo * m10 + hi * m11).reduce_add(),
+    )
+
+
+@inline(.always)
 def _sdot(acc: I4, a: B16, b: B16) -> I4:
     return llvm_intrinsic["llvm.aarch64.neon.sdot.v4i32.v16i8", I4](acc, a, b)
 
@@ -283,17 +312,16 @@ def _rows[
                 var a = x + UInt64((2 * p * xs + b) * Q8_BYTES)
                 var c = a + UInt64(xs * Q8_BYTES)
                 var correction = I4(0)
-                comptime if TYPE != 14:
+                comptime if TYPE == 12:
+                    var ca = _q4_correction(a, mn0, mn1)
+                    var cc = _q4_correction(c, mn0, mn1)
+                    correction = I4(ca[0], cc[0], ca[1], cc[1])
+                elif TYPE == 214:
                     comptime for g in range(GROUPS):
                         var sa = _sum16(a, g)
                         var sb = _sum16(c, g)
                         var s0 = sc0[unsafe_offset=g]
                         var s1 = sc1[unsafe_offset=g]
-                        comptime if TYPE == 12:
-                            sa = _sum16(a, 2 * g) + _sum16(a, 2 * g + 1)
-                            sb = _sum16(c, 2 * g) + _sum16(c, 2 * g + 1)
-                            s0 = mn0[unsafe_offset=g]
-                            s1 = mn1[unsafe_offset=g]
                         correction += I4(s0 * sa, s0 * sb, s1 * sa, s1 * sb)
                 var si = sums[unsafe_offset=p]
                 comptime if TYPE == 214:
@@ -311,15 +339,15 @@ def _rows[
             comptime if NV & 1:
                 var correction0 = Int32(0)
                 var correction1 = Int32(0)
-                comptime if TYPE != 14:
+                comptime if TYPE == 12:
+                    var co = _q4_correction(ox, mn0, mn1)
+                    correction0 = co[0]
+                    correction1 = co[1]
+                elif TYPE == 214:
                     comptime for g in range(GROUPS):
                         var sx = _sum16(ox, g)
                         var s0 = sc0[unsafe_offset=g]
                         var s1 = sc1[unsafe_offset=g]
-                        comptime if TYPE == 12:
-                            sx = _sum16(ox, 2 * g) + _sum16(ox, 2 * g + 1)
-                            s0 = mn0[unsafe_offset=g]
-                            s1 = mn1[unsafe_offset=g]
                         correction0 += sx * s0
                         correction1 += sx * s1
                 var si0 = os0.reduce_add()

@@ -365,10 +365,13 @@ static void mojo_test_fpcr(mojo_export_fn fn)
                     4, 3, nv, 1, 1)) {
                 MCHECK(0, "FPCR fixture allocation"); continue;
             }
-            for (uint64_t mode = 0; mode < 8; mode++) {
-                uint64_t control = (saved & ~(UINT64_C(3) << 22)) |
-                    ((mode & 3) << 22);
+            for (uint64_t mode = 0; mode < 32; mode++) {
+                uint64_t mask = (UINT64_C(3) << 22) | (UINT64_C(1) << 24) |
+                    (UINT64_C(1) << 19) | (UINT64_C(1) << 25);
+                uint64_t control = (saved & ~mask) | ((mode & 3) << 22);
                 if (mode & 4) control |= UINT64_C(1) << 24;
+                if (mode & 8) control |= UINT64_C(1) << 19;
+                if (mode & 16) control |= UINT64_C(1) << 25;
                 mojo_set_fpcr(control);
                 uint64_t actual_control = mojo_fpcr();
                 int rc = mojo_export_call(fn, &f, f.rows, f.a + 4);
