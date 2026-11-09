@@ -46,7 +46,7 @@
   },
   "evidence": {
     "date": "2026-11-09",
-    "status": "validated opt-in module; C stable default retained",
+    "status": "user-selected default; exact Mojo module enabled with C fallback",
     "promotion_gate_passed": false,
     "whole_profile_geometric_mean_rate_ratio": 1.0362431834051178,
     "automatic_shape_promotion": false,
@@ -55,7 +55,19 @@
     "report": "docs/benchmarks/snapdragon80b-20261109-mojo.md",
     "raw_results": "docs/benchmarks/snapdragon80b-20261109-mojo.json",
     "validation_report": "docs/benchmarks/snapdragon80b-20261109-mojo-validation.json",
-    "notes": "Original weights/CPU8/MTP4/cache32GiB/reserve12GiB/GDN111; exact multi-vector Mojo kernels with C singleton/fallback. Complete-cycle profile and individual kernel gains are separate gates; Q6 has no broad measured pool-inclusive win."
+    "notes": "Original weights/CPU8/MTP4/cache32GiB/reserve12GiB/GDN111; exact multi-vector Mojo kernels with C singleton/fallback. Complete-cycle profile and individual kernel gains are separate gates; Q6 has no broad measured pool-inclusive win.",
+    "default_selected": true,
+    "selection": {
+      "date": "2026-11-09",
+      "basis": "explicit_user_instruction",
+      "request": "Keep Mojo active; the measured gain is worthwhile.",
+      "measured_geometric_mean_gain_percent": 3.6243183405117785,
+      "benchmark_promotion_threshold_percent": 5,
+      "benchmark_promotion_gate_passed": false,
+      "automatic_shape_promotion": false,
+      "c_only_profile": "profiles/snapdragon-xelite-cpu-c.json",
+      "scope": "Select the validated Mojo runtime profile for this fork/device; preserve raw measurements and established benchmark gates."
+    }
   },
   "runtime": {
     "mojo_library": "lib/mojo/aarch64-windows/janas_mojo.dll"

@@ -19,11 +19,15 @@ The [exact runtime experiments](docs/snapdragon-runtime.md) add activation panel
 cycle planning, hybrid lookup, adaptive draft-only vocabulary and recurrent
 recovery journals. The [matched release report](docs/benchmarks/snapdragon80b-20261108-runtime.json)
 records the balanced workload comparison and validation boundaries. The CPU
-profile enables only the exact recovery changes that passed its promotion gates.
+profile retains those exact recovery changes.
 
-The [modular Mojo experiment](docs/snapdragon-mojo.md) adds optional ARM64
+The [modular Mojo implementation](docs/snapdragon-mojo.md) adds ARM64
 quantized kernels to the same fork, with C comparisons and a versioned module
-boundary for gradual migration. The established CPU profile remains available.
+boundary for gradual migration. On 2026-11-09 the user selected Mojo for the
+default CPU profile after a measured 3.62% geometric-mean gain, explicitly
+accepting a result below the earlier 5% gate. The original gate result remains
+unchanged. The prior C/MTP4 configuration is preserved in
+`profiles/snapdragon-xelite-cpu-c.json`.
 
 The upstream performance figures below describe its Intel test machine.
 Results for this Snapdragon laptop are recorded separately in the guide.

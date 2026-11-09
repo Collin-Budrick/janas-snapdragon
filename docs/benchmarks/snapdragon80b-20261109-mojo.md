@@ -6,6 +6,14 @@ or ARM64 Linux process through a versioned C ABI. The single-token path,
 thread pool, SSD/RAM expert cache, MTP weights, router, sampler and FP16 recurrent
 state remain in Janas. This is the first module of the gradual migration.
 
+**Deployment decision, 2026-11-09:** after reviewing this comparison, the user
+selected Mojo as the default CPU profile and active local backend. The measured
+gain and original 5% gate result below remain unchanged. This explicit selection
+does not automatically qualify every individual kernel shape. The prior C/MTP4
+profile is preserved as `profiles/snapdragon-xelite-cpu-c.json`.
+The [deployment receipt](snapdragon80b-20261109-mojo-selection.json) verifies
+the loaded native module, actual kernel execution and unchanged code output.
+
 ## Matched current-profile comparison
 
 Both arms use the original Qwen3-Next-80B-A3B Q4_K_M model/MTP sidecar, CPU8,
@@ -24,8 +32,9 @@ requires zero cached prompt tokens.
 | long | 17.74 | 19.23 | +8.36% | 46.217 / 45.108 |
 
 The optimized window's geometric-mean generation-rate change is **+3.62%**.
-The module did not meet the **5%** whole-profile promotion threshold, so the C
-profile remains the stable default. All workload rate floors and warm first-token
+The module did not meet the **5%** whole-profile promotion threshold. C was
+therefore retained as the default when these results were first delivered, before
+the subsequent user-selected deployment decision above. All workload rate floors and warm first-token
 latency gates passed.
 The initial module's separate matched window measured **+2.58%**, below the gate.
 Do not compare absolute rates across those two windows as a matched initial-versus-
@@ -70,6 +79,7 @@ leaf-module pipeline, not qualification of a complete native Mojo runtime.
 There is no MAX graph runtime or WSL IPC in inference. Numerical tests do not
 qualify every model/context/device, and five warm samples do not control CPU
 clocks, thermals or OS file-cache state. Fresh process does not mean cold SSD.
-The 40 tok/s objective has not been reached. The existing C profile remains the
-stable default; the Mojo profile is opt-in while individual shapes continue
-qualification.
+The 40 tok/s objective has not been reached. The default CPU profile and the
+dedicated Mojo profile now enable the module by user selection; C remains the
+single-token/unsupported-shape fallback and an explicit C-only comparison profile.
+Individual shapes continue qualification under the original measurement gates.

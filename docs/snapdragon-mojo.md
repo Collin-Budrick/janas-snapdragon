@@ -74,25 +74,40 @@ CPU features. Mojo uses `-O3` with `--fp-mode contract=off`; the existing Janas 
 flags remain the baseline. Generated modules and compiler installations are not committed
 to the fork.
 
-## Select the module explicitly
+## Default and comparison profiles
+
+On **2026-11-09**, the user selected Mojo as the default CPU profile after the
+matched comparison measured a **3.62%** geometric-mean gain. This is an explicit
+user choice below the earlier 5% promotion threshold. The recorded threshold
+result remains false, and this choice does not automatically qualify every
+individual kernel shape.
 
 The low-level controls are `JANAS_MOJO=1` and an **absolute** `JANAS_MOJO_LIBRARY` path.
 Loading occurs once and the handle lives until process exit. Configure these before
 starting Janas; changing the path does not reload code. Missing modules preserve C
 fallback and expose a status.
 
-The native Windows launcher resolves the project-relative module path in the opt-in [Mojo
-profile](../profiles/snapdragon-xelite-mojo.json):
+The native Windows launcher resolves the project-relative module path in both the
+[default CPU profile](../profiles/snapdragon-xelite-cpu.json) and the dedicated
+[Mojo profile](../profiles/snapdragon-xelite-mojo.json):
 
 ```powershell
-python tools/run-snapdragon.py --profile profiles/snapdragon-xelite-mojo.json --app chat --dry-run
-python tools/run-snapdragon.py --profile profiles/snapdragon-xelite-mojo.json --app chat
+python tools/run-snapdragon.py --profile profiles/snapdragon-xelite-cpu.json --app chat --dry-run
+python tools/run-snapdragon.py --profile profiles/snapdragon-xelite-cpu.json --app chat
 ```
 
 Use native ARM64 Windows Python for an actual launch. The profile retains CPU8, a 32 GiB
 expert cache, a 12 GiB reserve, MTP4 and the promoted DeltaNet chain/journal/K-only
-settings. The established CPU profile remains the default until matched end-to-end
-promotion gates pass. `JANAS_CPU_TILES=1` additionally forces experimental C panels,
+settings. Build the module before using a Mojo-enabled profile. The preserved
+[C-only profile](../profiles/snapdragon-xelite-cpu-c.json) selects the prior C/MTP4
+configuration for comparison or deployment without the module:
+
+```powershell
+python tools/run-snapdragon.py --profile profiles/snapdragon-xelite-cpu-c.json --app chat
+```
+
+C continues to handle single-token work, unsupported shapes and loader fallback.
+`JANAS_CPU_TILES=1` additionally forces experimental C panels,
 useful for isolating C-versus-Mojo kernel cost; `JANAS_CPU_TILES=0` prevents panel
 dispatch. Report those controls with results.
 
@@ -118,8 +133,9 @@ group measurements include panel allocation, packing, the C pool, dispatch, coun
 freeing. It checks results outside clocks. First-shape calls follow correctness tests and
 are not cold-process inference samples. Keep identical panel policy on both arms.
 
-Require at least **5% native median group improvement** before promoting a kernel shape.
-Full-profile promotion additionally requires at least 5% geometric-mean throughput
+The original automatic qualification gates require at least **5% native median group
+improvement** before promoting a kernel shape. Full-profile qualification additionally
+requires at least 5% geometric-mean throughput
 improvement across frozen code/prose/long workloads, no workload regression above 3%, and
 no warm first-token regression above the greater of 10 ms or 5%. Freeze
 executable/module/model/prompt hashes and initial MTP calibration; retain fresh samples
@@ -146,4 +162,5 @@ measurements.
 
 The [matched first-module results](benchmarks/snapdragon80b-20261109-mojo.md)
 record the current optimized module against the frozen MTP4 profile. The
-whole-profile gain was 3.6%; the Mojo profile remains opt-in.
+whole-profile gain was 3.6%. The user subsequently selected Mojo as the default;
+the raw comparison and original gate result remain unchanged.

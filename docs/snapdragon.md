@@ -23,15 +23,25 @@ Weights and local runtime binaries stay outside Git.
 
 ## Measured settings and starting the server
 
+On **2026-11-09**, the user selected the exact Mojo module for the default CPU
+profile and local server. The matched comparison measured a **3.62%**
+geometric-mean generation-rate gain; the earlier 5% promotion gate remains
+recorded as unmet. This deployment choice preserves C fallback and does not
+automatically qualify every kernel shape. See the [Mojo guide](snapdragon-mojo.md)
+for module build instructions and the [matched results](benchmarks/snapdragon80b-20261109-mojo.md).
+`profiles/snapdragon-xelite-cpu.json` and `profiles/snapdragon-xelite-mojo.json`
+enable Mojo; `profiles/snapdragon-xelite-cpu-c.json` preserves the prior C/MTP4
+configuration for comparison or use without the module.
+
 The selected profile uses eight CPU cores, a 32 GiB main expert cache, the
 separate MTP cache, a four-token draft ceiling and demand reads from the SSD.
 The 48.4 GB model stays on disk; only the needed experts enter the RAM cache.
 The MTP planner adjusts its actual draft length. The promoted CPU profile also enables exact DeltaNet chains, a delta journal
 and K-only recovery. The planner and draft vocabulary remain legacy, and new
-activation panels remain experimental. The latest matched ABBA comparison used
+activation panels serve the Mojo path. The earlier C runtime ABBA comparison used
 five warm samples per binary on every workload:
 
-| Workload, 128 generated tokens | Prior release | Current CPU profile | Rate ratio |
+| Workload, 128 generated tokens | Prior release | C profile at this measurement | Rate ratio |
 |---|---:|---:|---:|
 | Repeated code, 276 input tokens | 16.14 tok/s | **23.32 tok/s** | 1.444x |
 | General prose, 63 input tokens | 16.31 tok/s | **18.90 tok/s** | 1.159x |

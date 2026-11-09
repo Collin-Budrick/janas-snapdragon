@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "selected_utc": "2026-11-09T13:45:25.667586+00:00",
+  "selection_basis": "explicit_user_instruction",
+  "measured_geometric_mean_gain_percent": 3.6243183405117785,
+  "original_benchmark_gate_passed": false,
+  "default_profile": "profiles/snapdragon-xelite-cpu.json",
+  "c_only_profile": "profiles/snapdragon-xelite-cpu-c.json",
+  "default_mojo_enabled": true,
+  "c_profile_preserved": true,
+  "module_sha256": "763d287e889ad5d11ab6f9e157b54c21da033363ab7419946e836f0e68322bf1",
+  "native_server": {
+    "pid": 25652,
+    "executable": "C:\\Users\\colli\\Documents\\janas-snapdragon\\bin\\aarch64-windows\\janas-server.exe",
+    "affinity": 255,
+    "mojo_modules": [
+      {
+        "ModuleName": "janas_mojo.dll",
+        "FileName": "C:\\Users\\colli\\Documents\\janas-snapdragon\\lib\\mojo\\aarch64-windows\\janas_mojo.dll"
+      }
+    ]
+  },
+  "health_checks": {
+    "/health": 200,
+    "/v1/models": 200,
+    "/test": 200
+  },
+  "arithmetic_response": "391",
+  "output_tokens": 128,
+  "code_output_hash": "aad9221895bb6fe0",
+  "expected_code_output_hash": "aad9221895bb6fe0",
+  "cpu_prepared_row_vectors": 327742192,
+  "execution_proof": "Default automatic C panel policy is retained; positive prepared rows with the loaded Mojo DLL demonstrate multi-vector module execution. C singleton and fallback paths remain.",
+  "tooling_tests": {
+    "linux": 142,
+    "native_windows_arm64": 142,
+    "passed": true
+  },
+  "scope": "Profile selection and native server verification using previously validated immutable kernel binary; no new throughput benchmark.",
+  "passed": true
+}
