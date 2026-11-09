@@ -2,3 +2,4 @@
 *.sh text eol=lf
 tools/benchmark-prompts/*.txt text eol=lf
 docs/benchmarks/*-runtime*.json text eol=lf
+docs/benchmarks/*-hybrid*.json text eol=lf

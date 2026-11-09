@@ -7,6 +7,7 @@
 #include "generate.h"
 #include "history_index.h"
 #include "spec_controller.h"
+#include "hybrid_controller.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -321,6 +322,13 @@ struct janas_llm_session {
     struct janas_gen_stats st;
     struct janas_history_index *index;
     struct janas_cycle_controller cycle;
+    struct janas_hybrid_controller hybrid;
+    struct planner hybrid_pl[3]; /* adaptive heads do not train legacy bins */
+    struct janas_gen_hybrid_metrics hybrid_metrics;
+    struct janas_gen_hybrid_decision hybrid_pending, hybrid_current, hybrid_wait_decision;
+    struct janas_hybrid_observation hybrid_wait;
+    int hybrid_waiting;
+    double hybrid_incoming_recovery;
     struct janas_gen_metrics metrics;
     struct janas_gen_cycle pending;
     uint64_t next_proposal_id;
@@ -329,6 +337,40 @@ struct janas_llm_session {
     int observation_pending, has_filter;
     unsigned last_reuse, pending_reuse, observation_reuse;
 };
+
+static int hybrid_cost(const struct janas_llm_session *s)
+{
+    return s->o.spec_mode == JANAS_SPEC_HYBRID && s->o.hybrid_policy == 1;
+}
+
+static struct planner *mtp_planner(struct janas_llm_session *s)
+{
+    unsigned key = janas_cycle_vocab_key((unsigned)janas_llm_mtp_vocab_policy(s->m),
+                                         janas_llm_mtp_vocab_rows(s->m));
+    return key ? &s->hybrid_pl[key - 1] : &s->pl;
+}
+
+/* Recovery is fused with the next GDN verification. Its measured pool-time
+   row-share estimate is transferred once, without adding elapsed time. */
+static void hybrid_settle(struct janas_llm_session *s, double recovery)
+{
+    if (!s->hybrid_waiting) return;
+    if (!isfinite(recovery) || recovery < 0) recovery = 0;
+    s->hybrid_wait.seconds += recovery;
+    s->hybrid_wait_decision.causal_seconds = s->hybrid_wait.seconds;
+    s->hybrid_wait_decision.recovery_seconds += recovery;
+    janas_hybrid_observe(&s->hybrid, &s->hybrid_wait);
+    if (s->hybrid_wait.source == JANAS_GEN_SOURCE_LOOKUP) {
+        s->hybrid_metrics.lookup_seconds += s->hybrid_wait.seconds;
+        s->hybrid_metrics.lookup_delivered += s->hybrid_wait.delivered;
+    } else {
+        s->hybrid_metrics.mtp_seconds += s->hybrid_wait.seconds;
+        s->hybrid_metrics.mtp_delivered += s->hybrid_wait.delivered;
+    }
+    s->hybrid_metrics.recovery_reassigned_seconds += recovery;
+    s->hybrid_metrics.last = s->hybrid_wait_decision;
+    s->hybrid_waiting = 0;
+}
 
 static int cycle_mode(const struct janas_llm_session *s)
 {
@@ -340,7 +382,29 @@ static void finish_cycle(struct janas_llm_session *s)
 {
     if (!s->observation_pending) return;
     const struct janas_gen_cycle *c = &s->metrics.last;
-    if (s->o.spec_planner == 1) {
+    if (hybrid_cost(s)) {
+        hybrid_settle(s, 0);
+        unsigned source = c->planner_source == JANAS_GEN_SOURCE_LOOKUP
+            ? JANAS_GEN_SOURCE_LOOKUP : JANAS_GEN_SOURCE_MTP;
+        s->hybrid_wait = (struct janas_hybrid_observation){
+            .source = source, .depth = c->pass_width - 1,
+            .accepted_prefix = c->accepted_prefix, .delivered = c->delivered,
+            .pass_width = c->pass_width, .lookup_suffix = c->lookup_suffix,
+            .warm = c->warm,
+            .vocab = janas_cycle_vocab_key(c->draft_vocab_policy, c->draft_vocab_rows),
+            .reuse = s->observation_reuse,
+            .seconds = fmax(0, c->total_seconds - s->hybrid_incoming_recovery),
+            .verification_seconds = fmax(0, c->verification_seconds - s->hybrid_incoming_recovery)
+        };
+        s->hybrid_wait_decision = s->hybrid_current;
+        s->hybrid_wait_decision.proposal_id = c->proposal_id;
+        s->hybrid_wait_decision.accepted_prefix = c->accepted_prefix;
+        s->hybrid_wait_decision.delivered = c->delivered;
+        s->hybrid_wait_decision.pass_width = c->pass_width;
+        s->hybrid_wait_decision.causal_seconds = s->hybrid_wait.seconds;
+        s->hybrid_waiting = 1;
+        if (!c->rejected_rows) hybrid_settle(s, 0);
+    } else if (s->o.spec_planner == 1) {
         janas_cycle_observe_reuse(&s->cycle, c->planner_source, c->warm,
             janas_cycle_vocab_key(c->draft_vocab_policy, c->draft_vocab_rows),
             c->requested_depth, c->total_seconds, c->delivered, s->observation_reuse);
@@ -358,7 +422,18 @@ static void finish_cycle(struct janas_llm_session *s)
 static void abandon_proposal(struct janas_llm_session *s)
 {
     const struct janas_gen_cycle *p = &s->pending;
-    if (p->proposal_id && p->preparation_seconds > 0 && s->o.spec_planner == 1) {
+    if (p->proposal_id && p->preparation_seconds > 0 && hybrid_cost(s)) {
+        struct janas_hybrid_observation o = {
+            .source = p->planner_source, .depth = p->requested_depth,
+            .lookup_suffix = p->lookup_suffix, .warm = p->warm,
+            .vocab = janas_cycle_vocab_key(p->draft_vocab_policy, p->draft_vocab_rows),
+            .reuse = s->pending_reuse, .seconds = p->preparation_seconds
+        };
+        janas_hybrid_observe(&s->hybrid, &o);
+        if (o.source == JANAS_GEN_SOURCE_LOOKUP)
+            s->hybrid_metrics.lookup_seconds += o.seconds;
+        else s->hybrid_metrics.mtp_seconds += o.seconds;
+    } else if (p->proposal_id && p->preparation_seconds > 0 && s->o.spec_planner == 1) {
         /* This action already spent its preparation but never reached a
            target pass. Price it once as zero useful output, independently
            of the previous cycle's delivered-token observation. */
@@ -372,6 +447,7 @@ static void abandon_proposal(struct janas_llm_session *s)
     }
     s->metrics.abandoned_preparation_seconds += s->pending.preparation_seconds;
     memset(&s->pending, 0, sizeof(s->pending));
+    memset(&s->hybrid_pending, 0, sizeof(s->hybrid_pending));
     s->n_mdraft = 0;
 }
 
@@ -406,6 +482,10 @@ static int valid_options(const struct janas_llm_model *m,
            o->draft_vocab_policy >= 0 && o->draft_vocab_policy <= 1 &&
            (!o->draft_vocab_rows || o->draft_vocab_rows == 8192 ||
             o->draft_vocab_rows == 16384 || o->draft_vocab_rows == 32768) &&
+            o->hybrid_policy >= 0 && o->hybrid_policy <= 1 &&
+            o->hybrid_lookup_max_drafts >= 0 && o->hybrid_lookup_max_drafts <= MAX_SPEC_K &&
+            o->hybrid_mtp_max_drafts >= 0 && o->hybrid_mtp_max_drafts <= MAX_SPEC_K &&
+            o->hybrid_probe_percent >= 0 && o->hybrid_probe_percent <= 100 &&
            o->spec_k >= 1 && o->spec_k <= MAX_SPEC_K && o->n_stop >= 0 &&
            o->n_stop <= JANAS_GEN_MAX_STOP && o->temperature >= 0 &&
            o->top_k >= 0 && o->top_p >= 0 && o->min_p >= 0 &&
@@ -516,8 +596,18 @@ int janas_llm_session_set_options(struct janas_llm_session *s,
     int was_mtp = s->mtp;
     abandon_proposal(s);
     finish_cycle(s);
+    if (s->o.spec_mode != o->spec_mode ||
+        s->o.hybrid_policy != o->hybrid_policy || s->o.spec_k != o->spec_k ||
+        s->o.hybrid_lookup_max_drafts != o->hybrid_lookup_max_drafts ||
+        s->o.hybrid_mtp_max_drafts != o->hybrid_mtp_max_drafts ||
+        s->o.draft_vocab_policy != o->draft_vocab_policy ||
+        s->o.draft_vocab_rows != o->draft_vocab_rows) {
+        hybrid_settle(s, 0);
+        janas_hybrid_init(&s->hybrid, o->seed);
+    }
     s->o = *o;
-    if ((s->o.spec_mode == JANAS_SPEC_HYBRID || s->o.draft_vocab_policy) &&
+    if (hybrid_cost(s)) s->o.spec_planner = 0;
+    else if ((s->o.spec_mode == JANAS_SPEC_HYBRID || s->o.draft_vocab_policy) &&
         !s->o.spec_planner)
         s->o.spec_planner = 1;
     if (!o->draft_vocab_policy) janas_llm_mtp_vocab_legacy(s->m);
@@ -572,7 +662,8 @@ janas_llm_session_create(struct janas_llm_model *m,
     }
     s->mtp = janas_llm_model_has_mtp(m);
     s->o = *o;
-    if ((s->o.spec_mode == JANAS_SPEC_HYBRID || s->o.draft_vocab_policy) &&
+    if (hybrid_cost(s)) s->o.spec_planner = 0;
+    else if ((s->o.spec_mode == JANAS_SPEC_HYBRID || s->o.draft_vocab_policy) &&
         !s->o.spec_planner)
         s->o.spec_planner = 1;
     if (sampler_setup(s) != 0) {
@@ -583,6 +674,7 @@ janas_llm_session_create(struct janas_llm_model *m,
     s->reply_remaining = UINT32_MAX;
     s->last_reuse = s->pending_reuse = s->observation_reuse = 2;
     janas_cycle_init(&s->cycle, o->seed);
+    janas_hybrid_init(&s->hybrid, o->seed);
     if (!o->draft_vocab_policy) janas_llm_mtp_vocab_legacy(m);
     planner_load(s);
     return s;
@@ -607,6 +699,7 @@ void janas_llm_session_destroy(struct janas_llm_session *s)
 void janas_llm_session_reset(struct janas_llm_session *s)
 {
     discard_buffered(s);
+    hybrid_settle(s, 0);
     janas_llm_model_media_drop(s->m, 0); /* the pictures go with it */
     s->dpos_set = 0;
     s->n = s->n_kv = s->ret = s->call_start = 0;
@@ -665,6 +758,7 @@ int janas_llm_session_restore(struct janas_llm_session *s,
         janas_llm_model_state_load(s->m, sv->st) != 0)
         return -1;
     discard_buffered(s);
+    hybrid_settle(s, 0); /* the restored timeline has no old recovery debt */
     memcpy(s->hist, sv->hist, sv->n * sizeof(int32_t));
     s->n = s->ret = sv->n;
     s->n_kv = s->call_start = sv->n_kv;
@@ -820,6 +914,27 @@ void janas_llm_session_metrics(const struct janas_llm_session *s,
     out->pending_preparation_seconds = s->pending.preparation_seconds;
 }
 
+void janas_llm_session_hybrid_metrics(const struct janas_llm_session *s,
+                                     struct janas_gen_hybrid_metrics *out)
+{
+    if (!out) return;
+    if (!s) { memset(out, 0, sizeof(*out)); return; }
+    *out = s->hybrid_metrics;
+    /* A final rejected pass may never require recovery. Expose its completed
+       work immediately; the next forward can still add its causal recovery. */
+    if (s->hybrid_waiting) {
+        const struct janas_hybrid_observation *w = &s->hybrid_wait;
+        if (w->source == JANAS_GEN_SOURCE_LOOKUP) {
+            out->lookup_seconds += w->seconds;
+            out->lookup_delivered += w->delivered;
+        } else {
+            out->mtp_seconds += w->seconds;
+            out->mtp_delivered += w->delivered;
+        }
+        out->last = s->hybrid_wait_decision;
+    }
+}
+
 void janas_llm_session_reply_remaining(struct janas_llm_session *s,
                                        uint32_t remaining)
 {
@@ -882,8 +997,17 @@ int janas_llm_session_prefill_step(struct janas_llm_session *s)
         if (b > most)
             b = most;
         b = janas_llm_model_media_cut(m, p, b);
-        if (janas_llm_model_forward(m, s->hist + p, b, p, s->logits, 0) != 0)
+        struct janas_llm_runtime_stats hb, ha;
+        int settle = hybrid_cost(s) && s->hybrid_waiting;
+        if (settle) janas_llm_model_runtime_stats(m, &hb);
+        if (janas_llm_model_forward(m, s->hist + p, b, p, s->logits, 0) != 0) {
+            hybrid_settle(s, 0);
             return -1;
+        }
+        if (settle) {
+            janas_llm_model_runtime_stats(m, &ha);
+            hybrid_settle(s, ha.gdn_recovery_seconds - hb.gdn_recovery_seconds);
+        }
         s->call_start = p;
         /* the MTP block's rows: token t_{i+1} with hidden state h_i, at
            position i, so its attention sees the whole sequence */
@@ -1033,6 +1157,16 @@ static int prepare_cycle(struct janas_llm_session *s, uint32_t pos,
     if (remaining != UINT32_MAX && cap >= remaining) cap = remaining ? remaining - 1 : 0;
     unsigned source = JANAS_GEN_SOURCE_PLAIN, want = 0, matched_suffix = 0;
     unsigned warm = !janas_llm_model_settling(s->m), policy = 0, rows = 0;
+    int cost_hybrid = hybrid_cost(s);
+    unsigned mtp_cap = cap;
+    if (cost_hybrid) {
+        unsigned limit = o->hybrid_mtp_max_drafts ? (unsigned)o->hybrid_mtp_max_drafts : 4;
+        if (mtp_cap > limit) mtp_cap = limit;
+        policy = (unsigned)janas_llm_mtp_vocab_policy(s->m);
+        rows = janas_llm_mtp_vocab_rows(s->m);
+    }
+    struct janas_gen_hybrid_decision hd = {0};
+    if (cost_hybrid && !(ongoing && cap)) s->hybrid.cycles++;
     uint64_t vocab_epoch = 0;
     double start = now(), lookup_time = 0, controller_time = 0, repack_time = 0;
     int32_t proposal[MAX_SPEC_K];
@@ -1041,18 +1175,50 @@ static int prepare_cycle(struct janas_llm_session *s, uint32_t pos,
             double tl = now();
             if (!s->index) s->index = janas_history_index_create(8u * 1024u * 1024u);
             int avail = 0, suffix = 0;
+            unsigned lookup_cap = cap;
+            if (cost_hybrid) {
+                unsigned limit = o->hybrid_lookup_max_drafts ? (unsigned)o->hybrid_lookup_max_drafts : 8;
+                if (lookup_cap > limit) lookup_cap = limit;
+            }
             /* Lazy synchronization also handles append/truncate/slide/load;
                rebuilding is charged to this proposal, not hidden in a turn. */
             if (s->index && janas_history_index_sync(s->index, s->hist, s->n, 0) == 0)
                 avail = janas_history_index_lookup(s->index, s->hist, s->n,
-                                                   (int)cap, proposal, &suffix);
+                                                   (int)lookup_cap, proposal, &suffix);
             matched_suffix = (unsigned)suffix;
             lookup_time = now() - tl;
             s->metrics.lookup_seconds += lookup_time;
             if (avail > 0) s->metrics.lookup_hits++; else s->metrics.lookup_misses++;
             source = JANAS_GEN_SOURCE_LOOKUP;
             double tc = now();
-            want = o->spec_planner == 1
+            if (cost_hybrid) {
+                struct janas_hybrid_offer offer = {
+                    .lookup_available = (unsigned)avail, .lookup_suffix = matched_suffix,
+                    .lookup_cap = lookup_cap, .mtp_cap = mtp_cap, .warm = warm,
+                    .vocab = janas_cycle_vocab_key(policy, rows), .reuse = s->last_reuse,
+                    .probe_percent = (unsigned)o->hybrid_probe_percent
+                };
+                struct janas_hybrid_decision d = janas_hybrid_choose(&s->hybrid, &offer);
+                source = d.source;
+                want = source == JANAS_GEN_SOURCE_LOOKUP ? d.depth : 0;
+                hd.source = d.source; hd.requested_depth = d.depth;
+                hd.lookup_available = (unsigned)avail; hd.lookup_suffix = matched_suffix;
+                hd.suffix_class = d.suffix_class; hd.reason = d.reason; hd.probe = d.probe;
+                hd.warm = warm; hd.vocab_key = offer.vocab;
+                hd.lookup_evidence = d.lookup_evidence; hd.mtp_evidence = d.mtp_evidence;
+                hd.lookup_utility = d.lookup_utility; hd.mtp_utility = d.mtp_utility;
+                hd.predicted_seconds = source == JANAS_GEN_SOURCE_LOOKUP ? d.lookup_seconds : d.mtp_seconds;
+                s->hybrid_metrics.decisions++;
+                s->hybrid_metrics.offered_matches += avail > 0;
+                s->hybrid_metrics.eligible_matches += avail > 0 && lookup_cap > 0;
+                s->hybrid_metrics.lookup_selected += source == JANAS_GEN_SOURCE_LOOKUP;
+                s->hybrid_metrics.mtp_selected += source == JANAS_GEN_SOURCE_MTP;
+                s->hybrid_metrics.probes += d.probe != 0;
+                s->hybrid_metrics.cooldown_skips += d.reason == JANAS_HYBRID_COOLDOWN;
+                if (d.reason < 12) s->hybrid_metrics.reason_count[d.reason]++;
+                if (source == JANAS_GEN_SOURCE_LOOKUP && d.depth <= MAX_SPEC_K)
+                    s->hybrid_metrics.lookup_depth_count[d.depth]++;
+            } else want = o->spec_planner == 1
                 ? janas_cycle_choose_reuse(&s->cycle, source, warm, 0, (unsigned)avail,
                                      (unsigned)o->spec_explore_percent, s->last_reuse)
                 : (unsigned)avail;
@@ -1077,7 +1243,7 @@ static int prepare_cycle(struct janas_llm_session *s, uint32_t pos,
             policy = (unsigned)janas_llm_mtp_vocab_policy(s->m);
             rows = janas_llm_mtp_vocab_rows(s->m);
             double tc = now();
-            want = o->spec_planner == 1
+            want = cost_hybrid ? mtp_cap : o->spec_planner == 1
                 ? janas_cycle_choose_reuse(&s->cycle, source, warm,
                     janas_cycle_vocab_key(policy, rows), cap,
                     (unsigned)o->spec_explore_percent, s->last_reuse) : cap;
@@ -1104,7 +1270,9 @@ static int prepare_cycle(struct janas_llm_session *s, uint32_t pos,
     double preparation = now() - start;
     struct mtp_times mt = {0};
     if (s->mtp && mtp_step(s->m, s->hist, pos, acc, (int)want,
-            source == JANAS_GEN_SOURCE_MTP && want > 0, 0, NULL,
+            source == JANAS_GEN_SOURCE_MTP && want > 0,
+            cost_hybrid ? o->spec_min_conf : 0,
+            cost_hybrid && o->spec_auto ? mtp_planner(s) : NULL,
             s->hrow, s->mdraft, s->msurv, &s->n_mdraft, &mt) != 0)
         return -1;
     *maintenance = mt.maintenance;
@@ -1141,6 +1309,9 @@ static int prepare_cycle(struct janas_llm_session *s, uint32_t pos,
         s->pending.controller_seconds = controller_time;
         s->pending_reuse = s->last_reuse;
         s->pending_vocab_epoch = vocab_epoch;
+        hd.proposal_id = s->pending.proposal_id;
+        hd.vocab_key = janas_cycle_vocab_key(policy, rows);
+        s->hybrid_pending = hd;
         s->metrics.proposals += s->n_mdraft > 0;
     } else {
         s->n_mdraft = 0;
@@ -1168,7 +1339,8 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     double t0 = now();
     int measured = cycle_mode(s);
     int drafts_wanted = o->spec_mode == JANAS_SPEC_MTP || o->spec_mode == JANAS_SPEC_HYBRID;
-    int plan = !measured && s->mtp && drafts_wanted && o->spec_auto;
+    int cost_hybrid = hybrid_cost(s);
+    int plan = (!measured || cost_hybrid) && s->mtp && drafts_wanted && o->spec_auto;
     int32_t block[MAX_SPEC_K + 1];
     block[0] = s->hist[pos];
     int nd = 0;
@@ -1176,6 +1348,8 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     struct janas_gen_cycle current = s->pending;
     uint64_t current_vocab_epoch = current.proposal_id ? s->pending_vocab_epoch : 0;
     unsigned current_reuse = current.proposal_id ? s->pending_reuse : 2;
+    s->hybrid_current = s->hybrid_pending;
+    memset(&s->hybrid_pending, 0, sizeof(s->hybrid_pending));
     if (!current.proposal_id) {
         current.proposal_id = ++s->next_proposal_id;
         current.source = JANAS_GEN_SOURCE_PLAIN;
@@ -1190,6 +1364,10 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     memset(&s->pending, 0, sizeof(s->pending));
     if (measured) {
         nd = s->n_mdraft;
+        if (cost_hybrid && current.planner_source == JANAS_GEN_SOURCE_MTP && plan) {
+            nd = plan_drafts(mtp_planner(s), s->msurv, s->n_mdraft);
+            if (!nd && s->n_mdraft > 0 && s->st.passes % 16 == 0) nd = 1;
+        }
         if (s->has_filter || o->presence_penalty != 0 || o->frequency_penalty != 0)
             nd = 0;
         memcpy(block + 1, s->mdraft, (size_t)nd * sizeof(int32_t));
@@ -1302,11 +1480,20 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     double runtime_control = now() - tr;
     double tp = now();
     if (janas_llm_model_forward(m, block, (uint32_t)nd + 1, pos, s->logits,
-                                1) != 0)
+                                1) != 0) {
+        hybrid_settle(s, 0);
         return -1;
+    }
     double dt = now() - tp;
     tr = now();
     janas_llm_model_runtime_stats(m, &runtime_after);
+    s->hybrid_incoming_recovery = 0;
+    if (cost_hybrid && s->hybrid_waiting) {
+        double recovery = runtime_after.gdn_recovery_seconds - runtime_before.gdn_recovery_seconds;
+        recovery = fmin(dt, fmax(0, recovery));
+        hybrid_settle(s, recovery);
+        s->hybrid_incoming_recovery = recovery;
+    }
     if (runtime_after.expert_groups > runtime_before.expert_groups &&
         runtime_after.expert_assignments >= runtime_before.expert_assignments) {
         uint64_t groups = runtime_after.expert_groups - runtime_before.expert_groups;
@@ -1363,7 +1550,8 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
         s->st.pass_seconds[nd + 1] += dt;
     }
     if ((plan || copies) && !settling_now && learn) {
-        double *tt = &s->pl.t[nd + 1];
+        struct planner *p = cost_hybrid ? mtp_planner(s) : &s->pl;
+        double *tt = &p->t[nd + 1];
         *tt = *tt > 0 ? 0.8 * *tt + 0.2 * cost : cost;
     }
     if (o->spec_mode == JANAS_SPEC_DRAFT && nd > 0)
@@ -1384,10 +1572,12 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     /* what a draft of that guessed chance was worth, whoever asked for it:
        the planner only learns about the bins it tries, so drafts made under
        a fixed threshold teach it too */
-    if (!measured && current.source == JANAS_GEN_SOURCE_MTP && !o->draft_vocab_policy)
+    if ((!measured || cost_hybrid) && current.source == JANAS_GEN_SOURCE_MTP &&
+        (!o->draft_vocab_policy || cost_hybrid))
         for (int i = 0; i < nd; i++) {
-            s->pl.tried[cal_bin(s->msurv[i])] += 1;
-            s->pl.won[cal_bin(s->msurv[i])] += i < acc;
+            struct planner *p = cost_hybrid ? mtp_planner(s) : &s->pl;
+            p->tried[cal_bin(s->msurv[i])] += 1;
+            p->won[cal_bin(s->msurv[i])] += i < acc;
         }
     /* a pass run while the expert cache is still filling in the background
        measures the disk, not the drafts: it teaches nothing */
@@ -1429,6 +1619,11 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     /* the MTP rows of the new tokens always (the block's KV cache must stay
        complete for later turns), drafts only when generation goes on */
     double maintenance = 0;
+    if (cost_hybrid && current.planner_source == JANAS_GEN_SOURCE_LOOKUP && nd && !acc) {
+        unsigned key = janas_cycle_vocab_key(current.draft_vocab_policy, current.draft_vocab_rows);
+        unsigned cls = janas_hybrid_suffix_class(current.lookup_suffix);
+        s->hybrid.cooldown_until[!!current.warm][key][cls] = s->hybrid.cycles + 33;
+    }
     if (measured) {
         if (prepare_cycle(s, pos, (uint32_t)acc, t, &maintenance) != 0)
             return -1;
@@ -1503,6 +1698,10 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     s->metrics.source_drafted[current.source] += (uint32_t)nd;
     s->metrics.source_accepted[current.source] += (uint32_t)acc;
     s->metrics.source_seconds[current.source] += current.total_seconds;
+    if (cost_hybrid && current.planner_source == JANAS_GEN_SOURCE_LOOKUP) {
+        s->hybrid_metrics.lookup_drafted += (uint32_t)nd;
+        s->hybrid_metrics.lookup_accepted += (uint32_t)acc;
+    }
     if (current.source == JANAS_GEN_SOURCE_LOOKUP && current.lookup_suffix <= 8)
         s->metrics.lookup_suffix_count[current.lookup_suffix]++;
     s->metrics.pass_width_count[nd + 1]++;

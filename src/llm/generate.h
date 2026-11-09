@@ -66,6 +66,8 @@ struct janas_gen_options {
     int spec_explore_percent; /* cycle planner probes, 0..100 */
     int draft_vocab_policy; /* 0: legacy, 1: adaptive draft-only head */
     uint32_t draft_vocab_rows; /* 0: auto, or 8192/16384/32768 */
+    int hybrid_policy; /* 0 legacy, 1 cost-aware source selection */
+    int hybrid_lookup_max_drafts, hybrid_mtp_max_drafts, hybrid_probe_percent;
 };
 
 enum janas_gen_source {
@@ -113,6 +115,23 @@ struct janas_gen_metrics {
     double abandoned_preparation_seconds, pending_preparation_seconds;
     uint32_t buffered_tokens;
     struct janas_gen_cycle last;
+};
+
+struct janas_gen_hybrid_decision {
+    uint64_t proposal_id;
+    uint32_t source, requested_depth, lookup_available, lookup_suffix, suffix_class;
+    uint32_t reason, probe, warm, vocab_key, lookup_evidence, mtp_evidence;
+    uint32_t accepted_prefix, delivered, pass_width;
+    double lookup_utility, mtp_utility, predicted_seconds;
+    double causal_seconds, recovery_seconds;
+};
+struct janas_gen_hybrid_metrics {
+    uint64_t decisions, offered_matches, eligible_matches;
+    uint64_t lookup_selected, mtp_selected, probes, cooldown_skips;
+    uint64_t lookup_drafted, lookup_accepted, lookup_delivered, mtp_delivered;
+    uint64_t reason_count[12], lookup_depth_count[17];
+    double lookup_seconds, mtp_seconds, recovery_reassigned_seconds;
+    struct janas_gen_hybrid_decision last;
 };
 
 struct janas_gen_stats {
@@ -270,6 +289,8 @@ void janas_llm_session_stats(const struct janas_llm_session *s,
                              struct janas_gen_stats *st);
 void janas_llm_session_metrics(const struct janas_llm_session *s,
                                struct janas_gen_metrics *out);
+void janas_llm_session_hybrid_metrics(const struct janas_llm_session *s,
+                                      struct janas_gen_hybrid_metrics *out);
 /* Remaining outputs requested by the caller, including buffered tokens.
    UINT32_MAX means unknown (the session default). This is only a work hint. */
 void janas_llm_session_reply_remaining(struct janas_llm_session *s,

@@ -497,6 +497,9 @@ static int32_t run_one(struct srv_engine *e, struct srv_job *j, int k)
         .size = sizeof(speculation), .version = JANAS_LLM_SPEC_METRICS_VERSION};
     int speculation_valid = k == 0 &&
         janas_llm_chat_speculation_metrics(c, &speculation) == JANAS_LLM_OK;
+    struct janas_llm_hybrid_metrics hybrid = {
+        .size = sizeof(hybrid), .version = JANAS_LLM_HYBRID_METRICS_VERSION};
+    int hybrid_valid = k == 0 && janas_llm_chat_hybrid_metrics(c, &hybrid) == JANAS_LLM_OK;
     if (k == 0 && e->warn_input && st.prompt_tokens > e->warn_input &&
         rc != JANAS_LLM_ELIMIT)
         fprintf(stderr,
@@ -509,6 +512,7 @@ static int32_t run_one(struct srv_engine *e, struct srv_job *j, int k)
         j->st = st;
         j->speculation = speculation;
         j->speculation_valid = speculation_valid;
+        j->hybrid = hybrid; j->hybrid_valid = hybrid_valid;
     }
     /* the prompt is counted once, as OpenAI counts it: each prompt's */
     int per = j->kind == JOB_TEXT ? j->n_choices / j->n_prompts : j->n_choices;

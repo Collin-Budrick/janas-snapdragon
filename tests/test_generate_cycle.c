@@ -7,6 +7,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "llm/model.h"
 
@@ -15,6 +16,8 @@
 struct janas_llm_model {
     uint32_t ctx, period, last_pos, last_n, max_width;
     int bad_drafts, peaky;
+    float draft_conf;
+    double recovery_on_next;
     int invalid_calls, invalid_prepare, prepare_calls, feedback_calls;
     uint32_t forward_calls, mtp_calls, mtp_rows, note_rows;
     int32_t last_tokens[JANAS_LLM_MAX_BLOCK];
@@ -25,7 +28,21 @@ struct janas_llm_model {
     struct janas_llm_runtime_stats runtime;
 };
 
+/* Planner decisions must depend on the fixture's work, never on scheduler
+ * jitter from concurrent model runs or compiler jobs. Only the included
+ * generator uses this clock; production timing is compiled unchanged. */
+static uint64_t fixture_clock_ticks;
+static int fixture_clock_gettime(clockid_t clock_id, struct timespec *ts)
+{
+    (void)clock_id;
+    uint64_t tick = ++fixture_clock_ticks;
+    ts->tv_sec = (time_t)(tick / UINT64_C(10000000));
+    ts->tv_nsec = (long)((tick % UINT64_C(10000000)) * 100);
+    return 0;
+}
+#define clock_gettime fixture_clock_gettime
 #include "../src/llm/generate.c"
+#undef clock_gettime
 
 static int failures;
 #define CHECK(c, text) do { if (!(c)) { \
@@ -37,6 +54,7 @@ static void model_init(struct janas_llm_model *m)
     memset(m, 0, sizeof(*m));
     m->ctx = MOCK_CTX;
     m->period = MOCK_VOCAB;
+    m->draft_conf = 0.99f;
     for (size_t i = 0; i < sizeof(m->mtp_tokens) / sizeof(*m->mtp_tokens); i++)
         m->mtp_tokens[i] = -1;
 }
@@ -143,6 +161,8 @@ int janas_llm_model_forward(struct janas_llm_model *m, const int32_t *tokens,
     m->last_n = n;
     m->last_logits = logits;
     m->forward_calls++;
+    m->runtime.gdn_recovery_seconds += m->recovery_on_next;
+    m->recovery_on_next = 0;
     /* Two observed assignments per group: a constant high-reuse context.
      * Counters advance only after target work, never from a future router. */
     m->runtime.expert_assignments += (uint64_t)n * 2;
@@ -186,7 +206,7 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
         return -1;
     *token = m->bad_drafts ? (tokens[n - 1] + 9) % MOCK_VOCAB
                           : next_token(m, tokens[n - 1]);
-    *conf = 0.99f;
+    *conf = m->draft_conf;
     m->costs.head_calls++;
     m->costs.head_seconds += 1e-6;
     return 0;
@@ -275,7 +295,7 @@ static void canonical_mtp(const struct janas_llm_session *s,
 }
 
 static void paired_transcript(int mode, int planner, int bad, float temperature,
-                              int guarded, int adaptive)
+                               int guarded, int adaptive, int cost_hybrid)
 {
     struct janas_llm_model a, b;
     model_init(&a); model_init(&b); b.bad_drafts = bad;
@@ -286,6 +306,12 @@ static void paired_transcript(int mode, int planner, int bad, float temperature,
         oa.frequency_penalty = ob.frequency_penalty = 0.2f;
     }
     ob.draft_vocab_policy = adaptive;
+    if (cost_hybrid) {
+        ob.hybrid_policy = 1;
+        ob.hybrid_lookup_max_drafts = ob.spec_k = 8;
+        ob.hybrid_mtp_max_drafts = 4;
+        ob.hybrid_probe_percent = 2;
+    }
     struct janas_llm_session *sa = janas_llm_session_create(&a, &oa);
     struct janas_llm_session *sb = janas_llm_session_create(&b, &ob);
     CHECK(sa && sb, "paired sessions created");
@@ -357,12 +383,19 @@ static void paired_transcript(int mode, int planner, int bad, float temperature,
     janas_llm_session_destroy(sa); janas_llm_session_destroy(sb);
 }
 
-static void unread_rewind(float temperature)
+static void unread_rewind(float temperature, int cost_hybrid)
 {
     struct janas_llm_model a, b;
     model_init(&a); model_init(&b); a.peaky = b.peaky = 1;
     struct janas_gen_options oa = options(JANAS_SPEC_OFF, 0, temperature);
     struct janas_gen_options ob = options(JANAS_SPEC_MTP, 2, temperature);
+    if (cost_hybrid) {
+        ob.spec_mode = JANAS_SPEC_HYBRID;
+        ob.spec_k = 8;
+        ob.hybrid_policy = 1;
+        ob.hybrid_lookup_max_drafts = 8;
+        ob.hybrid_mtp_max_drafts = 4;
+    }
     struct janas_llm_session *sa = janas_llm_session_create(&a, &oa);
     struct janas_llm_session *sb = janas_llm_session_create(&b, &ob);
     CHECK(sa && sb, "unread sessions created");
@@ -398,12 +431,19 @@ static void unread_rewind(float temperature)
     janas_llm_session_destroy(sa); janas_llm_session_destroy(sb);
 }
 
-static void reseed_after_unread(void)
+static void reseed_after_unread(int cost_hybrid)
 {
     struct janas_llm_model a, b;
     model_init(&a); model_init(&b); a.peaky = b.peaky = 1;
     struct janas_gen_options oa = options(JANAS_SPEC_OFF, 0, 1.0f);
     struct janas_gen_options ob = options(JANAS_SPEC_MTP, 2, 1.0f);
+    if (cost_hybrid) {
+        ob.spec_mode = JANAS_SPEC_HYBRID;
+        ob.spec_k = 8;
+        ob.hybrid_policy = 1;
+        ob.hybrid_lookup_max_drafts = 8;
+        ob.hybrid_mtp_max_drafts = 4;
+    }
     struct janas_llm_session *sa = janas_llm_session_create(&a, &oa);
     struct janas_llm_session *sb = janas_llm_session_create(&b, &ob);
     CHECK(sa && sb, "reseed sessions created");
@@ -600,6 +640,245 @@ static void lookup_eos_context(void)
     janas_llm_session_destroy(s);
 }
 
+static struct janas_gen_options cost_options(float temperature)
+{
+    struct janas_gen_options o = options(JANAS_SPEC_HYBRID, 1, temperature);
+    o.spec_k = o.hybrid_lookup_max_drafts = 8;
+    o.hybrid_mtp_max_drafts = 4;
+    o.hybrid_policy = 1;
+    return o;
+}
+
+static void cost_fallback_confidence(float temperature, int confidence_stop)
+{
+    struct janas_llm_model a, b;
+    model_init(&a); model_init(&b);
+    a.draft_conf = b.draft_conf = 0.9f;
+    struct janas_gen_options oa = options(JANAS_SPEC_MTP, 0, temperature);
+    struct janas_gen_options ob = cost_options(temperature);
+    oa.spec_auto = ob.spec_auto = 1;
+    oa.spec_min_conf = ob.spec_min_conf = confidence_stop ? 0.8f : 0;
+    struct janas_llm_session *sa = janas_llm_session_create(&a, &oa);
+    struct janas_llm_session *sb = janas_llm_session_create(&b, &ob);
+    CHECK(sa && sb, "legacy MTP4/cost-fallback sessions created");
+    if (!sa || !sb) {
+        janas_llm_session_destroy(sa); janas_llm_session_destroy(sb); return;
+    }
+    int32_t prompt[] = {0, 1, 2, 3, 0, 1, 2, 3};
+    int32_t turn[] = {8, 9, 10};
+    for (unsigned reply = 0; reply < 2; reply++) {
+        CHECK(janas_llm_session_append(sa, reply ? turn : prompt, reply ? 3 : 8) == 0 &&
+              janas_llm_session_append(sb, reply ? turn : prompt, reply ? 3 : 8) == 0,
+              "fallback comparison appends identical turns");
+        a.max_width = b.max_width = 0; /* decode shapes, excluding prefill */
+        janas_llm_session_mark(sa); janas_llm_session_mark(sb);
+        janas_llm_session_reply_remaining(sa, 64);
+        janas_llm_session_reply_remaining(sb, 64);
+        for (unsigned i = 0; i < 64; i++) {
+            int32_t ta = -1, tb = -1;
+            CHECK(janas_llm_session_next(sa, &ta) == 0 &&
+                  janas_llm_session_next(sb, &tb) == 0 && ta == tb,
+                  "cost fallback preserves exact legacy greedy/seeded target transcript");
+            CHECK(sa->n_mdraft == sb->n_mdraft && sa->n_mdraft <= 4,
+                  "lookup disabled retains calibrated MTP4 depth and confidence stopping");
+            CHECK(a.costs.head_calls == b.costs.head_calls,
+                  "fallback head/chain calls equal legacy rather than alternate cycle planner");
+        }
+    }
+    CHECK(memcmp(sa->pl.tried, sb->pl.tried, sizeof(sa->pl.tried)) == 0 &&
+          memcmp(sa->pl.won, sb->pl.won, sizeof(sa->pl.won)) == 0,
+          "cost fallback updates the same legacy confidence calibration bins");
+    if (confidence_stop)
+        CHECK(a.max_width <= 3 && b.max_width <= 3,
+              "configured minimum confidence stops recursively multiplied draft probabilities");
+    CHECK(sb->metrics.source_drafted[JANAS_GEN_SOURCE_LOOKUP] == 0 &&
+          sb->hybrid_metrics.mtp_selected > 0,
+          "zero exploration and no lookup evidence use MTP for every proposed draft");
+    canonical_mtp(sb, &b);
+    janas_llm_session_destroy(sa); janas_llm_session_destroy(sb);
+}
+
+static void train_cost_lookup(struct janas_llm_session *s)
+{
+    struct janas_hybrid_observation o = {
+        JANAS_HYBRID_MTP, 4, 4, 5, 5, 0, 1, 0, 2, 1.0, 0.8
+    };
+    for (unsigned i = 0; i < 3; i++) janas_hybrid_observe(&s->hybrid, &o);
+    o.source = JANAS_HYBRID_LOOKUP; o.depth = o.accepted_prefix = 8;
+    o.delivered = o.pass_width = 9; o.lookup_suffix = 8;
+    o.seconds = 0.001; o.verification_seconds = 0.0008;
+    for (unsigned i = 0; i < 3; i++) janas_hybrid_observe(&s->hybrid, &o);
+}
+
+static void cost_lookup_maintenance_and_recovery(void)
+{
+    struct janas_llm_model m;
+    model_init(&m); m.period = 4;
+    struct janas_gen_options o = cost_options(0);
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "cost-positive lookup session created");
+    if (!s) return;
+    train_cost_lookup(s);
+    int32_t prompt[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+    CHECK(janas_llm_session_append(s, prompt, 12) == 0,
+          "positive exact history continuation appended");
+    m.max_width = 0; /* exclude the twelve-token prompt prefill */
+    janas_llm_session_reply_remaining(s, 96);
+    for (unsigned i = 0; i < 96; i++) {
+        int32_t token = -1;
+        CHECK(janas_llm_session_next(s, &token) == 0 && token == (int32_t)(i % 4),
+              "trained lookup delivers identical periodic target continuation");
+        if (!i) m.max_width = 0; /* first next also performs lazy prefill */
+    }
+    CHECK(s->hybrid_metrics.lookup_selected > 0 &&
+          s->metrics.source_drafted[JANAS_GEN_SOURCE_LOOKUP] > 0 &&
+          m.costs.head_calls == 0 && m.mtp_rows >= 96,
+          "beneficial lookup skips all MTP head scoring but maintains native MTP state");
+    CHECK(m.max_width <= 9 && !m.invalid_calls && !m.invalid_prepare,
+          "lookup8 never exceeds nine verified inputs or valid target-row access");
+    if (m.max_width > 9 || m.invalid_calls || m.invalid_prepare)
+        printf("lookup fixture width=%u invalid_calls=%d invalid_prepare=%d\n",
+               m.max_width, m.invalid_calls, m.invalid_prepare);
+    canonical_mtp(s, &m);
+    uint64_t hits = s->metrics.lookup_hits;
+    uint64_t learned = s->hybrid_metrics.lookup_selected;
+    janas_llm_session_reset(s);
+    int32_t fresh[] = {10, 11, 12};
+    m.period = MOCK_VOCAB;
+    CHECK(janas_llm_session_append(s, fresh, 3) == 0,
+          "new conversation after retained controller reset accepts unique prompt");
+    int32_t fresh_token = -1;
+    CHECK(janas_llm_session_next(s, &fresh_token) == 0 && fresh_token == 13 &&
+          s->metrics.lookup_hits == hits &&
+          s->hybrid_metrics.lookup_selected == learned &&
+          s->pending.planner_source == JANAS_GEN_SOURCE_MTP,
+          "retained learned costs never reuse another conversation's indexed tokens");
+    janas_llm_session_destroy(s);
+
+    model_init(&m); m.period = 4;
+    s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "cost lookup rejection session created");
+    if (!s) return;
+    train_cost_lookup(s);
+    CHECK(janas_llm_session_append(s, prompt, 12) == 0,
+          "rejection history continuation appended");
+    janas_llm_session_reply_remaining(s, 32);
+    int32_t token;
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 0 &&
+          s->pending.planner_source == JANAS_GEN_SOURCE_LOOKUP,
+          "rejection fixture prepares lookup before target behavior changes");
+    m.period = 1;
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 0 &&
+          s->metrics.last.source == JANAS_GEN_SOURCE_LOOKUP &&
+          s->metrics.last.accepted_prefix == 0 && s->hybrid_waiting,
+          "first lookup mismatch leaves its causal observation pending for fused recovery");
+    CHECK(s->pending.planner_source == JANAS_GEN_SOURCE_MTP &&
+          s->n_mdraft <= 4 && m.costs.head_calls > 0,
+          "rejected lookup falls back before scoring the subsequent MTP4 proposal");
+    m.recovery_on_next = 1e-8;
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 0 &&
+          s->hybrid_metrics.recovery_reassigned_seconds > 0 &&
+          s->hybrid_incoming_recovery > 0,
+          "nested next-forward recovery is transferred to the preceding rejected lookup once");
+    CHECK(!m.invalid_calls && !m.invalid_prepare,
+          "source changes preserve valid replay and MTP state maintenance");
+    canonical_mtp(s, &m);
+    janas_llm_session_destroy(s);
+}
+
+static void cost_recovery_conservation(void)
+{
+    struct janas_llm_model m;
+    model_init(&m);
+    struct janas_gen_options o = cost_options(0);
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "causal recovery fixture created");
+    if (!s) return;
+    s->metrics.cycle_seconds = 1.1;
+    s->metrics.last = (struct janas_gen_cycle){
+        .source = JANAS_GEN_SOURCE_LOOKUP, .planner_source = JANAS_GEN_SOURCE_LOOKUP,
+        .pass_width = 5, .accepted_prefix = 1, .delivered = 2, .rejected_rows = 3,
+        .lookup_suffix = 8, .warm = 1, .total_seconds = .5, .verification_seconds = .4
+    };
+    s->observation_pending = 1; s->observation_reuse = 2;
+    finish_cycle(s);
+    CHECK(s->hybrid_waiting && !s->hybrid.lookup[1][0][2][4].count,
+          "rejected source is not learned before its next-forward recovery is known");
+    hybrid_settle(s, .07);
+    CHECK(fabs(s->hybrid.lookup[1][0][2][4].seconds - .57) < 1e-12 &&
+          fabs(s->hybrid_metrics.lookup_seconds - .57) < 1e-12,
+          "source causing rejection receives its nested recovery exactly once");
+    s->metrics.last = (struct janas_gen_cycle){
+        .source = JANAS_GEN_SOURCE_MTP, .planner_source = JANAS_GEN_SOURCE_MTP,
+        .pass_width = 3, .accepted_prefix = 2, .delivered = 3, .warm = 1,
+        .total_seconds = .6, .verification_seconds = .4
+    };
+    s->hybrid_incoming_recovery = .07;
+    s->observation_pending = 1;
+    finish_cycle(s);
+    CHECK(fabs(s->hybrid.mtp[1][0].seconds - .53) < 1e-12 &&
+          fabs(s->hybrid_metrics.lookup_seconds + s->hybrid_metrics.mtp_seconds - 1.1) < 1e-12 &&
+          s->metrics.cycle_seconds == 1.1,
+          "recovery reassignment conserves complete wall-clock cost across alternating sources");
+    hybrid_settle(s, .07);
+    CHECK(fabs(s->hybrid_metrics.recovery_reassigned_seconds - .07) < 1e-12,
+          "repeated settle cannot charge nested recovery twice");
+    janas_llm_session_destroy(s);
+}
+
+static void cost_stops_and_context(void)
+{
+    struct janas_llm_model m;
+    struct janas_gen_options o = cost_options(0);
+    int32_t start = 3, token = -1;
+    model_init(&m); o.eos = 7;
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s && janas_llm_session_append(s, &start, 1) == 0,
+          "cost-aware EOS fixture created");
+    if (!s) return;
+    for (int i = 0; i < 4; i++)
+        CHECK(janas_llm_session_next(s, &token) == 0 && token == i + 4,
+              "cost MTP fallback reaches EOS at unchanged target position");
+    CHECK(token == 7 && s->n_mdraft == 0 && s->ret == s->n,
+          "cost hybrid stops scoring and buffers no tokens beyond EOS");
+    janas_llm_session_destroy(s);
+
+    model_init(&m); o.eos = -1; o.n_stop = 1; o.stop[0] = 6;
+    s = janas_llm_session_create(&m, &o);
+    CHECK(s && janas_llm_session_append(s, &start, 1) == 0,
+          "cost-aware secondary stop fixture created");
+    if (!s) return;
+    for (int i = 0; i < 3; i++)
+        CHECK(janas_llm_session_next(s, &token) == 0 && token == i + 4,
+              "secondary stop retains exact target token sequence");
+    CHECK(token == 6 && !s->n_mdraft && s->ret == s->n,
+          "cost hybrid constructs no unused proposal beyond secondary stop");
+    janas_llm_session_destroy(s);
+
+    model_init(&m); m.ctx = 8; o.n_stop = 0;
+    s = janas_llm_session_create(&m, &o);
+    int32_t near_end[] = {0, 1, 2, 3, 4, 5, 6};
+    CHECK(s && janas_llm_session_append(s, near_end, 7) == 0,
+          "cost-aware context-bound fixture created");
+    if (!s) return;
+    for (unsigned i = 0; i < 2; i++)
+        CHECK(janas_llm_session_next(s, &token) == 0,
+              "cost-aware fallback uses remaining legal context inputs");
+    CHECK(janas_llm_session_next(s, &token) == 1 && !m.invalid_calls,
+          "cost hybrid source ceilings cannot exceed known context capacity");
+    janas_llm_session_destroy(s);
+
+    model_init(&m); s = janas_llm_session_create(&m, &o);
+    CHECK(s && janas_llm_session_append(s, &start, 1) == 0,
+          "cost-aware one-token reply fixture created");
+    if (!s) return;
+    janas_llm_session_reply_remaining(s, 1);
+    CHECK(janas_llm_session_next(s, &token) == 0 &&
+          m.costs.head_calls == 0 && !s->n_mdraft && s->ret == s->n,
+          "one-token reply clips both source caps before unused MTP head work");
+    janas_llm_session_destroy(s);
+}
+
 int main(void)
 {
     {
@@ -623,18 +902,31 @@ int main(void)
     }
     for (int sampled = 0; sampled < 2; sampled++) {
         float temp = sampled ? 1.0f : 0.0f;
-        paired_transcript(JANAS_SPEC_MTP, 0, 0, temp, 0, 0);
-        paired_transcript(JANAS_SPEC_MTP, 1, 0, temp, 0, 0);
-        paired_transcript(JANAS_SPEC_MTP, 2, 0, temp, 0, 1);
-        paired_transcript(JANAS_SPEC_MTP, 2, 1, temp, 0, 0);
-        paired_transcript(JANAS_SPEC_HYBRID, 2, 0, temp, 0, 0);
-        paired_transcript(JANAS_SPEC_HYBRID, 1, 0, temp, 3, 1);
-        unread_rewind(temp);
+        paired_transcript(JANAS_SPEC_MTP, 0, 0, temp, 0, 0, 0);
+        paired_transcript(JANAS_SPEC_MTP, 1, 0, temp, 0, 0, 0);
+        paired_transcript(JANAS_SPEC_MTP, 2, 0, temp, 0, 1, 0);
+        paired_transcript(JANAS_SPEC_MTP, 2, 1, temp, 0, 0, 0);
+        paired_transcript(JANAS_SPEC_HYBRID, 2, 0, temp, 0, 0, 0);
+        paired_transcript(JANAS_SPEC_HYBRID, 1, 0, temp, 3, 1, 0);
+        paired_transcript(JANAS_SPEC_HYBRID, 1, 0, temp, 0, 0, 1);
+        paired_transcript(JANAS_SPEC_HYBRID, 1, 1, temp, 0, 0, 1);
+        paired_transcript(JANAS_SPEC_HYBRID, 1, 0, temp, 3, 0, 1);
+        paired_transcript(JANAS_SPEC_HYBRID, 1, 0, temp, 0, 1, 1);
+        unread_rewind(temp, 0);
+        unread_rewind(temp, 1);
     }
-    reseed_after_unread();
+    reseed_after_unread(0);
+    reseed_after_unread(1);
     abandoned_cycle_observation();
     late_hybrid_lookup();
     lookup_eos_context();
+    cost_fallback_confidence(0, 0);
+    cost_fallback_confidence(1, 0);
+    cost_fallback_confidence(0, 1);
+    cost_fallback_confidence(1, 1);
+    cost_lookup_maintenance_and_recovery();
+    cost_recovery_conservation();
+    cost_stops_and_context();
     printf("test_generate_cycle: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

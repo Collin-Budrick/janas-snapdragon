@@ -66,3 +66,36 @@ void janas_spec_metrics_json(struct janas_buf *b,
         m->last.sample_seconds, m->last.maintenance_seconds,
         m->last.controller_seconds, m->last.total_seconds);
 }
+
+void janas_hybrid_metrics_json(struct janas_buf *b,
+                                const struct janas_llm_hybrid_metrics *m)
+{
+    janas_buf_puts(b, "{\"schema\":1,\"scope\":\"current_reply\","
+        "\"reason_order\":[\"no_match\",\"no_evidence\",\"mtp_cheaper\",\"lookup_faster\","
+        "\"lookup_probe\",\"mtp_refresh\",\"cooldown\",\"no_capacity\"],"
+        "\"cost_scope\":\"causal_full_cycles_recovery_reassigned_once\",\"recovery_attribution\":\"fused_gdn_row_share_estimate\"");
+#define U(f) janas_buf_printf(b, ",\"" #f "\":%llu", (unsigned long long)m->f)
+#define F(f) janas_buf_printf(b, ",\"" #f "\":%.9g", m->f)
+    U(decisions); U(offered_matches); U(eligible_matches);
+    U(lookup_selected); U(mtp_selected); U(probes); U(cooldown_skips);
+    U(lookup_drafted); U(lookup_accepted); U(lookup_delivered); U(mtp_delivered);
+    F(lookup_seconds); F(mtp_seconds); F(recovery_reassigned_seconds);
+#undef U
+#undef F
+#define A(f, n) do { janas_buf_puts(b, ",\"" #f "\":["); \
+    for (unsigned i = 0; i < (n); i++) \
+        janas_buf_printf(b, "%s%llu", i ? "," : "", (unsigned long long)m->f[i]); \
+    janas_buf_puts(b, "]"); } while (0)
+    A(reason_count, 12); A(lookup_depth_count, 17);
+#undef A
+    janas_buf_puts(b, ",\"last\":{");
+#define L(f) janas_buf_printf(b, "\"" #f "\":%llu,", (unsigned long long)m->last.f)
+    L(proposal_id); L(source); L(requested_depth); L(lookup_available); L(lookup_suffix);
+    L(suffix_class); L(reason); L(probe); L(warm); L(vocab_key);
+    L(lookup_evidence); L(mtp_evidence); L(accepted_prefix); L(delivered); L(pass_width);
+#undef L
+    janas_buf_printf(b, "\"lookup_utility\":%.9g,\"mtp_utility\":%.9g,"
+        "\"predicted_seconds\":%.9g,\"causal_seconds\":%.9g,\"recovery_seconds\":%.9g}}",
+        m->last.lookup_utility, m->last.mtp_utility, m->last.predicted_seconds,
+        m->last.causal_seconds, m->last.recovery_seconds);
+}

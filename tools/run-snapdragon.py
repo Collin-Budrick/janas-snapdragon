@@ -20,7 +20,10 @@ policy. Optional case.npu_min_macs is 0..2^63-1 (default 0); a positive value
 filters Hexagon matrices by rows*columns*batch before preparing device weights.
 Optional case.spec_planner is legacy/cycle/fixed (default legacy), spec_explore
 is an integer in 0..100 (default 20), draft_vocab is legacy/adaptive (default
-legacy), and draft_vocab_rows is 0/8192/16384/32768 (default 0). MTP and hybrid
+legacy), and draft_vocab_rows is 0/8192/16384/32768 (default 0). Optional
+hybrid_policy is legacy/cost (default legacy); lookup_drafts and mtp_drafts
+are independent 1..16 ceilings (defaults 8 and 4), clipped by draft_tokens.
+hybrid_probe_percent is 0..100 (default 2). MTP and hybrid
 modes require a frozen mtp identity. Optional integer gdn_chain, gdn_journal
 and gdn_k_only are 0/1 (default 0); journal requires chain, and k_only requires
 journal. Optional panels is auto/off/experimental (default auto), selecting
@@ -54,6 +57,7 @@ PROFILES = {"cpu": (False, False), "cpu+gpu": (True, False),
 DEVICES = {"cpu", "gpu", "npu", "npu+gpu"}
 MODES = {"none", "lookup", "mtp", "hybrid", "auto"}
 SPEC_PLANNERS = {"legacy", "cycle", "fixed"}
+HYBRID_POLICIES = {"legacy", "cost"}
 DRAFT_VOCAB_POLICIES = {"legacy", "adaptive"}
 DRAFT_VOCAB_ROWS = {0, 8192, 16384, 32768}
 PANEL_POLICIES = {"auto": None, "off": "0", "experimental": "1"}
@@ -65,6 +69,7 @@ PERFORMANCE_ENV = ("JANAS_KERNELS", "JANAS_EXPERTS", "JANAS_GPU_ALWAYS",
     "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS", "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL",
     "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES", "JANAS_SPEC_PLANNER",
     "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
+    "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT",
     "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY")
 PROFILE_ENV = {"JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG",
     "JANAS_TUNE", "JANAS_TUNE_THREADS", "JANAS_WARM", "JANAS_MISS_SKIP",
@@ -72,6 +77,7 @@ PROFILE_ENV = {"JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG",
     "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS",
     "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES", "JANAS_SPEC_PLANNER",
     "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
+    "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT",
     "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY"}
 
 
@@ -127,10 +133,16 @@ def load_profile(path: Path, root: Path = ROOT) -> dict[str, Any]:
     case = case.copy()
     for key, default, choices in (("spec_planner", "legacy", SPEC_PLANNERS),
                                   ("draft_vocab", "legacy", DRAFT_VOCAB_POLICIES),
+                                  ("hybrid_policy", "legacy", HYBRID_POLICIES),
                                   ("panels", "auto", PANEL_POLICIES)):
         case.setdefault(key, default)
         if not isinstance(case[key], str) or case[key] not in choices:
             raise ValueError(f"case.{key} must be one of: " + ", ".join(sorted(choices)))
+    for key, default, low, high in (("lookup_drafts", 8, 1, 16),
+                                      ("mtp_drafts", 4, 1, 16),
+                                      ("hybrid_probe_percent", 2, 0, 100)):
+        case.setdefault(key, default)
+        number(case[key], f"case.{key}", low, high, True)
     case.setdefault("spec_explore", 20)
     number(case["spec_explore"], "case.spec_explore", 0, 100, True)
     case.setdefault("draft_vocab_rows", 0)
@@ -207,6 +219,10 @@ def launch_environment(profile: dict[str, Any], inherited: dict[str, str]) -> di
             ("spec_explore", "JANAS_SPEC_EXPLORE", 20),
             ("draft_vocab", "JANAS_DRAFT_VOCAB_POLICY", "legacy"),
             ("draft_vocab_rows", "JANAS_DRAFT_VOCAB_ROWS", 0),
+            ("hybrid_policy", "JANAS_HYBRID_POLICY", "legacy"),
+            ("lookup_drafts", "JANAS_LOOKUP_DRAFTS", 8),
+            ("mtp_drafts", "JANAS_MTP_DRAFTS", 4),
+            ("hybrid_probe_percent", "JANAS_HYBRID_PROBE_PERCENT", 2),
             ("gdn_chain", "JANAS_GDN_CHAIN", 0),
             ("gdn_journal", "JANAS_GDN_JOURNAL", 0),
             ("gdn_k_only", "JANAS_GDN_K_ONLY", 0)):
@@ -246,6 +262,10 @@ def launch_command(profile: dict[str, Any], app: str, executable: Path,
         "--spec-explore", str(c.get("spec_explore", 20)),
         "--draft-vocab", c.get("draft_vocab", "legacy"),
         "--draft-vocab-rows", str(c.get("draft_vocab_rows", 0)),
+        "--hybrid-policy", c.get("hybrid_policy", "legacy"),
+        "--lookup-drafts", str(c.get("lookup_drafts", 8)),
+        "--mtp-drafts", str(c.get("mtp_drafts", 4)),
+        "--hybrid-probe-percent", str(c.get("hybrid_probe_percent", 2)),
         "--prompt-on", c["prompt_on"],
         "--drafts-on", c["drafts_on"], "--reply-on", c["reply_on"], "--think", "off"]
     if profile["mtp"] is not None and c["speculation"] in ("mtp", "hybrid", "auto"):

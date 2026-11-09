@@ -231,6 +231,8 @@ struct srv_job {
        use this job-owned snapshot under mu, never the live chat counters. */
     struct janas_llm_speculation_metrics speculation;
     int speculation_valid;
+    struct janas_llm_hybrid_metrics hybrid;
+    int hybrid_valid;
     uint32_t prompt_tokens;                       /* of every prompt, once */
     uint32_t completion_tokens, reasoning_tokens; /* of all of them */
     uint32_t queue_pos;       /* requests ahead of it, while it waits */

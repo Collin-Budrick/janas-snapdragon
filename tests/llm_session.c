@@ -12,6 +12,8 @@
  * Usage: llm_session <model.jns> <tokens.int32> [mtp=<mtp.jns>]
  *   [planner=legacy|cycle|fixed] [speculation=mtp|hybrid] [drafts=1..16]
  *   [draft_vocab=legacy|adaptive] [rows=0|8192|16384|32768]
+ *   [hybrid_policy=legacy|cost] [lookup_drafts=1..16] [mtp_drafts=1..16]
+ *   [hybrid_probe_percent=0..100]
  */
 #include <inttypes.h>
 #include <limits.h>
@@ -64,6 +66,8 @@ static int run_turns(struct janas_llm_model *m,
     struct janas_gen_metrics metrics;
     janas_llm_session_metrics(s, &metrics);
     janas_llm_mtp_costs(m, &after);
+    struct janas_gen_hybrid_metrics hybrid;
+    janas_llm_session_hybrid_metrics(s, &hybrid);
     ok &= metrics.cycles > 0 && metrics.delivered_tokens == G1 + G2;
     ok &= metrics.last.resolved_planner == (uint32_t)o->spec_planner;
     if (o->spec_mode == JANAS_SPEC_HYBRID)
@@ -83,6 +87,19 @@ static int run_turns(struct janas_llm_model *m,
            after.head_calls - before.head_calls, after.repacks - before.repacks,
            after.vocab_policy, after.vocab_rows, after.vocab_epoch,
            ok ? "verified" : "FAILED");
+    if (o->spec_mode == JANAS_SPEC_HYBRID && o->hybrid_policy == 1) {
+        ok &= hybrid.decisions > 0 && hybrid.mtp_selected > 0;
+        ok &= max_width <= (unsigned)o->spec_k + 1;
+        for (unsigned width = (unsigned)o->hybrid_lookup_max_drafts + 1;
+             width <= JANAS_GEN_MAX_K; width++)
+            ok &= hybrid.lookup_depth_count[width] == 0;
+        printf("hybrid: policy=cost decisions=%" PRIu64 " offered=%" PRIu64
+               " lookup=%" PRIu64 " mtp=%" PRIu64 " probes=%" PRIu64
+               " cooldown=%" PRIu64 " accepted=%" PRIu64 " %s\n",
+               hybrid.decisions, hybrid.offered_matches, hybrid.lookup_selected,
+               hybrid.mtp_selected, hybrid.probes, hybrid.cooldown_skips,
+               hybrid.lookup_accepted, ok ? "verified" : "FAILED");
+    }
     if (o->draft_vocab_policy && !metrics.source_drafted[JANAS_GEN_SOURCE_MTP])
         printf("adaptive head not exercised: no MTP proposal executed\n");
     janas_llm_session_destroy(s);
@@ -117,12 +134,15 @@ int main(int argc, char **argv)
                         "[mtp=<mtp.jns>] [planner=legacy|cycle|fixed] "
                         "[speculation=mtp|hybrid] [drafts=1..16] "
                         "[draft_vocab=legacy|adaptive] "
-                        "[rows=0|8192|16384|32768]\n");
+                        "[rows=0|8192|16384|32768] "
+                        "[hybrid_policy=legacy|cost] [lookup_drafts=1..16] "
+                        "[mtp_drafts=1..16] [hybrid_probe_percent=0..100]\n");
         return 2;
     }
     const char *mtp_path = NULL;
     int planner = 0, speculation = -1, vocab_policy = 0;
-    unsigned drafts = 4, rows = 0;
+    unsigned drafts = 4, rows = 0, lookup_drafts = 8, mtp_drafts = 4, hybrid_probe_percent = 2;
+    int hybrid_policy = 0;
     for (int i = 3; i < argc; i++) {
         const char *a = argv[i];
         if (!strncmp(a, "mtp=", 4) && a[4]) mtp_path = a + 4;
@@ -131,6 +151,14 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "planner=fixed")) planner = 2;
         else if (!strcmp(a, "speculation=mtp")) speculation = JANAS_SPEC_MTP;
         else if (!strcmp(a, "speculation=hybrid")) speculation = JANAS_SPEC_HYBRID;
+        else if (!strcmp(a, "hybrid_policy=legacy")) hybrid_policy = 0;
+        else if (!strcmp(a, "hybrid_policy=cost")) hybrid_policy = 1;
+        else if (!strncmp(a, "lookup_drafts=", 14) && unsigned_value(a + 14, &lookup_drafts) &&
+                 lookup_drafts >= 1 && lookup_drafts <= JANAS_GEN_MAX_K) { }
+        else if (!strncmp(a, "mtp_drafts=", 11) && unsigned_value(a + 11, &mtp_drafts) &&
+                 mtp_drafts >= 1 && mtp_drafts <= JANAS_GEN_MAX_K) { }
+        else if (!strncmp(a, "hybrid_probe_percent=", 21) && unsigned_value(a + 21, &hybrid_probe_percent) &&
+                 hybrid_probe_percent <= 100) { }
         else if (!strcmp(a, "draft_vocab=legacy")) vocab_policy = 0;
         else if (!strcmp(a, "draft_vocab=adaptive")) vocab_policy = 1;
         else if (!strncmp(a, "drafts=", 7) && unsigned_value(a + 7, &drafts) &&
@@ -201,7 +229,7 @@ int main(int argc, char **argv)
     }
     int mode = speculation >= 0 ? speculation
                                : mtp_path ? JANAS_SPEC_MTP : JANAS_SPEC_LOOKUP;
-    if ((mode == JANAS_SPEC_HYBRID || vocab_policy) && planner == 0)
+    if (((mode == JANAS_SPEC_HYBRID && !hybrid_policy) || vocab_policy) && planner == 0)
         planner = 1; /* match the generator's resolved hybrid default */
     if (((mode == JANAS_SPEC_MTP || mode == JANAS_SPEC_HYBRID) &&
          !janas_llm_model_has_mtp(m)) ||
@@ -211,10 +239,12 @@ int main(int argc, char **argv)
         return 2;
     }
     printf("settings: compute=%d io=%d planner=%s speculation=%s drafts=%u "
-           "draft_vocab=%s rows=%u quality=HIGH expert_bits=6 head_bits=0\n",
+           "draft_vocab=%s rows=%u quality=HIGH expert_bits=6 head_bits=0 "
+           "hybrid_policy=%s lookup_drafts=%u mtp_drafts=%u hybrid_probe_percent=%u\n",
            layout.n, ni, planner == 1 ? "cycle" : planner == 2 ? "fixed" : "legacy",
            mode == JANAS_SPEC_HYBRID ? "hybrid" : mode == JANAS_SPEC_MTP ? "mtp" : "lookup",
-           drafts, vocab_policy ? "adaptive" : "legacy", rows);
+           drafts, vocab_policy ? "adaptive" : "legacy", rows,
+           hybrid_policy ? "cost" : "legacy", lookup_drafts, mtp_drafts, hybrid_probe_percent);
     struct janas_gen_options greedy = {.spec_k = 1, .eos = -1};
     struct janas_gen_options spec = {.spec_mode = mode,
                                      .spec_k = (int)drafts,
@@ -222,7 +252,11 @@ int main(int argc, char **argv)
                                      .spec_planner = planner,
                                      .spec_explore_percent = 20,
                                      .draft_vocab_policy = vocab_policy,
-                                     .draft_vocab_rows = rows};
+                                     .draft_vocab_rows = rows,
+                                     .hybrid_policy = hybrid_policy,
+                                     .hybrid_lookup_max_drafts = (int)lookup_drafts,
+                                     .hybrid_mtp_max_drafts = (int)mtp_drafts,
+                                     .hybrid_probe_percent = (int)hybrid_probe_percent};
     int32_t g1[G1], g2[G2], h1[G1], h2[G2], once[G2];
     int32_t seq[NA + G1 + NB];
     int ok = 1;

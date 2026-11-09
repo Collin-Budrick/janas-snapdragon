@@ -102,6 +102,29 @@ int main(void)
         CHECK(!yyjson_obj_get(yyjson_obj_get(get_usage(d), "janas"), "speculation"));
         yyjson_doc_free(d);
     }
+    j.hybrid_valid = 1;
+    j.hybrid.decisions = 12; j.hybrid.lookup_selected = 3; j.hybrid.mtp_selected = 9;
+    j.hybrid.lookup_depth_count[8] = 2; j.hybrid.last.source = 1;
+    j.hybrid.last.lookup_utility = 25; j.hybrid.last.mtp_utility = 20;
+    j.hybrid.recovery_reassigned_seconds = 0.125;
+    d = usage(&j);
+    if (d) {
+        yyjson_val *h = yyjson_obj_get(yyjson_obj_get(get_usage(d), "janas"), "hybrid");
+        CHECK(yyjson_is_obj(h));
+        CHECK(yyjson_get_uint(yyjson_obj_get(h, "decisions")) == 12);
+        CHECK(yyjson_get_uint(yyjson_obj_get(h, "lookup_selected")) == 3);
+        CHECK(yyjson_get_uint(yyjson_arr_get(yyjson_obj_get(h, "lookup_depth_count"), 8)) == 2);
+        CHECK(yyjson_equals_str(yyjson_obj_get(h, "recovery_attribution"),
+                                "fused_gdn_row_share_estimate"));
+        CHECK(yyjson_get_real(yyjson_obj_get(h, "recovery_reassigned_seconds")) == 0.125);
+        yyjson_doc_free(d);
+    }
+    j.hybrid.last.lookup_utility = NAN;
+    d = usage(&j);
+    if (d) {
+        CHECK(!yyjson_obj_get(yyjson_obj_get(get_usage(d), "janas"), "hybrid"));
+        yyjson_doc_free(d);
+    }
     if (failures) return 1;
     puts("test_server_speculation: snapshot/object/scopes/legacy usage ok");
     return 0;

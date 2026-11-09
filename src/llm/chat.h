@@ -102,6 +102,7 @@ struct janas_llm_chat {
     struct janas_llm_chat_params p;
     int max_drafts; /* 0: the public API's default ceiling; else 1..16 */
     struct janas_llm_speculation_config spec_config;
+    struct janas_llm_hybrid_config hybrid_config;
     char *system;
     int replying;   /* a reply is being read */
     int closed;     /* the last reply ended with a stop token */
@@ -142,6 +143,7 @@ struct janas_llm_chat {
     /* counters */
     struct janas_gen_stats st0;
     struct janas_gen_metrics gm0;
+    struct janas_gen_hybrid_metrics hm0;
     struct janas_llm_runtime_stats rt0;
     struct janas_mtp_costs mt0;
     struct janas_expert_cache_stats cs0;

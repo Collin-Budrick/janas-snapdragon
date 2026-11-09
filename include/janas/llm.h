@@ -416,6 +416,50 @@ JANAS_LLM_API void janas_llm_speculation_config_default(
 JANAS_LLM_API int32_t janas_llm_chat_set_speculation_config(
     janas_llm_chat *c, const struct janas_llm_speculation_config *config);
 
+/* Independent from the version-1 speculation layouts. Cost policy preserves
+   calibrated legacy MTP fallback; source ceilings also obey max_drafts. */
+#define JANAS_LLM_HYBRID_CONFIG_VERSION 1
+#define JANAS_LLM_HYBRID_METRICS_VERSION 1
+#define JANAS_LLM_HYBRID_LEGACY 0
+#define JANAS_LLM_HYBRID_COST 1
+#define JANAS_LLM_HYBRID_REASON_NO_MATCH 0
+#define JANAS_LLM_HYBRID_REASON_NO_EVIDENCE 1
+#define JANAS_LLM_HYBRID_REASON_MTP_CHEAPER 2
+#define JANAS_LLM_HYBRID_REASON_LOOKUP_FASTER 3
+#define JANAS_LLM_HYBRID_REASON_LOOKUP_PROBE 4
+#define JANAS_LLM_HYBRID_REASON_MTP_REFRESH 5
+#define JANAS_LLM_HYBRID_REASON_COOLDOWN 6
+#define JANAS_LLM_HYBRID_REASON_NO_CAPACITY 7
+struct janas_llm_hybrid_config {
+    uint32_t size, version;
+    int32_t policy, lookup_max_drafts, mtp_max_drafts, probe_percent;
+};
+JANAS_LLM_API void janas_llm_hybrid_config_default(struct janas_llm_hybrid_config *config);
+JANAS_LLM_API int32_t janas_llm_chat_set_hybrid_config(
+    janas_llm_chat *c, const struct janas_llm_hybrid_config *config);
+struct janas_llm_hybrid_decision {
+    uint64_t proposal_id;
+    uint32_t source, requested_depth, lookup_available, lookup_suffix, suffix_class;
+    uint32_t reason, probe, warm, vocab_key, lookup_evidence, mtp_evidence;
+    uint32_t accepted_prefix, delivered, pass_width;
+    double lookup_utility, mtp_utility, predicted_seconds;
+    double causal_seconds, recovery_seconds;
+};
+/* Reply-local counters; last contains the latest decision and its eventual
+   causal cost. Recovery is already nested in verification wall time; its
+   reassignment is an estimated row share of fused GDN execution. */
+struct janas_llm_hybrid_metrics {
+    uint32_t size, version;
+    uint64_t decisions, offered_matches, eligible_matches;
+    uint64_t lookup_selected, mtp_selected, probes, cooldown_skips;
+    uint64_t lookup_drafted, lookup_accepted, lookup_delivered, mtp_delivered;
+    uint64_t reason_count[12], lookup_depth_count[17];
+    double lookup_seconds, mtp_seconds, recovery_reassigned_seconds;
+    struct janas_llm_hybrid_decision last;
+};
+JANAS_LLM_API int32_t janas_llm_chat_hybrid_metrics(
+    const janas_llm_chat *c, struct janas_llm_hybrid_metrics *metrics);
+
 struct janas_llm_speculation_cycle {
     uint64_t proposal_id;
     uint32_t source, planner_source, requested_depth, pass_width, accepted_prefix;

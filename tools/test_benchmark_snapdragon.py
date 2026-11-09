@@ -26,6 +26,17 @@ def row(case, rate=10, signature=None, prompts=None):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_hybrid_controls_bound_sources_and_reference_policy(self):
+        base = bench.Case("cpu", "hybrid", 8, 32, 8, hybrid_policy="cost",
+                          lookup_drafts=8, mtp_drafts=4, hybrid_probe_percent=2)
+        self.assertEqual(base.cpu_reference().hybrid_policy, "legacy")
+        for key, value in (("hybrid_policy", "invalid"), ("lookup_drafts", 0),
+                           ("lookup_drafts", 17), ("mtp_drafts", True),
+                           ("mtp_drafts", 17), ("hybrid_probe_percent", -1),
+                           ("hybrid_probe_percent", 101)):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                dataclasses.replace(base, **{key: value})
+
     def test_new_controls_are_explicit_recorded_and_do_not_mutate_parent(self):
         args = argparse.Namespace(bench=Path("bench.exe"), model=Path("model.jns"),
             mtp=Path("mtp.jns"), seed=1, gen=64, ctx=2048, rounds=1,
@@ -47,7 +58,8 @@ class BenchmarkTests(unittest.TestCase):
                     env = run.call_args.kwargs["env"]
                     expected = dict(zip(bench.EXPERIMENT_ENV, (
                         case.spec_planner, str(case.spec_explore), case.draft_vocab,
-                        str(case.draft_vocab_rows), str(case.gdn_chain),
+                        str(case.draft_vocab_rows), case.hybrid_policy, str(case.lookup_drafts),
+                        str(case.mtp_drafts), str(case.hybrid_probe_percent), str(case.gdn_chain),
                         str(case.gdn_journal), str(case.gdn_k_only))))
                     expected["JANAS_CPU_TILES"] = tile_value
                     for name, value in expected.items():
@@ -58,7 +70,11 @@ class BenchmarkTests(unittest.TestCase):
                     for name, value in (("--spec-planner", case.spec_planner),
                                         ("--spec-explore", str(case.spec_explore)),
                                         ("--draft-vocab", case.draft_vocab),
-                                        ("--draft-vocab-rows", str(case.draft_vocab_rows))):
+                                        ("--draft-vocab-rows", str(case.draft_vocab_rows)),
+                                        ("--hybrid-policy", case.hybrid_policy),
+                                        ("--lookup-drafts", str(case.lookup_drafts)),
+                                        ("--mtp-drafts", str(case.mtp_drafts)),
+                                        ("--hybrid-probe-percent", str(case.hybrid_probe_percent))):
                         self.assertEqual(command[command.index(name) + 1], value)
                     self.assertEqual("--mtp" in command, case.speculation == "hybrid")
                     self.assertEqual("--no-mtp" in command, case.speculation == "none")

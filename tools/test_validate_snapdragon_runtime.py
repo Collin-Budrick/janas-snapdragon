@@ -168,6 +168,8 @@ class ProtocolTests(unittest.TestCase):
                         f"lookup_attempts={4 if selected and mode=='hybrid' else 0} mtp_drafts={32 if mtp else 0} "
                         f"head_calls={32 if mtp else 0} repacks={2 if mtp and adaptive else 0} "
                         "head_policy=0 head_rows=16384 head_epoch=2 verified\n")
+                    if selected and values.get("hybrid_policy") == "cost":
+                        text += "hybrid: policy=cost decisions=12 offered=8 lookup=1 mtp=11 probes=1 cooldown=0 accepted=1 verified\n"
                 for marker in ("greedy: turns vs all at once", "greedy + speculation: turn 1",
                     "greedy + speculation: turn 2", "sampling, speculation off vs on: turn 1",
                     "sampling, speculation off vs on: turn 2"):
@@ -178,6 +180,51 @@ class ProtocolTests(unittest.TestCase):
             records = json.loads((self.v.OUT / "sessions.json").read_text())["results"]
             hybrid = next(r for r in records if r["name"] == "session-hybrid-cycle8-adaptive")
             self.assertFalse(hybrid["adaptive_execution_verified"])
+
+    def test_cost_hybrid_plan_separates_normal_and_forced_probe_validation(self):
+        cases = self.v.plan("session")["cases"]
+        normal = next(c for c in cases if c["name"] == "hybrid-cost8")
+        probe = next(c for c in cases if c["name"] == "hybrid-cost8-probe")
+        for case in (normal, probe):
+            self.assertIn("hybrid_policy=cost", case["command"])
+            self.assertIn("lookup_drafts=8", case["command"])
+            self.assertIn("mtp_drafts=4", case["command"])
+            self.assertEqual(case["planner"], "legacy")
+        self.assertIn("hybrid_probe_percent=2", normal["command"])
+        self.assertIn("hybrid_probe_percent=100", probe["command"])
+
+    def test_semantic_hybrid_requires_all_sources_both_samplers_and_actual_lookup(self):
+        for lookup_seen in (False, True):
+            def fake(name, argv, env, **unused):
+                records = []
+                for sampler in ("greedy", "seeded"):
+                    for mode in ("plain", "mtp4", "hybrid-cost8"):
+                        for turn, phase in enumerate(["copy"] * 4 + ["switch", "return"]):
+                            records.append(dict(schema=1, kind="semantic", sampler=sampler, mode=mode,
+                                turn=turn, phase=phase, identity_verified=True, input_threads=8, output_threads=8))
+                records.append(dict(schema=1, kind="summary", identity_verified=True,
+                                    lookup_exercised=lookup_seen, fallback_exercised=True))
+                return self.result(name, "\n".join(json.dumps(v) for v in records))
+            with patch.object(self.v, "run", fake):
+                self.assertEqual(self.v.semantic_hybrid(), lookup_seen)
+        planned = self.v.plan("hybrid")["cases"]
+        self.assertEqual(len(planned), 1)
+        self.assertIn("probe=2", planned[0]["command"])
+
+    def test_attention_calibration_seeds_identical_private_copies_without_touching_original(self):
+        path = self.root / "attn.txt"
+        data = b"Snapdragon_X|8|16/2/256|0|2048 4294967295 1024\n"
+        path.write_bytes(data)
+        frozen = self.v.attention_input(path)
+        for name in ("first", "second"):
+            seed = self.v.seed_attention_calibration(self.root / name, frozen)
+            copied = Path(seed["private_path"])
+            self.assertEqual(copied.read_bytes(), data)
+            copied.write_bytes(b"private changes remain private")
+        self.assertEqual(path.read_bytes(), data)
+        path.write_bytes(b"Snapdragon_X|8|16/2/256|0|2048 1024 1024\n")
+        with self.assertRaises(RuntimeError):
+            self.v.seed_attention_calibration(self.root / "third", frozen)
 
     def test_model_files_with_same_basename_are_validated_by_role(self):
         self.v.MODEL = self.root / "main" / "weights.jns"

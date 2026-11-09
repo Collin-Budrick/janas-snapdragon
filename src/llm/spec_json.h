@@ -6,4 +6,6 @@
 /* One object only; callers own the key, comma and outer envelope. */
 void janas_spec_metrics_json(struct janas_buf *out,
                               const struct janas_llm_speculation_metrics *m);
+void janas_hybrid_metrics_json(struct janas_buf *out,
+                                const struct janas_llm_hybrid_metrics *m);
 #endif

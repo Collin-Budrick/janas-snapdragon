@@ -13,6 +13,9 @@ static struct janas_mtp_costs head;
 
 int32_t janas_api_fail(int32_t code, const char *fmt, ...)
 { (void)fmt; return code; }
+void janas_llm_session_hybrid_metrics(const struct janas_llm_session *s,
+                                       struct janas_gen_hybrid_metrics *out)
+{ (void)s; memset(out, 0, sizeof *out); }
 void janas_llm_session_metrics(const struct janas_llm_session *s,
                                 struct janas_gen_metrics *out)
 { (void)s; *out = generation; }

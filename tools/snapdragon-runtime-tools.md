@@ -131,3 +131,17 @@ python -m unittest discover -s tools -p "test_*snapdragon_runtime.py"
 These tests use synthetic records and temporary files. They check planning,
 ABBA scheduling, input identities, environment isolation and rejection of
 invalid comparisons without loading model weights or launching inference.
+
+## Cost-aware hybrid comparisons
+
+The optional `profiles/snapdragon-xelite-hybrid.json` selects `hybrid-policy=cost`, lookup up to eight drafts, calibrated MTP fallback up to four, and two-percent eligible probes. The global draft ceiling remains authoritative. The earlier hybrid cycle controller remains available as `hybrid-policy=legacy`.
+
+Freeze the **current promoted MTP4/GDN111** executable/profile before rebuilding. Benchmark execution now requires a frozen attention calibration file as well as an explicitly frozen MTP calibration state. Both arms use the same retained-controller/fresh-conversation protocol and receive identical private cache seeds; the original files are never modified by trials. Private attention calibration must remain unchanged after each process, so missing hardware/geometry keys cannot silently retime AUTO precision.
+
+```powershell
+python tools/benchmark-snapdragon-runtime.py paired --baseline-exe lib/validation/hybrid-cost-20261108/baseline-janas-bench.exe --baseline-manifest lib/validation/hybrid-cost-20261108/baseline-manifest.json --candidate-case hybrid-cost8 --calibration-file lib/validation/hybrid-cost-20261108/calibration/drafts-fcea9eb750bbc323.bin --attention-calibration-file lib/validation/hybrid-cost-20261108/calibration/attn.txt --model-receipt lib/validation/runtime-20261108/model-checksum-receipt.json --output lib/validation/hybrid-cost-20261108/paired-final --execute
+```
+
+Those baseline/calibration/receipt paths are local artifacts from this evaluation, not model downloads or files supplied by a clone. For a new evaluation provide fresh frozen inputs. The default `--baseline-controls` now preserves the promoted MTP4 legacy planner/head and GDN111 settings; explicit overrides are recorded. Keep source/executables stable until all ABBA processes finish.
+
+`validate-snapdragon-runtime.py --stage hybrid` runs the multi-turn copying/topic-switch check across plain, MTP4 and cost-aware hybrid under greedy and seeded sampling. `--attention-calibration-file` makes the AUTO-policy regression reproducible. The normal probe rate is two percent; `--semantic-probe-percent 100` is a separate functional branch-exercising setting and must not be used for performance promotion.

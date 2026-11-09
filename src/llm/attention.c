@@ -50,9 +50,9 @@ struct janas_attn {
     const uint32_t *last; /* the next call's last position a token sees
                              (janas_attn_set_last); NULL: its own */
     atomic_uint *done;    /* chunks finished, per (KV head, subgroup) */
-    /* the engine's choice (scores_auto): the sixteen-bit query from this
-       position on, a token's calls [0] and a block's [1] (UINT32_MAX:
-       never), measured once before the first call (attn_calibrate) */
+    /* The engine's choice (scores_auto): the sixteen-bit query from this
+       position on (UINT32_MAX: never). Both historical calibration columns
+       remain readable, but [0] defines the arithmetic for every token. */
     uint32_t from16[2];
     int calibrated;
 };
@@ -1102,7 +1102,10 @@ void janas_attn_destroy(struct janas_attn *A)
  * of 64 to 16,384): the sixteen-bit way from the shortest at which it wins
  * there and at every longer one. The result is kept in ~/.cache/janas
  * (attn.txt) by processor, threads and geometry, so every session uses the
- * same. JANAS_ATTN=float or int16 fixes it.
+ * same. The token column [0] defines precision at each absolute position
+ * for every call width. The historical block column [1] is retained for
+ * cache compatibility, never to change a verified token's arithmetic.
+ * JANAS_ATTN=float or int16 fixes it.
  */
 static double attn_now(void)
 {
@@ -1252,12 +1255,30 @@ void janas_attn_run(struct janas_attn *A, struct janas_pool *pool,
                     const int8_t *v, const float *vs, uint32_t n, uint32_t pos0,
                     float *out)
 {
-    /* the engine's choice: measured once (attn_calibrate) */
+    /* Block timing must not change precision: speculative verification has
+       to compute the same target as single-token decoding. Use its policy
+       at each absolute token position, including when a batch crosses the
+       threshold. Historical cache entries with two columns remain valid. */
     if (A->scores_auto && A->qi && !A->kv16) {
         if (!A->calibrated)
             attn_calibrate(A, pool);
-        A->scores =
-            pos0 >= A->from16[n > 1] ? JANAS_ATTN_INT16 : JANAS_ATTN_FLOAT;
+        uint32_t threshold = A->from16[0];
+        if (threshold != UINT32_MAX && pos0 < threshold && n > threshold - pos0) {
+            uint32_t first = threshold - pos0;
+            size_t row = (size_t)A->n_head * A->hd;
+            const uint32_t *last = A->last;
+            A->scores = JANAS_ATTN_FLOAT;
+            run_way(A, pool, q, k, ks, v, vs, first, pos0, out);
+            /* run_way consumes set_last for one call. The second segment
+               belongs to that same original call, with a shifted row view. */
+            A->last = last ? last + first : NULL;
+            A->scores = JANAS_ATTN_INT16;
+            run_way(A, pool, q + (size_t)first * row, k, ks, v, vs,
+                    n - first, threshold, out + (size_t)first * row);
+            return;
+        }
+        A->scores = threshold != UINT32_MAX && pos0 >= threshold
+                        ? JANAS_ATTN_INT16 : JANAS_ATTN_FLOAT;
     }
     run_way(A, pool, q, k, ks, v, vs, n, pos0, out);
 }

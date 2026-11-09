@@ -63,3 +63,35 @@ int32_t janas_llm_chat_speculation_metrics(
     memcpy(out, &v, requested);
     return JANAS_LLM_OK;
 }
+
+_Static_assert(sizeof(struct janas_gen_hybrid_metrics) ==
+               sizeof(struct janas_llm_hybrid_metrics) - 2 * sizeof(uint32_t),
+               "public hybrid metrics layout");
+int32_t janas_llm_chat_hybrid_metrics(const janas_llm_chat *c,
+                                      struct janas_llm_hybrid_metrics *out)
+{
+    if (!c || !c->s || !out || out->size < 2 * sizeof(uint32_t) ||
+        out->size > sizeof(*out) || out->version != JANAS_LLM_HYBRID_METRICS_VERSION)
+        return janas_api_fail(JANAS_LLM_EINVAL, "invalid hybrid metrics layout");
+    uint32_t requested = out->size;
+    struct janas_gen_hybrid_metrics g;
+    janas_llm_session_hybrid_metrics(c->s, &g);
+    struct janas_llm_hybrid_metrics v = {0};
+    v.size = requested; v.version = JANAS_LLM_HYBRID_METRICS_VERSION;
+    memcpy(&v.decisions, &g, sizeof(g));
+#define D(f) v.f = g.f >= c->hm0.f ? g.f - c->hm0.f : g.f
+    D(decisions); D(offered_matches); D(eligible_matches);
+    D(lookup_selected); D(mtp_selected); D(probes); D(cooldown_skips);
+    D(lookup_drafted); D(lookup_accepted); D(lookup_delivered); D(mtp_delivered);
+    D(lookup_seconds); D(mtp_seconds); D(recovery_reassigned_seconds);
+#undef D
+    for (unsigned i = 0; i < 12; i++)
+        v.reason_count[i] = g.reason_count[i] >= c->hm0.reason_count[i] ?
+            g.reason_count[i] - c->hm0.reason_count[i] : g.reason_count[i];
+    for (unsigned i = 0; i < 17; i++)
+        v.lookup_depth_count[i] = g.lookup_depth_count[i] >= c->hm0.lookup_depth_count[i] ?
+            g.lookup_depth_count[i] - c->hm0.lookup_depth_count[i] : g.lookup_depth_count[i];
+    if (!v.decisions) memset(&v.last, 0, sizeof(v.last));
+    memcpy(out, &v, requested);
+    return JANAS_LLM_OK;
+}

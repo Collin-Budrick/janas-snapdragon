@@ -13,6 +13,10 @@
 #include "llm/spec_config.h"
 
 static struct janas_gen_metrics fixture_gen;
+static struct janas_gen_hybrid_metrics fixture_hybrid;
+static void fixture_hybrid_metrics(const struct janas_llm_session *s,
+                                     struct janas_gen_hybrid_metrics *out)
+{ (void)s; *out = fixture_hybrid; }
 static struct janas_llm_runtime_stats fixture_runtime;
 static struct janas_mtp_costs fixture_mtp;
 static void fixture_session_metrics(const struct janas_llm_session *s,
@@ -24,10 +28,12 @@ static void fixture_runtime_stats(const struct janas_llm_model *m,
 static void fixture_mtp_costs(const struct janas_llm_model *m,
                                struct janas_mtp_costs *out)
 { (void)m; *out = fixture_mtp; }
+#define janas_llm_session_hybrid_metrics fixture_hybrid_metrics
 #define janas_llm_session_metrics fixture_session_metrics
 #define janas_llm_model_runtime_stats fixture_runtime_stats
 #define janas_llm_mtp_costs fixture_mtp_costs
 #include "../src/llm/api_spec.c"
+#undef janas_llm_session_hybrid_metrics
 #undef janas_llm_session_metrics
 #undef janas_llm_model_runtime_stats
 #undef janas_llm_mtp_costs
@@ -52,12 +58,13 @@ static int failures;
 
 static const char *const env_names[] = {
     "JANAS_SPEC_PLANNER", "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY",
-    "JANAS_DRAFT_VOCAB_ROWS"
+    "JANAS_DRAFT_VOCAB_ROWS", "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS",
+    "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT"
 };
 
 static void clear_env(void)
 {
-    for (unsigned i = 0; i < 4; i++) CHECK(unsetenv(env_names[i]) == 0, "clear environment");
+    for (unsigned i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) CHECK(unsetenv(env_names[i]) == 0, "clear environment");
 }
 
 static void check_unchanged(const struct janas_llm_chat *c,
@@ -135,7 +142,7 @@ static void config_tests(struct janas_llm_chat *c)
           janas_api_options(c, &o) == JANAS_LLM_OK && o.spec_planner == 2 &&
           o.spec_explore_percent == 0, "explicit fixed planner and zero exploration preserved");
     const uint32_t rows[] = {0, 8192, 16384, 32768};
-    for (unsigned i = 0; i < 4; i++) {
+    for (unsigned i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
         p.draft_vocab_rows = rows[i];
         CHECK(janas_llm_chat_set_speculation_config(c, &p) == JANAS_LLM_OK,
               "supported draft row budget accepted");
@@ -203,7 +210,7 @@ static void metrics_tests(struct janas_llm_chat *c)
           janas_llm_chat_speculation_metrics(c, NULL) == JANAS_LLM_EINVAL,
           "null metrics arguments rejected");
     const uint32_t bad_sizes[] = {0, 4, sizeof(box.m) + 1, UINT32_MAX};
-    for (unsigned i = 0; i < 4; i++) {
+    for (unsigned i = 0; i < sizeof(bad_sizes) / sizeof(bad_sizes[0]); i++) {
         box = before; box.m.size = bad_sizes[i];
         struct janas_llm_speculation_metrics unchanged = box.m;
         CHECK(janas_llm_chat_speculation_metrics(c, &box.m) == JANAS_LLM_EINVAL &&
@@ -239,7 +246,7 @@ static void metrics_tests(struct janas_llm_chat *c)
         CHECK(box.tail[i] == 0xa5, "full-size metrics do not overwrite trailing bytes");
     const uint32_t prefixes[] = {8, 9, offsetof(struct janas_llm_speculation_metrics, last),
         offsetof(struct janas_llm_speculation_metrics, expert_assignments)};
-    for (unsigned i = 0; i < 4; i++) {
+    for (unsigned i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
         box = before; box.m.size = prefixes[i];
         for (unsigned call = 0; call < 2; call++) {
             CHECK(janas_llm_chat_speculation_metrics(c, &box.m) == JANAS_LLM_OK &&
@@ -259,10 +266,76 @@ static void metrics_tests(struct janas_llm_chat *c)
     c->s = NULL;
 }
 
+static void hybrid_tests(struct janas_llm_chat *c)
+{
+    clear_env();
+    struct janas_llm_hybrid_config p;
+    janas_llm_hybrid_config_default(&p);
+    CHECK(p.size == sizeof p && p.version == 1 && p.policy == 0 &&
+          p.lookup_max_drafts == 8 && p.mtp_max_drafts == 4 && p.probe_percent == 2,
+          "independent hybrid defaults preserve old behavior");
+    CHECK(janas_llm_chat_set_hybrid_config(c, &p) == JANAS_LLM_OK, "hybrid default accepted");
+    struct janas_llm_hybrid_config bad = p;
+#define H_BAD(field, value) do { bad = p; bad.field = (value); \
+    struct janas_llm_hybrid_config old = c->hybrid_config; \
+    CHECK(janas_llm_chat_set_hybrid_config(c, &bad) == JANAS_LLM_EINVAL && \
+          memcmp(&old, &c->hybrid_config, sizeof old) == 0, "hybrid invalid atomic"); } while (0)
+    H_BAD(size, sizeof p - 1); H_BAD(version, 2); H_BAD(policy, 2);
+    H_BAD(lookup_max_drafts, 0); H_BAD(lookup_max_drafts, 17);
+    H_BAD(mtp_max_drafts, 0); H_BAD(mtp_max_drafts, 17);
+    H_BAD(probe_percent, -1); H_BAD(probe_percent, 101);
+#undef H_BAD
+    char error[160];
+    CHECK(janas_spec_runtime_option("--hybrid-policy", "cost", error, sizeof error) == 1 &&
+          janas_spec_runtime_option("--lookup-drafts", "8", error, sizeof error) == 1 &&
+          janas_spec_runtime_option("--mtp-drafts", "4", error, sizeof error) == 1 &&
+          janas_spec_runtime_option("--hybrid-probe-percent", "2", error, sizeof error) == 1 &&
+          janas_hybrid_config_env(&p, error, sizeof error) == 0 && p.policy == 1,
+          "hybrid CLI environment round trip");
+    struct janas_llm_hybrid_config before = p;
+    CHECK(setenv("JANAS_MTP_DRAFTS", "0", 1) == 0 &&
+          janas_hybrid_config_env(&p, error, sizeof error) == -1 &&
+          memcmp(&p, &before, sizeof p) == 0, "hybrid environment parse atomic");
+    clear_env();
+    c->llm->has_mtp = 1;
+    c->p.speculate = JANAS_LLM_SPEC_HYBRID;
+    p = before;
+    CHECK(janas_llm_chat_set_hybrid_config(c, &p) == JANAS_LLM_OK, "cost hybrid accepted");
+    struct janas_gen_options o;
+    CHECK(janas_api_options(c, &o) == JANAS_LLM_OK && o.hybrid_policy == 1 &&
+          o.hybrid_lookup_max_drafts == 8 && o.hybrid_mtp_max_drafts == 4 &&
+          o.hybrid_probe_percent == 2 && o.spec_planner == JANAS_LLM_SPEC_PLANNER_LEGACY,
+          "cost policy preserves legacy fallback option and independent caps");
+    c->s = (struct janas_llm_session *)(void *)c;
+    fixture_hybrid.decisions = 10; c->hm0.decisions = 3;
+    fixture_hybrid.lookup_selected = 5; c->hm0.lookup_selected = 2;
+    fixture_hybrid.last.source = 1;
+    for (uint32_t n = 8; n <= sizeof(struct janas_llm_hybrid_metrics); n++) {
+        unsigned char *box = malloc((size_t)n + 16);
+        CHECK(box != NULL, "hybrid metrics allocation");
+        if (!box) break;
+        memset(box, 0xa5, (size_t)n + 16);
+        struct janas_llm_hybrid_metrics *m = (void *)box;
+        m->size = n; m->version = 1;
+        CHECK(janas_llm_chat_hybrid_metrics(c, m) == JANAS_LLM_OK && m->size == n,
+              "hybrid metrics every prefix supported");
+        for (unsigned j = 0; j < 16; j++) CHECK(box[n+j] == 0xa5, "hybrid metric guard untouched");
+        free(box);
+    }
+    struct janas_llm_hybrid_metrics m = {.size = sizeof m, .version = 1};
+    CHECK(janas_llm_chat_hybrid_metrics(c, &m) == 0 && m.decisions == 7 &&
+          m.lookup_selected == 3, "hybrid counters reply-local");
+    struct janas_llm_hybrid_metrics unchanged = m;
+    m.version = 2; unchanged.version = 2;
+    CHECK(janas_llm_chat_hybrid_metrics(c, &m) == JANAS_LLM_EINVAL &&
+          memcmp(&m, &unchanged, sizeof m) == 0, "hybrid metrics unknown version atomic");
+    c->s = NULL;
+}
+
 int main(void)
 {
-    char *saved_env[4] = {0};
-    for (unsigned i = 0; i < 4; i++) {
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])] = {0};
+    for (unsigned i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         const char *v = getenv(env_names[i]);
         if (v) {
             saved_env[i] = malloc(strlen(v) + 1);
@@ -276,7 +349,8 @@ int main(void)
     config_tests(&c);
     parser_tests(&c);
     metrics_tests(&c);
-    for (unsigned i = 0; i < 4; i++) {
+    hybrid_tests(&c);
+    for (unsigned i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         if (saved_env[i]) CHECK(setenv(env_names[i], saved_env[i], 1) == 0, "restore parent environment");
         else CHECK(unsetenv(env_names[i]) == 0, "restore absent parent environment");
         free(saved_env[i]);

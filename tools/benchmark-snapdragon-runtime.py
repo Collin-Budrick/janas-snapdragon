@@ -20,6 +20,8 @@ import math
 import os
 from pathlib import Path
 import platform
+import re
+import struct
 import statistics
 import subprocess
 import sys
@@ -36,8 +38,9 @@ PROMPTS = {
              "8f6be1b71a3a7f9fa789309ffd09588a837567f00d5f7fdcbc312baba7e6b79c", "aad9221895bb6fe0"),
 }
 DEFAULT_CONTROL = dict(speculation="mtp", draft_tokens=4, spec_planner="legacy",
-    spec_explore=20, draft_vocab="legacy", draft_vocab_rows=0, gdn_chain=0,
-    gdn_journal=0, gdn_k_only=0, panels="auto")
+    spec_explore=20, draft_vocab="legacy", draft_vocab_rows=0, gdn_chain=1,
+    gdn_journal=1, gdn_k_only=1, panels="auto", hybrid_policy="legacy",
+    lookup_drafts=8, mtp_drafts=4, hybrid_probe_percent=2)
 CASES = {
     "baseline": dict(DEFAULT_CONTROL),
     "legacy": dict(DEFAULT_CONTROL),
@@ -49,6 +52,8 @@ CASES = {
     "hybrid8": dict(DEFAULT_CONTROL, speculation="hybrid", spec_planner="cycle", draft_tokens=8),
     "hybrid8-adaptive": dict(DEFAULT_CONTROL, speculation="hybrid", spec_planner="cycle",
                             draft_tokens=8, draft_vocab="adaptive", draft_vocab_rows=0),
+    "hybrid-cost8": dict(DEFAULT_CONTROL, speculation="hybrid", draft_tokens=8,
+                              hybrid_policy="cost"),
 }
 COMMON_ENV = {"JANAS_GPU": "0", "JANAS_NPU": "0", "JANAS_TUNE": "0",
     "JANAS_TUNE_THREADS": "0", "JANAS_WARM": "0", "JANAS_MISS_SKIP": "0",
@@ -93,6 +98,12 @@ def valid_control(value):
         raise ValueError("GDN values must be integer 0/1")
     if (c["gdn_journal"] and not c["gdn_chain"]) or (c["gdn_k_only"] and not c["gdn_journal"]):
         raise ValueError("GDN journal requires chain; K-only requires journal")
+    if c["hybrid_policy"] not in ("legacy", "cost"):
+        raise ValueError("Invalid hybrid policy")
+    for key, low, high in (("lookup_drafts", 1, 16), ("mtp_drafts", 1, 16),
+                           ("hybrid_probe_percent", 0, 100)):
+        if type(c[key]) is not int or not low <= c[key] <= high:
+            raise ValueError("Invalid integer " + key)
     if c["panels"] not in ("auto", "off", "experimental"):
         raise ValueError("Invalid panels setting")
     return c
@@ -102,7 +113,9 @@ def performance_controls(c):
     controls = dict(COMMON_ENV, JANAS_SPEC_PLANNER=c["spec_planner"],
         JANAS_SPEC_EXPLORE=str(c["spec_explore"]), JANAS_DRAFT_VOCAB_POLICY=c["draft_vocab"],
         JANAS_DRAFT_VOCAB_ROWS=str(c["draft_vocab_rows"]), JANAS_GDN_CHAIN=str(c["gdn_chain"]),
-        JANAS_GDN_JOURNAL=str(c["gdn_journal"]), JANAS_GDN_K_ONLY=str(c["gdn_k_only"]))
+        JANAS_GDN_JOURNAL=str(c["gdn_journal"]), JANAS_GDN_K_ONLY=str(c["gdn_k_only"]),
+        JANAS_HYBRID_POLICY=c["hybrid_policy"], JANAS_LOOKUP_DRAFTS=str(c["lookup_drafts"]),
+        JANAS_MTP_DRAFTS=str(c["mtp_drafts"]), JANAS_HYBRID_PROBE_PERCENT=str(c["hybrid_probe_percent"]))
     if c["panels"] != "auto":
         controls["JANAS_CPU_TILES"] = "1" if c["panels"] == "experimental" else "0"
     return controls
@@ -228,6 +241,72 @@ def baseline_input(args, pins):
 
 
 
+def calibration_input(path, kind="draft"):
+    """Freeze only model planner counts; never mutate the original cache."""
+    if path is None:
+        return {"kind": kind, "state": "absent", "source_path": None, "cache_filename": None,
+                "bytes": 0, "sha256": None, "payload_hex": None}
+    path = path.resolve()
+    if kind == "attention":
+        if path.name != "attn.txt":
+            raise ValueError("Attention calibration filename must be attn.txt")
+    elif not re.fullmatch(r"drafts-[0-9a-f]{16}\.bin", path.name):
+        raise ValueError("Calibration filename must be drafts-<16 lowercase hex>.bin")
+    value = {"kind": kind, "state": "absent", "source_path": str(path), "cache_filename": path.name,
+             "bytes": 0, "sha256": None, "payload_hex": None}
+    if path.exists():
+        data = path.read_bytes()
+        if kind == "attention":
+            if not data or len(data) > 1 << 20:
+                raise ValueError("Attention calibration must contain at most 1 MiB of text")
+            for line in data.decode("utf-8").splitlines():
+                parts = line.split()
+                if (len(parts) != 3 or len(parts[0].encode("utf-8")) > 399 or "|" not in parts[0] or
+                    any(not v.isascii() or not v.isdecimal() or int(v) > 0xffffffff for v in parts[1:])):
+                    raise ValueError("Invalid legacy attention calibration row")
+        else:
+            if len(data) != 20 * 8:
+                raise ValueError("MTP calibration needs ten tried/won double pairs")
+            counts = struct.unpack("<20d", data)
+            if any(not math.isfinite(v) or v < 0 for v in counts) or any(
+                    counts[10 + i] > counts[i] for i in range(10)):
+                raise ValueError("Invalid MTP calibration counts")
+        value.update(state="seeded", bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                     payload_hex=data.hex())
+    return value
+
+
+def verify_calibration_source(value):
+    if value.get("source_path") and calibration_input(Path(value["source_path"]), value.get("kind", "draft")) != value:
+        raise RuntimeError("Original " + value.get("kind", "draft") + " calibration changed after protocol was frozen")
+
+
+def seed_calibration(cache, value):
+    """Every process starts from the same snapshot, including absent state."""
+    verify_calibration_source(value)
+    target = None
+    if value["state"] == "seeded":
+        target = cache / "janas" / value["cache_filename"]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        data = bytes.fromhex(value["payload_hex"])
+        with target.open("xb") as stream:
+            stream.write(data)
+        if sha(target) != value["sha256"]:
+            raise RuntimeError("Private calibration seed differs from frozen snapshot")
+    return {"state": value["state"], "sha256": value["sha256"], "bytes": value["bytes"],
+            "private_path": str(target) if target else None,
+            "original_cache_mutated": False}
+
+
+def attention_calibration_result(cache, frozen):
+    path = cache / "janas" / "attn.txt"
+    actual = sha(path) if path.is_file() else None
+    size = path.stat().st_size if path.is_file() else 0
+    return {"private_path": str(path), "sha256": actual, "bytes": size,
+            "unchanged": actual == frozen["sha256"] and size == frozen["bytes"],
+            "auto_retiming_detected": actual != frozen["sha256"] or size != frozen["bytes"]}
+
+
 def prepare_inputs(args):
     pins_path = args.model_pins.resolve()
     pins = load_pins(pins_path)
@@ -297,6 +376,8 @@ def prepare_inputs(args):
                          "output_tokens": 128, "output_hash": output_hash}
     verification = {"method": method, "complete": method != "unverified_plan_only", "files": proofs}
     return {"baseline": baseline,
+            "calibration": calibration_input(args.calibration_file),
+            "attention_calibration": calibration_input(args.attention_calibration_file, "attention"),
             "candidate": {"path": str(candidate), "sha256": candidate_sha},
             "models": models, "prompts": prompts, "source": source_identity(),
             "model_verification": verification,
@@ -311,9 +392,7 @@ def prepare_inputs(args):
 
 def run_spec(inputs, workload, case, control, label, rounds, sequence):
     control = valid_control(control)
-    retain_controller = label == "B" and (
-        control["spec_planner"] == "cycle" or control["speculation"] == "hybrid" or
-        control["draft_vocab"] == "adaptive")
+    retain_controller = True
     controller_protocol = ("retained_across_fresh_conversations" if retain_controller
                            else "fresh_chat_per_sample")
     binary = inputs["baseline" if label == "A" else "candidate"]
@@ -327,8 +406,12 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
     if label == "B":
         command += ["--spec-planner", control["spec_planner"], "--spec-explore", str(control["spec_explore"]),
                     "--draft-vocab", control["draft_vocab"], "--draft-vocab-rows", str(control["draft_vocab_rows"])]
-        if retain_controller:
-            command += ["--fair-retain-controller"]
+        command += ["--hybrid-policy", control["hybrid_policy"],
+                    "--lookup-drafts", str(control["lookup_drafts"]),
+                    "--mtp-drafts", str(control["mtp_drafts"]),
+                    "--hybrid-probe-percent", str(control["hybrid_probe_percent"])]
+    if retain_controller:
+        command += ["--fair-retain-controller"]
     value = {"id": f"{sequence:02d}-{workload}-{label}-{case}", "workload": workload, "case": case,
              "binary": label, "binary_sha256": binary["sha256"], "warm_rounds": rounds,
               "controller_protocol": controller_protocol,
@@ -344,7 +427,9 @@ def make_manifest(args, protocol, runs, inputs):
                     "sampler": "greedy", "seed": 20260926, "context_tokens": 2048, "gen": 128,
                     "prefetch": "off", "gpu": False, "npu": False,
                     "kv_and_attention": "architecture defaults; inherited overrides cleared"},
-                "sampling": {"new_chat_each_sample": True, "prompt_kv_reuse": False,
+                "sampling": {"new_chat_each_sample": False,
+                    "new_conversation_each_sample": True,
+                    "calibration": "identical frozen seed in every private process cache; original remains untouched", "prompt_kv_reuse": False,
                     "controller_state": "per-run controller_protocol; retained handles still begin fresh conversations",
                     "same_process_private_cache_reuse": "warm rounds only; fresh cache directory per process",
                     "os_file_cache": "uncontrolled across sequential processes; fresh does not mean cold SSD",
@@ -389,10 +474,9 @@ def validate_records(records, run):
         if run["binary"] == "B":
             expected.update({k: c[k] for k in ("spec_planner", "spec_explore", "draft_vocab", "draft_vocab_rows")})
             expected.update(controller_fields)
+            expected.update({k: c[k] for k in ("hybrid_policy", "lookup_drafts", "mtp_drafts", "hybrid_probe_percent")})
         else:
-            # Frozen baselines predate these fields. If a newer explicit
-            # baseline reports them, it must still use the fresh protocol.
-            expected.update({k: v for k, v in controller_fields.items() if k in setup[0]})
+            expected.update(controller_fields)
         for key in ("fair_retain_controller", "conversation_cache_reuse"):
             if key in expected and type(setup[0].get(key)) is not bool:
                 errors.append("setup " + key + " must be a boolean")
@@ -438,11 +522,15 @@ def validate_records(records, run):
             errors.append("unexpected accelerator policy")
         if run["binary"] == "B" and not isinstance(s.get("speculation_metrics"), dict):
             errors.append("candidate speculation metrics missing")
+        if run["binary"] == "B" and c["hybrid_policy"] == "cost" and not isinstance(s.get("hybrid_metrics"), dict):
+            errors.append("cost-aware hybrid metrics missing")
     return sorted(set(errors))
 
 
 
 def verify_inputs(inputs):
+    verify_calibration_source(inputs["calibration"])
+    verify_calibration_source(inputs["attention_calibration"])
     for key in ("baseline", "candidate"):
         if sha(inputs[key]["path"]) != inputs[key]["sha256"]:
             raise RuntimeError(key + " executable changed")
@@ -477,7 +565,10 @@ def child_run(run, folder, timeout):
     cache = folder / "cache"
     cache.mkdir(parents=True, exist_ok=False)
     env, controlled = environment(cache, run["control"])
-    record = dict(run, environment=controlled, parent_original_affinity=hex(old.value),
+    calibration = seed_calibration(cache, run["calibration"])
+    attention_calibration = seed_calibration(cache, run["attention_calibration"])
+    record = dict(run, environment=controlled, calibration_initial=calibration,
+                  attention_calibration_initial=attention_calibration, parent_original_affinity=hex(old.value),
                   system_affinity=hex(system.value), status="running")
     write_json(folder / "command.json", record)
     started = time.perf_counter()
@@ -518,6 +609,10 @@ def child_run(run, folder, timeout):
     except (ValueError, TypeError, UnicodeError) as exc:
         record["records"] = []
         errors = ["invalid benchmark JSON: " + str(exc)]
+    attention_final = attention_calibration_result(cache, run["attention_calibration"])
+    record["attention_calibration_final"] = attention_final
+    if not attention_final["unchanged"]:
+        errors.append("Private attention calibration changed: AUTO retimed a missing key")
     if process.returncode or timed_out:
         errors.append("child failed or timed out")
     record.update(errors=sorted(set(errors)), status="invalid" if errors else "ok")
@@ -563,6 +658,35 @@ def summary(manifest, records):
             "complete_and_output_verified": eligible,
             "candidate_to_baseline_median_rate_ratio": new / old if eligible and old and new else None,
             "scope": "warm output-tail rate ratio; full wall and TTFT retained separately; screen is discovery only"})
+    comparisons = result["comparisons"]
+    checks = []
+    for comparison in comparisons:
+        workload, candidate_case = comparison["workload"], comparison["candidate_case"]
+        base = next((g for g in result["groups"] if g["workload"] == workload and g["binary"] == "A"), None)
+        candidate = next((g for g in result["groups"] if g["workload"] == workload and g["binary"] == "B" and g["case"] == candidate_case), None)
+        old_ttft = base["median_warm_ttft_seconds"] if base else None
+        new_ttft = candidate["median_warm_ttft_seconds"] if candidate else None
+        limit = old_ttft + max(0.010, old_ttft * 0.05) if old_ttft else None
+        ratio = comparison["candidate_to_baseline_median_rate_ratio"]
+        comparison.update(baseline_median_ttft_seconds=old_ttft,
+                          candidate_median_ttft_seconds=new_ttft,
+                          first_token_limit_seconds=limit,
+                          first_token_passed=bool(limit and new_ttft and new_ttft <= limit),
+                          workload_rate_floor_passed=bool(ratio and ratio >= 0.97))
+        checks.append(comparison)
+    ratios = [c["candidate_to_baseline_median_rate_ratio"] for c in checks]
+    eligible = (manifest["contract"]["protocol"] == "paired-ABBA-5warm-per-binary" and
+                len(checks) == len(PROMPTS) and {c["workload"] for c in checks} == set(PROMPTS) and
+                len({c["candidate_case"] for c in checks}) == 1 and
+                all(c["complete_and_output_verified"] for c in checks) and
+                all(g["warm_samples"] >= 5 for g in result["groups"]))
+    geomean = math.exp(sum(math.log(r) for r in ratios) / len(ratios)) if eligible and all(ratios) else None
+    result["promotion"] = {"eligible": eligible,
+        "geometric_mean_rate_ratio": geomean,
+        "minimum_geometric_mean_rate_ratio": 1.05, "minimum_workload_rate_ratio": 0.97,
+        "ttft_tolerance": "greater of 10 milliseconds or five percent of baseline median",
+        "passed": bool(eligible and geomean is not None and geomean >= 1.05 and all(
+            c["first_token_passed"] and c["workload_rate_floor_passed"] for c in checks))}
     return result
 
 
@@ -580,6 +704,15 @@ def completed_run(folder, run):
     parsed = strict_records(attempt / "stdout.log")
     if parsed != value["records"] or validate_records(parsed, run) or value.get("status") != "ok" or value.get("exit_code") != 0 or value.get("timeout"):
         raise RuntimeError("Resume refuses invalid/inconsistent completed run: " + run["id"])
+    expected_seed = {k: run["calibration"][k] for k in ("state", "sha256", "bytes")}
+    if any(value.get("calibration_initial", {}).get(k) != v for k, v in expected_seed.items()):
+        raise RuntimeError("Resume calibration seed mismatch: " + run["id"])
+    expected_attention = {k: run["attention_calibration"][k] for k in ("state", "sha256", "bytes")}
+    if any(value.get("attention_calibration_initial", {}).get(k) != v for k, v in expected_attention.items()):
+        raise RuntimeError("Resume attention calibration seed mismatch: " + run["id"])
+    attention_final = attention_calibration_result(attempt / "cache", run["attention_calibration"])
+    if not attention_final["unchanged"] or value.get("attention_calibration_final") != attention_final:
+        raise RuntimeError("Resume private attention calibration changed or retimed: " + run["id"])
     if value.get("child_affinity") != "0xff" or value.get("environment", {}).get("controls") != run["performance_controls"]:
         raise RuntimeError("Resume affinity/environment mismatch: " + run["id"])
     return value
@@ -589,10 +722,12 @@ def native_host():
     return os.name == "nt" and platform.machine().lower() in ("arm64", "aarch64")
 
 
-def execute(manifest, args):
+def _execute(manifest, args):
     if not native_host():
         raise RuntimeError("--execute requires native ARM64 Windows Python")
     contract = manifest["contract"]
+    if contract["inputs"]["attention_calibration"]["state"] != "seeded":
+        raise RuntimeError("Execution requires --attention-calibration-file: independent AUTO retiming changes target arithmetic")
     if not contract["inputs"].get("model_verification", {}).get("complete"):
         raise RuntimeError("Execution refuses unverified model payloads")
     if contract["inputs"]["candidate"]["sha256"] == contract["inputs"]["baseline"]["sha256"]:
@@ -647,6 +782,25 @@ def execute(manifest, args):
 
 
 
+def execute(manifest, args):
+    try:
+        return _execute(manifest, args)
+    finally:
+        # Children only write private copies. Check the original even on an
+        # interrupted/failed run instead of silently accepting cache training.
+        frozen = manifest["contract"]["inputs"]["calibration"]
+        verify_calibration_source(frozen)
+        attention = manifest["contract"]["inputs"]["attention_calibration"]
+        verify_calibration_source(attention)
+        if args.output is not None and args.output.resolve().is_dir():
+            write_json(args.output.resolve() / "calibration-preserved.json", {
+                "original_unchanged": True, "state": frozen["state"],
+                "source_path": frozen["source_path"], "sha256": frozen["sha256"],
+                "private_copy_per_process": True,
+                "attention_source_path": attention["source_path"],
+                "attention_sha256": attention["sha256"], "attention_original_unchanged": True})
+
+
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("mode", choices=("screen", "paired"), nargs="?", default="paired")
@@ -655,6 +809,10 @@ def parser():
     action.add_argument("--execute", action="store_true", help="explicitly run sequential native Windows ARM64 children")
     p.add_argument("--baseline-exe", type=Path, help="explicit control executable; its SHA is recorded")
     p.add_argument("--baseline-manifest", type=Path, help="bind the control executable to a SHA/source receipt")
+    p.add_argument("--baseline-controls", type=Path, help="explicit validated baseline control JSON; default promoted MTP4/GDN111")
+    p.add_argument("--calibration-file", type=Path, help="drafts-<fingerprint>.bin to seed identically into every private process cache; omission freezes absent state")
+    p.add_argument("--attention-calibration-file", type=Path,
+                   help="frozen original attn.txt, seeded byte-for-byte into every private cache; required for execute")
     p.add_argument("--bench-exe", type=Path, default=ROOT / "bin/aarch64-windows/janas-bench.exe")
     p.add_argument("--model", type=Path, default=ROOT / "models/qwen3-next-80b-a3b-q4km.jns")
     p.add_argument("--mtp", type=Path, default=ROOT / "models/qwen3-next-80b-a3b-mtp-q4k.jns")
@@ -697,6 +855,7 @@ def check_args(args):
 def build_plan(args, inputs):
     workloads = check_args(args)
     runs = []
+    baseline_control = valid_control(read_json(args.baseline_controls)) if args.baseline_controls else valid_control(DEFAULT_CONTROL)
     if args.mode == "screen":
         cases = args.cases.split(",")
         if not cases or len(set(cases)) != len(cases) or any(c not in CASES for c in cases):
@@ -705,7 +864,7 @@ def build_plan(args, inputs):
             cases.insert(0, "baseline")
         for workload in workloads:
             for case in cases:
-                runs.append(run_spec(inputs, workload, case, CASES[case],
+                runs.append(run_spec(inputs, workload, case, baseline_control if case == "baseline" else CASES[case],
                                      "A" if case == "baseline" else "B", 2, len(runs)))
         protocol = "screen-fresh-plus-2warm"
     else:
@@ -715,7 +874,7 @@ def build_plan(args, inputs):
             for index, label in enumerate("ABBA"):
                 rounds = 3 if index in (0, 1) else 2
                 runs.append(run_spec(inputs, workload, "baseline" if label == "A" else name,
-                                     DEFAULT_CONTROL if label == "A" else control,
+                                     baseline_control if label == "A" else control,
                                      label, rounds, len(runs)))
         protocol = "paired-ABBA-5warm-per-binary"
     return make_manifest(args, protocol, runs, inputs)

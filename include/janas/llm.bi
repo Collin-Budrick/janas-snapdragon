@@ -548,6 +548,67 @@ declare function janas_llm_speech_word(byval s as const janas_llm_speech ptr, _
                                        byval cap as long, _
                                        byval length as long ptr) as long
 
+const JANAS_LLM_HYBRID_CONFIG_VERSION = 1
+const JANAS_LLM_HYBRID_METRICS_VERSION = 1
+const JANAS_LLM_HYBRID_LEGACY = 0
+const JANAS_LLM_HYBRID_COST = 1
+type janas_llm_hybrid_config
+    size as ulong
+    version as ulong
+    policy as long
+    lookup_max_drafts as long
+    mtp_max_drafts as long
+    probe_percent as long
+end type
+type janas_llm_hybrid_decision
+    proposal_id as ulongint
+    source as ulong
+    requested_depth as ulong
+    lookup_available as ulong
+    lookup_suffix as ulong
+    suffix_class as ulong
+    reason as ulong
+    probe as ulong
+    warm as ulong
+    vocab_key as ulong
+    lookup_evidence as ulong
+    mtp_evidence as ulong
+    accepted_prefix as ulong
+    delivered as ulong
+    pass_width as ulong
+    lookup_utility as double
+    mtp_utility as double
+    predicted_seconds as double
+    causal_seconds as double
+    recovery_seconds as double
+end type
+type janas_llm_hybrid_metrics
+    size as ulong
+    version as ulong
+    decisions as ulongint
+    offered_matches as ulongint
+    eligible_matches as ulongint
+    lookup_selected as ulongint
+    mtp_selected as ulongint
+    probes as ulongint
+    cooldown_skips as ulongint
+    lookup_drafted as ulongint
+    lookup_accepted as ulongint
+    lookup_delivered as ulongint
+    mtp_delivered as ulongint
+    reason_count(0 to 11) as ulongint
+    lookup_depth_count(0 to 16) as ulongint
+    lookup_seconds as double
+    mtp_seconds as double
+    recovery_reassigned_seconds as double
+    last as janas_llm_hybrid_decision
+end type
+declare function janas_llm_chat_hybrid_metrics(byval c as const janas_llm_chat ptr, _
+                                               byval m as janas_llm_hybrid_metrics ptr) as long
+declare sub janas_llm_hybrid_config_default(byval p as janas_llm_hybrid_config ptr)
+declare function janas_llm_chat_set_hybrid_config(byval c as janas_llm_chat ptr, _
+                                                  byval p as const janas_llm_hybrid_config ptr) as long
+
 end extern
 
 '' The parameter blocks carry their own size, and every call checks it, so a

@@ -104,6 +104,7 @@ struct janas_llm_runtime_stats {
     uint64_t gdn_chain_tokens, gdn_journal_replay_tokens;
     uint64_t gdn_scalar_replay_tokens, gdn_konly_replay_tokens;
     double gdn_core_seconds, gdn_conv_seconds;
+    double gdn_recovery_seconds; /* fused pool wall-time row-share estimate */
     uint64_t gdn_delta_bytes;
     uint64_t cpu_groups, cpu_tasks;
     uint64_t cpu_prepared_rows, cpu_prepared_row_vectors;

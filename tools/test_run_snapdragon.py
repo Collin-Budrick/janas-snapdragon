@@ -49,6 +49,31 @@ class LauncherTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.profile), encoding="utf-8")
         return launcher.load_profile(self.path, self.root)
 
+    def test_hybrid_controls_round_trip_and_reject_invalid_caps(self):
+        self.profile["case"].update(hybrid_policy="cost", lookup_drafts=8,
+                                    mtp_drafts=4, hybrid_probe_percent=2)
+        profile = self.load()
+        env = launcher.launch_environment(profile, {"JANAS_HYBRID_POLICY": "hostile",
+            "JANAS_LOOKUP_DRAFTS": "99", "JANAS_MTP_DRAFTS": "99",
+            "JANAS_HYBRID_PROBE_PERCENT": "99"})
+        for name, value in {"JANAS_HYBRID_POLICY": "cost", "JANAS_LOOKUP_DRAFTS": "8",
+                            "JANAS_MTP_DRAFTS": "4", "JANAS_HYBRID_PROBE_PERCENT": "2"}.items():
+            self.assertEqual(env[name], value)
+            self.assertIn(name, launcher.PROFILE_ENV)
+        command = launcher.launch_command(profile, "server", Path("server.exe"),
+                                           "127.0.0.1", 8081, False)
+        for name, value in (("--hybrid-policy", "cost"), ("--lookup-drafts", "8"),
+                            ("--mtp-drafts", "4"), ("--hybrid-probe-percent", "2")):
+            self.assertEqual(command[command.index(name)+1], value)
+        for key, value in (("hybrid_policy", "invalid"), ("lookup_drafts", 0),
+                           ("lookup_drafts", 17), ("mtp_drafts", True),
+                           ("hybrid_probe_percent", -1), ("hybrid_probe_percent", 101)):
+            old = self.profile["case"][key]
+            self.profile["case"][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                self.load()
+            self.profile["case"][key] = old
+
     def test_profile_is_explicit(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             launcher.parser().parse_args([])

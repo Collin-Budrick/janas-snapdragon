@@ -29,6 +29,8 @@ CODE = ROOT / "tools" / "benchmark-prompts" / "qwen3-next-code.tokens.json"
 RECEIPT = ROOT / "tools" / "snapdragon-runtime-models.json"
 BASELINE_QUALITY_EXE = None
 VERIFY_MODEL_HASHES = False
+SEMANTIC_PROBE_PERCENT = 2
+ATTENTION_CALIBRATION = None
 EXPECTED_DIGEST = "c70a79fcb00b7e3d"
 EXPECTED_QREF_SHA = "52b0f576b85e9df0d2ba24380ff974f836a0f467fdcb46bbf19a747535883390"
 EXPECTED_INPUTS = {
@@ -48,6 +50,8 @@ SESSION_CASES = (
     ("hybrid-cycle8", "cycle", "hybrid", 8, "legacy", 0),
     ("hybrid-cycle8-adaptive", "cycle", "hybrid", 8, "adaptive", 0),
     ("fixed-mtp16-adaptive", "fixed", "mtp", 16, "adaptive", 16384),
+    ("hybrid-cost8", "legacy", "hybrid", 8, "legacy", 0),
+    ("hybrid-cost8-probe", "legacy", "hybrid", 8, "legacy", 0),
 )
 VOCAB = 151936
 HARDWARE_HELPERS = {"test_npu_hexagon_check.exe", "test_hx_probe.exe"}
@@ -134,6 +138,35 @@ def prepare_inputs():
     return manifest
 
 
+def attention_input(path):
+    if path is None:
+        return None
+    path = path.resolve()
+    data = path.read_bytes()
+    if path.name != "attn.txt" or not data or len(data) > 1 << 20:
+        raise ValueError("Attention calibration requires a nonempty attn.txt of at most 1 MiB")
+    for line in data.decode("utf-8").splitlines():
+        parts = line.split()
+        if (len(parts) != 3 or len(parts[0].encode("utf-8")) > 399 or "|" not in parts[0] or
+            any(not v.isascii() or not v.isdecimal() or int(v) > 0xffffffff for v in parts[1:])):
+            raise ValueError("Invalid legacy attention calibration row")
+    return {"source_path": str(path), "bytes": len(data), "sha256": sha_bytes(data),
+            "payload_hex": data.hex()}
+
+
+def seed_attention_calibration(cache, frozen):
+    if frozen is None:
+        return None
+    if attention_input(Path(frozen["source_path"])) != frozen:
+        raise RuntimeError("Original attention calibration changed after validation was planned")
+    target = cache / "janas" / "attn.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("xb") as stream:
+        stream.write(bytes.fromhex(frozen["payload_hex"]))
+    return {"source_path": frozen["source_path"], "private_path": str(target),
+            "sha256": frozen["sha256"], "bytes": frozen["bytes"], "original_mutated": False}
+
+
 def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,)):
     argv = [str(x) for x in argv]
     if not Path(argv[0]).is_absolute():
@@ -142,7 +175,8 @@ def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,)):
     cache = OUT / "cache" / name
     cache.mkdir(parents=True, exist_ok=False)
     env["XDG_CACHE_HOME"] = cache.as_posix()
-    result = {"name": name, "command": argv, "timeout_seconds": timeout,
+    attention_seed = seed_attention_calibration(cache, ATTENTION_CALIBRATION)
+    result = {"name": name, "command": argv, "attention_calibration_seed": attention_seed, "timeout_seconds": timeout,
               "started_utc": datetime.now(timezone.utc).isoformat(),
               "binary_sha256": sha(argv[0]),
               "janas_environment": {k: v for k, v in env.items() if k.upper().startswith("JANAS_")},
@@ -326,12 +360,19 @@ def evaluation():
     return True
 
 
+def session_controls(name):
+    if not name.startswith("hybrid-cost"):
+        return []
+    return ["hybrid_policy=cost", "lookup_drafts=8", "mtp_drafts=4",
+            "hybrid_probe_percent=" + ("100" if name.endswith("-probe") else "2")]
+
+
 def session():
     results = []
     for name, planner, mode, drafts, vocab, rows in SESSION_CASES:
         r = run("session-" + name, [BIN / "llm_session.exe", MODEL,
                 OUT / "session-code160.int32", "mtp=" + str(MTP), "planner=" + planner,
-                "speculation=" + mode, f"drafts={drafts}", "draft_vocab=" + vocab, f"rows={rows}"],
+                "speculation=" + mode, f"drafts={drafts}", "draft_vocab=" + vocab, f"rows={rows}"] + session_controls(name),
                 environment({"JANAS_ATTN": "float"}), affinity=0xff)
         text = read_log(r)
         expected = ["greedy: turns vs all at once", "greedy + speculation: turn 1",
@@ -363,6 +404,16 @@ def session():
                 errors.append("selected planner was not actually exercised")
             if mode == "hybrid" and v.get("lookup_attempts", 0) <= 0:
                 errors.append("hybrid did not consult the history index")
+        hybrid_records = []
+        if name.startswith("hybrid-cost"):
+            for line in text.splitlines():
+                if line.startswith("hybrid:"):
+                    fields = dict((k, int(v)) for k, v in re.findall(r"([a-z_]+)=(\d+)", line))
+                    fields["verified"] = line.endswith(" verified")
+                    hybrid_records.append(fields)
+            if len(hybrid_records) != 2 or not all(v.get("verified") and v.get("decisions", 0) > 0 and
+                                                   v.get("mtp", 0) > 0 for v in hybrid_records):
+                errors.append("cost-aware hybrid selection/MTP fallback not proven")
         mtp_exercised = bool(selected) and all(v.get("mtp_drafts", 0) > 0 and
                                                v.get("head_calls", 0) > 0 for v in selected)
         adaptive_verified = vocab == "adaptive" and mtp_exercised and all(
@@ -374,7 +425,7 @@ def session():
                 errors.append("fixed adaptive-head execution unverified")
             if not all(v.get("max_width", 0) == 17 for v in selected):
                 errors.append("17-row target verification not proven by runtime counters")
-        r.update(validation_errors=errors, runtime_records=records,
+        r.update(validation_errors=errors, runtime_records=records, hybrid_records=hybrid_records,
                  mtp_execution_verified=mtp_exercised, adaptive_execution_verified=adaptive_verified,
                  adaptive_note="not exercised or currently a legacy comparison epoch" if vocab == "adaptive" and not adaptive_verified else None)
         r["passed"] = r["passed"] and not errors
@@ -385,6 +436,46 @@ def session():
         if not r["passed"]:
             return False
     return True
+
+
+def semantic_hybrid():
+    name = "semantic-hybrid-copy-switch"
+    r = run(name, [BIN / "llm_hybrid.exe", MODEL, MTP,
+                  "probe=" + str(SEMANTIC_PROBE_PERCENT)],
+            environment(), timeout=1800, affinity=0xff)
+    records, errors = [], []
+    for line in Path(r["stdout"]).read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            value = json.loads(line)
+            if not finite_json(value):
+                raise ValueError("nonfinite semantic record")
+            records.append(value)
+        except ValueError as error:
+            errors.append(str(error))
+    samples = [v for v in records if v.get("kind") == "semantic"]
+    summaries = [v for v in records if v.get("kind") == "summary"]
+    if len(samples) != 36 or any(v.get("identity_verified") is not True for v in samples):
+        errors.append("expected 36 token-and-text-identical multi-turn semantic samples")
+    for sampler in ("greedy", "seeded"):
+        for mode in ("plain", "mtp4", "hybrid-cost8"):
+            chosen = [v for v in samples if v.get("sampler") == sampler and v.get("mode") == mode]
+            if len(chosen) != 6 or [v.get("phase") for v in chosen] != ["copy"] * 4 + ["switch", "return"]:
+                errors.append("semantic sampler/source/turn coverage missing")
+    if len(summaries) != 1 or summaries[0].get("identity_verified") is not True:
+        errors.append("missing successful semantic identity summary")
+    elif summaries[0].get("lookup_exercised") is not True or summaries[0].get("fallback_exercised") is not True:
+        errors.append("copy lookup and post-switch MTP fallback were not both exercised")
+    if any(v.get("input_threads") != 8 or v.get("output_threads") != 8 for v in samples):
+        errors.append("semantic compute settings differ from CPU8")
+    r.update(validation_errors=errors, semantic_records=records,
+             probe_percent=SEMANTIC_PROBE_PERCENT,
+             performance_boundary="functional scenario; source order is not matched ABBA",
+             forced_probe_functional_only=SEMANTIC_PROBE_PERCENT != 2)
+    r["passed"] = r["passed"] and not errors
+    save(OUT / "semantic-hybrid.json", r)
+    return r["passed"]
 
 
 def model_metadata():
@@ -425,8 +516,14 @@ def plan(stage):
                    "environment_overrides": {"JANAS_ATTN": "float"}, "process_affinity_mask": 255,
                    "command": [str(BIN / "llm_session.exe"), str(MODEL), str(OUT / "session-code160.int32"),
                        "mtp=" + str(MTP), "planner=" + p, "speculation=" + m, f"drafts={d}",
-                       "draft_vocab=" + v, f"rows={r}"]}
+                       "draft_vocab=" + v, f"rows={r}"] + session_controls(n)}
                   for n, p, m, d, v, r in SESSION_CASES]
+    if stage in ("all", "hybrid"):
+        cases.append({"stage": "hybrid", "name": "semantic-hybrid-copy-switch",
+            "probe_percent": SEMANTIC_PROBE_PERCENT, "timeout_seconds": 1800,
+            "process_affinity_mask": 255,
+            "command": [str(BIN / "llm_hybrid.exe"), str(MODEL), str(MTP),
+                        "probe=" + str(SEMANTIC_PROBE_PERCENT)]})
     return {"mode": "plan", "launches_executables": False, "output_directory": str(OUT),
             "sequential": True, "stage": stage, "cases": cases,
             "requested_janas_environment": {k: v for k, v in environment().items() if k.startswith("JANAS_")},
@@ -511,7 +608,7 @@ def create_reference():
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
-    result.add_argument("--stage", choices=("all", "units", "quality", "eval", "session"), default="all")
+    result.add_argument("--stage", choices=("all", "units", "quality", "eval", "session", "hybrid"), default="all")
     mode = result.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="default; list checks without launching anything")
     mode.add_argument("--execute", action="store_true", help="explicitly run sequential native Windows checks")
@@ -523,6 +620,10 @@ def parser():
     result.add_argument("--token-input", type=Path, default=ROOT / "tools/benchmark-prompts/qwen3-next-code.tokens.json")
     result.add_argument("--model-receipt", type=Path, default=ROOT / "tools/snapdragon-runtime-models.json")
     result.add_argument("--verify-model-sha256", action="store_true", help="stream and verify both large model files before checks")
+    result.add_argument("--attention-calibration-file", type=Path,
+                        help="optional frozen original attn.txt, copied identically into every child private cache")
+    result.add_argument("--semantic-probe-percent", type=int, choices=range(101), default=2,
+                        metavar="0..100", help="hybrid semantic check; default production 2, other values functional only")
     result.add_argument("--create-reference", action="store_true", help="create a missing CPU64 reference and require its locked digest/SHA")
     result.add_argument("--baseline-quality-exe", "--baseline-exe", dest="baseline_quality_exe", type=Path,
                         help="optional baseline quality_check executable for --create-reference")
@@ -531,7 +632,7 @@ def parser():
 
 def main():
     global OUT, BIN, MODEL, MTP, QREF, CODE, RECEIPT, EXPECTED_DIGEST, EXPECTED_QREF_SHA
-    global MODEL_PINS, BASELINE_QUALITY_EXE, VERIFY_MODEL_HASHES
+    global MODEL_PINS, BASELINE_QUALITY_EXE, VERIFY_MODEL_HASHES, SEMANTIC_PROBE_PERCENT, ATTENTION_CALIBRATION
     cli = parser()
     args = cli.parse_args()
     RECEIPT = args.model_receipt.resolve()
@@ -546,6 +647,8 @@ def main():
     EXPECTED_QREF_SHA = receipt["quality_reference"]["sha256"]
     BASELINE_QUALITY_EXE = args.baseline_quality_exe.resolve() if args.baseline_quality_exe else None
     VERIFY_MODEL_HASHES = args.verify_model_sha256
+    SEMANTIC_PROBE_PERCENT = args.semantic_probe_percent
+    ATTENTION_CALIBRATION = attention_input(args.attention_calibration_file)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     OUT = args.out.resolve() if args.out else ROOT / "lib/validation" / ("snapdragon-runtime-" + stamp + "-" + str(os.getpid()))
     if args.create_reference and args.stage == "units":
@@ -587,7 +690,7 @@ def main():
             if not QREF.is_file():
                 raise ValueError("reference missing; supply --reference or explicitly use --create-reference")
             summary["inputs"] = prepare_inputs()
-        stages = [("units", units), ("quality", quality), ("eval", evaluation), ("session", session)]
+        stages = [("units", units), ("quality", quality), ("eval", evaluation), ("session", session), ("hybrid", semantic_hybrid)]
         for name, fn in stages:
             if args.stage not in ("all", name): continue
             passed = fn()
@@ -603,6 +706,10 @@ def main():
         summary["error"] = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
+        if ATTENTION_CALIBRATION is not None:
+            if attention_input(Path(ATTENTION_CALIBRATION["source_path"])) != ATTENTION_CALIBRATION:
+                raise RuntimeError("Original attention calibration changed during validation")
+            summary["attention_calibration_original_unchanged"] = True
         summary["ended_utc"] = datetime.now(timezone.utc).isoformat()
         save(OUT / "summary.json", summary)
         lock.unlink(missing_ok=True)

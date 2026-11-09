@@ -662,6 +662,15 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
         if (janas_spec_config_env(&sc, config_error, sizeof config_error) != 0) {
             fprintf(stderr, "janas-bench: %s\n", config_error); goto failed;
         }
+        struct janas_llm_hybrid_config hc;
+        janas_llm_hybrid_config_default(&hc);
+        if (janas_hybrid_config_env(&hc, config_error, sizeof config_error) != 0) {
+            fprintf(stderr, "janas-bench: %s\n", config_error); goto failed;
+        }
+        json_text(&b, "hybrid_policy", hc.policy ? "cost" : "legacy");
+        json_text(&b, "hybrid_fallback_planner", hc.policy ? "legacy" : "configured");
+        janas_buf_printf(&b, "\"lookup_drafts\":%d,\"mtp_drafts\":%d,\"hybrid_probe_percent\":%d,",
+                         hc.lookup_max_drafts, hc.mtp_max_drafts, hc.probe_percent);
         const char *const planners[] = {"legacy", "cycle", "fixed"};
         json_text(&b, "spec_planner", planners[sc.planner]);
         json_text(&b, "draft_vocab", sc.draft_vocab_policy ? "adaptive" : "legacy");
@@ -859,6 +868,12 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
             }
             janas_buf_puts(&b, ",\"speculation_metrics\":");
             janas_spec_metrics_json(&b, &sm);
+            struct janas_llm_hybrid_metrics hm = {
+                .size = sizeof hm, .version = JANAS_LLM_HYBRID_METRICS_VERSION};
+            if (janas_llm_chat_hybrid_metrics(c, &hm) != JANAS_LLM_OK) goto failed;
+            janas_buf_puts(&b, ",\"hybrid_metrics\":");
+            janas_hybrid_metrics_json(&b, &hm);
+
             if (f->profile_phases)
                 fair_profile_json(&b, &profile, st.output_tokens);
             if (json_line(&b) != 0) {

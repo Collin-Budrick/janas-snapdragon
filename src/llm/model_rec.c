@@ -614,7 +614,8 @@ void janas_m_rec_core(struct janas_llm_model *m, const struct layer *ly,
                          .k_only = chain && m->gdn_konly_active};
     double tv = now();
     janas_pool_run(m->compute, conv_worker, &sj);
-    m->gdn_conv_seconds += now() - tv;
+    double conv_seconds = now() - tv;
+    m->gdn_conv_seconds += conv_seconds;
     trace_row(m, "conv_out", m->conv_out + (size_t)(m->replay + n - 1) * cc,
               cc);
     if (m->trace >= 3) {
@@ -626,7 +627,13 @@ void janas_m_rec_core(struct janas_llm_model *m, const struct layer *ly,
     }
     tv = now();
     janas_pool_run(m->compute, rec_worker, &sj);
-    m->gdn_core_seconds += now() - tv;
+    double core_seconds = now() - tv;
+    m->gdn_core_seconds += core_seconds;
+    /* Recovery and new rows deliberately share traversal and state scratch.
+       Allocate measured pool time by row count; this is an estimate, not an
+       independently timed phase and never extra generation wall time. */
+    if (a && a + n)
+        m->gdn_recovery_seconds += (conv_seconds + core_seconds) * a / (a + n);
     if (chain)
         m->gdn_chain_tokens += n;
     if (sj.recover)

@@ -7,6 +7,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import struct
 from pathlib import Path
 import tempfile
 import unittest
@@ -62,8 +63,9 @@ class RuntimeProtocolTests(unittest.TestCase):
                  "speculation_resolved": "mtp" if c["speculation"] == "auto" else c["speculation"],
                  "cache_bytes_requested": 32 << 30, "reserve_bytes": 12 << 30, "gpu": "", "npu": ""}
         if run["binary"] == "B":
-            setup.update({k: c[k] for k in ("spec_planner", "spec_explore", "draft_vocab", "draft_vocab_rows")})
-            setup.update({"fair_retain_controller": run["controller_protocol"] == "retained_across_fresh_conversations",
+            setup.update({k: c[k] for k in ("spec_planner", "spec_explore", "draft_vocab", "draft_vocab_rows",
+                                          "hybrid_policy", "lookup_drafts", "mtp_drafts", "hybrid_probe_percent")})
+        setup.update({"fair_retain_controller": run["controller_protocol"] == "retained_across_fresh_conversations",
                           "fair_controller_protocol": run["controller_protocol"],
                           "conversation_cache_reuse": False,
                           "history_index_scope": "canonical_tokens_of_current_sample",
@@ -80,8 +82,9 @@ class RuntimeProtocolTests(unittest.TestCase):
                             "total_seconds": 11.0, "first_token_seconds": 1.2,
                             "input_seconds": 1.0, "accelerator_counters": {},
                             "speculation_metrics": {"cycles": 8}})
-            if run["binary"] == "B":
-                samples[-1]["fair_controller_protocol"] = run["controller_protocol"]
+            samples[-1]["fair_controller_protocol"] = run["controller_protocol"]
+            if c["hybrid_policy"] == "cost":
+                samples[-1]["hybrid_metrics"] = {"schema": 1, "decisions": 8}
         return [setup, *samples]
 
     def test_public_paths_and_frozen_prompt_hashes(self):
@@ -127,7 +130,7 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertEqual([r["case"] for r in runs[:3]], ["baseline", "hybrid4", "legacy"])
         self.assertTrue(all(r["warm_rounds"] == 2 for r in runs))
 
-    def test_controller_retention_condition_matrix_is_candidate_only(self):
+    def test_controller_retention_is_symmetric_for_current_baseline(self):
         inputs = self.inputs()
         controls = [({}, False), ({"gdn_chain": 1, "gdn_journal": 1}, False),
                     ({"spec_planner": "fixed"}, False),
@@ -139,7 +142,7 @@ class RuntimeProtocolTests(unittest.TestCase):
             for binary in ("A", "B"):
                 with self.subTest(overrides=overrides, binary=binary):
                     run = tool.run_spec(inputs, "code", "fixture", control, binary, 2, 0)
-                    wanted = binary == "B" and candidate_retain
+                    wanted = True
                     self.assertEqual(run["command"].count("--fair-retain-controller"), int(wanted))
                     self.assertEqual(run["controller_protocol"],
                                      "retained_across_fresh_conversations" if wanted else "fresh_chat_per_sample")
@@ -150,7 +153,9 @@ class RuntimeProtocolTests(unittest.TestCase):
         for value in ([], {"unknown": 1}, {"draft_tokens": True}, {"draft_tokens": 17},
                       {"spec_explore": -1}, {"spec_explore": float("nan")},
                       {"draft_vocab_rows": 123}, {"gdn_chain": False},
-                      {"gdn_journal": 1}, {"gdn_k_only": 1}, {"panels": "magic"}):
+                      {"gdn_chain": 0, "gdn_journal": 1}, {"gdn_journal": 0, "gdn_k_only": 1}, {"panels": "magic"},
+                      {"hybrid_policy": "unknown"}, {"lookup_drafts": 0},
+                      {"mtp_drafts": 17}, {"hybrid_probe_percent": True}):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 tool.valid_control(value)
         self.assertEqual(tool.valid_control({"draft_tokens": 16})["draft_tokens"], 16)
@@ -329,12 +334,12 @@ class RuntimeProtocolTests(unittest.TestCase):
         del bad[1]["fair_controller_protocol"]
         self.assertTrue(tool.validate_records(bad, run))
 
-    def test_frozen_baseline_allows_absent_controller_fields_but_not_false_claims(self):
+    def test_current_baseline_requires_same_retained_controller_protocol(self):
         run = tool.build_plan(self.args(), self.inputs())["contract"]["plan"][0]
         records = self.records(run)
         self.assertEqual(tool.validate_records(records, run), [])
-        for field, value in (("fair_retain_controller", True),
-                             ("fair_controller_protocol", "retained_across_fresh_conversations"),
+        for field, value in (("fair_retain_controller", False),
+                             ("fair_controller_protocol", "fresh_chat_per_sample"),
                              ("conversation_cache_reuse", True),
                              ("history_index_scope", "previous_conversation"),
                              ("target_sampler_seed_scope", "continued")):
@@ -342,9 +347,110 @@ class RuntimeProtocolTests(unittest.TestCase):
             bad[0][field] = value
             with self.subTest(field=field):
                 self.assertTrue(tool.validate_records(bad, run))
-        bad = copy.deepcopy(records)
-        bad[1]["fair_controller_protocol"] = "retained_across_fresh_conversations"
-        self.assertTrue(tool.validate_records(bad, run))
+            del bad[0][field]
+            self.assertTrue(tool.validate_records(bad, run))
+
+    def test_baseline_controls_preserve_promoted_gdn_and_custom_overrides(self):
+        controls = self.folder / "baseline-controls.json"
+        controls.write_text(json.dumps({"gdn_chain": 0, "gdn_journal": 0, "gdn_k_only": 0}))
+        manifest = tool.build_plan(self.args(extra=["--baseline-controls", str(controls),
+            "--candidate-case", "hybrid-cost8"]), self.inputs())
+        baseline, candidate = manifest["contract"]["plan"][:2]
+        self.assertEqual([baseline["control"][k] for k in ("gdn_chain", "gdn_journal", "gdn_k_only")], [0,0,0])
+        self.assertEqual([candidate["control"][k] for k in ("gdn_chain", "gdn_journal", "gdn_k_only")], [1,1,1])
+        self.assertEqual(candidate["control"]["draft_tokens"], 8)
+        self.assertEqual(candidate["control"]["mtp_drafts"], 4)
+        self.assertIn("--hybrid-policy", candidate["command"])
+        self.assertEqual(tool.DEFAULT_CONTROL["gdn_k_only"], 1)
+        records = self.records(candidate)
+        self.assertEqual(tool.validate_records(records, candidate), [])
+        del records[1]["hybrid_metrics"]
+        self.assertIn("cost-aware hybrid metrics missing", tool.validate_records(records, candidate))
+
+    def test_identical_calibration_seeds_and_original_preserved(self):
+        path = self.folder / "drafts-0123456789abcdef.bin"
+        data = struct.pack("<20d", *([10.0] * 10 + [7.0] * 10))
+        path.write_bytes(data)
+        frozen = tool.calibration_input(path)
+        self.assertEqual(frozen["state"], "seeded")
+        for label in ("A", "B"):
+            cache = self.folder / label
+            initial = tool.seed_calibration(cache, frozen)
+            target = Path(initial["private_path"])
+            self.assertEqual(target.read_bytes(), data)
+            target.write_bytes(b"private per-process training")
+            tool.verify_calibration_source(frozen)
+        self.assertEqual(path.read_bytes(), data)
+        path.write_bytes(data[:-1])
+        with self.assertRaises((RuntimeError, ValueError)):
+            tool.verify_calibration_source(frozen)
+
+    def test_calibration_absence_is_frozen_and_invalid_counts_refused(self):
+        path = self.folder / "drafts-0123456789abcdef.bin"
+        absent = tool.calibration_input(path)
+        self.assertEqual(absent["state"], "absent")
+        cache = self.folder / "absent-cache"
+        self.assertIsNone(tool.seed_calibration(cache, absent)["private_path"])
+        self.assertFalse(cache.exists())
+        path.write_bytes(struct.pack("<20d", *([0.0] * 10 + [1.0] * 10)))
+        with self.assertRaises(ValueError):
+            tool.calibration_input(path)
+        with self.assertRaises(ValueError):
+            tool.calibration_input(self.folder / "credentials.bin")
+        path.write_bytes(struct.pack("<20d", *([1.0] * 20)))
+        with self.assertRaises(RuntimeError):
+            tool.verify_calibration_source(absent)
+
+    def test_attention_calibration_preserves_legacy_columns_and_original(self):
+        path = self.folder / "attn.txt"
+        data = b"Snapdragon_X|8|16/2/256|0|2048 4294967295 1024\n"
+        path.write_bytes(data)
+        frozen = tool.calibration_input(path, "attention")
+        self.assertEqual(frozen["kind"], "attention")
+        for arm in ("attention-A", "attention-B"):
+            seeded = tool.seed_calibration(self.folder / arm, frozen)
+            self.assertEqual(Path(seeded["private_path"]).read_bytes(), data)
+        self.assertEqual(path.read_bytes(), data)
+        args = self.args(extra=["--attention-calibration-file", str(path)])
+        with mock.patch.object(tool, "source_identity", return_value={"fixture": True}):
+            inputs = tool.prepare_inputs(args)
+        self.assertEqual(inputs["attention_calibration"], frozen)
+        for data in (b"key 1\n", b"key|8 -1 1024\n", b"key|8 4294967296 1024\n"):
+            path.write_bytes(data)
+            with self.assertRaises(ValueError):
+                tool.calibration_input(path, "attention")
+
+    def test_private_attention_retiming_is_detected_after_child(self):
+        path = self.folder / "attn.txt"
+        data = b"Snapdragon_X|8|16/2/256|0|2048 4294967295 1024\n"
+        path.write_bytes(data)
+        frozen = tool.calibration_input(path, "attention")
+        cache = self.folder / "attention-child"
+        seeded = tool.seed_calibration(cache, frozen)
+        self.assertTrue(tool.attention_calibration_result(cache, frozen)["unchanged"])
+        private = Path(seeded["private_path"])
+        private.write_bytes(data + b"Other_CPU|8|16/2/256|0|2048 1024 1024\n")
+        report = tool.attention_calibration_result(cache, frozen)
+        self.assertFalse(report["unchanged"])
+        self.assertTrue(report["auto_retiming_detected"])
+        private.unlink()
+        self.assertFalse(tool.attention_calibration_result(cache, frozen)["unchanged"])
+        self.assertEqual(path.read_bytes(), data)
+
+    def test_promotion_requires_all_workloads_five_warm_and_guardrails(self):
+        manifest = tool.build_plan(self.args(), self.inputs())
+        records = []
+        for run in manifest["contract"]["plan"]:
+            samples = self.records(run)
+            for sample in samples[1:]:
+                sample["output_tokens_per_second"] = 14 if run["binary"] == "B" else 12.8
+            records.append({**run, "status": "ok", "records": samples, "process_wall_seconds": 1.0})
+        self.assertTrue(tool.summary(manifest, records)["promotion"]["passed"])
+        for record in records:
+            if record["binary"] == "B" and record["workload"] == "prose":
+                for sample in record["records"][1:]:
+                    sample["first_token_seconds"] = 1.3
+        self.assertFalse(tool.summary(manifest, records)["promotion"]["passed"])
 
 
 if __name__ == "__main__":

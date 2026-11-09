@@ -61,6 +61,17 @@ void out_usage(yyjson_mut_doc *d, yyjson_mut_val *obj, const struct srv_job *j)
         }
         janas_buf_free(&text);
     }
+    if (j->hybrid_valid) {
+        struct janas_buf text = {0};
+        janas_hybrid_metrics_json(&text, &j->hybrid);
+        yyjson_doc *metrics = text.oom ? NULL : yyjson_read(text.p, text.n, 0);
+        if (metrics) {
+            yyjson_mut_val *copy = yyjson_val_mut_copy(d, yyjson_doc_get_root(metrics));
+            if (copy) yyjson_mut_obj_add_val(d, jn, "hybrid", copy);
+            yyjson_doc_free(metrics);
+        }
+        janas_buf_free(&text);
+    }
 }
 
 const char *out_finish(const struct srv_choice *c)

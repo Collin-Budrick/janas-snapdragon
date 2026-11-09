@@ -252,5 +252,6 @@ void janas_llm_model_runtime_stats(const struct janas_llm_model *m,
     out->gdn_konly_replay_tokens = m->gdn_konly_replay_tokens;
     out->gdn_core_seconds = m->gdn_core_seconds;
     out->gdn_conv_seconds = m->gdn_conv_seconds;
+    out->gdn_recovery_seconds = m->gdn_recovery_seconds;
     out->gdn_delta_bytes = m->gdn_delta_bytes;
 }
