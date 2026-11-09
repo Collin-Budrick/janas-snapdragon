@@ -168,6 +168,19 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotEqual(identity, self.v.case_identity("unit-test_fixture", [exe], env))
         self.assertIsNone(self.v.cache_load("unit-test_fixture", [exe], env))
 
+    def test_mojo_false_skip_field_is_metadata_false_but_real_skips_are_rejected(self):
+        path = self.root / "test_mojo.exe"
+        valid = dict(test="mojo", cases=1989, compared_words=178914, failures=0, skipped=False)
+        for skipped, marker in ((False, ""), (True, ""), (False, "SKIP optional module\n"),
+                                (False, "test_mojo: skipped unavailable module\n")):
+            value = dict(valid, skipped=skipped)
+            r = self.result("unit-test_mojo", json.dumps(value) + "\n")
+            Path(r["stderr"]).write_text(marker)
+            checked = self.v.validate_unit_result(r, path)
+            with self.subTest(skipped=skipped, marker=marker):
+                self.assertEqual(checked["explicit_skip"], skipped or bool(marker))
+                self.assertEqual(checked["passed"], not skipped and not marker)
+
     def test_mojo_source_identity_includes_kernel_and_build_script(self):
         root = self.root / "source"
         (root / "tools").mkdir(parents=True)

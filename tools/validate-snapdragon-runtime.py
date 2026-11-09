@@ -476,11 +476,20 @@ def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,), allow_c
 def validate_unit_result(r,path):
     text = read_log(r)
     errors = []
+    explicit_skip = bool(re.search(r"(?i)\bskipped\b", text))
     if path.name.lower() == "test_mojo.exe":
+        # A field named "skipped" is not a skip when its JSON value is false.
+        # Genuine skip text outside the result record still rejects this
+        # explicitly requested module matrix, even beside a passing record.
+        non_json = "\n".join(line for line in text.splitlines()
+                             if not line.lstrip().startswith("{"))
+        explicit_skip = bool(re.search(r"(?i)\bskip(?:ped)?\b", non_json))
         try:
             rows = [json.loads(line) for line in text.splitlines() if line.lstrip().startswith("{")]
+            explicit_skip = explicit_skip or any(isinstance(row, dict) and
+                row.get("skipped") is True for row in rows)
             value = rows[0] if len(rows) == 1 else {}
-            if (value.get("test") != "mojo" or value.get("skipped") is not False or
+            if (explicit_skip or value.get("test") != "mojo" or value.get("skipped") is not False or
                     type(value.get("cases")) is not int or value["cases"] < 1341 or
                     type(value.get("compared_words")) is not int or value["compared_words"] < 144570 or
                     type(value.get("failures")) is not int or value["failures"] != 0):
@@ -491,7 +500,7 @@ def validate_unit_result(r,path):
         errors.append("missing named unit success/explicit skip marker")
     if re.search(r"(?im)^\s*(?:FAIL(?:ED)?\b|AddressSanitizer:|runtime error:)", text):
         errors.append("unit emitted failure/sanitizer marker")
-    r.update(validation_errors=errors, explicit_skip=bool(re.search(r"(?i)\bskipped\b", text)),
+    r.update(validation_errors=errors, explicit_skip=explicit_skip,
              parent_cpu_mask=255 if FAST else None,
              executor=r.get("executor","inherited_proof") if r.get("proof_reused") else "bounded_parallel_model_free" if FAST else "serial")
     r["passed"] = r["passed"] and not errors
