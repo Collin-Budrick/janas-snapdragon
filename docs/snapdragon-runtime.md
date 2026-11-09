@@ -251,3 +251,19 @@ Benchmark comparisons must freeze the current promoted MTP4 executable and GDN11
 The previous AUTO attention selector could choose different query-score precision for the same token depending on verification width. A reproducible 1,024-token boundary case cached `UINT32_MAX` (always floating point) for single tokens and `1024` for batches; after four identical copying replies, ordinary MTP4 diverged from plain decoding at a topic switch. The target weights, KV quantization and DeltaNet rounding were unchanged.
 
 AUTO now follows the **single-token precision policy at each absolute token position** for every width. A batch crossing that threshold is split only within attention scoring, preserving query/output row offsets and custom visibility bounds. Fixed `float` and `int16` settings are unchanged. Existing two-column calibration files remain readable. This corrects target verification rather than choosing a new approximation. Regression coverage includes differing calibration columns, threshold crossings and widths 1–17. Matched trials also freeze the original profile's `attn.txt` in both private caches; runtime timing calibration must not silently change the numerical reference between arms.
+
+### Matched hybrid evaluation (8 November 2026)
+
+[Raw benchmark and source decisions](benchmarks/snapdragon80b-20261108-hybrid-cost.json) and [correctness/attention regression proof](benchmarks/snapdragon80b-20261108-hybrid-cost-validation.json) retain the frozen executable, calibration, controls and all samples.
+
+| Workload | Frozen current MTP4 | Cost hybrid8/MTP4 | Change |
+|---|---:|---:|---:|
+| Code | 20.34 tok/s | 19.83 tok/s | -2.5% |
+| Prose | 16.61 tok/s | 14.32 tok/s | -13.8% |
+| Longer prompt | 10.30 tok/s | 14.28 tok/s | +38.7% |
+
+The geometric mean improved 5.2%, but prose failed the 3% regression floor, so **the CPU profile retains MTP4**. Hybrid remains opt-in. These primary warm replies selected lookup only for bounded exploration; the apparent aggregate gain is not evidence of normal lookup exploitation. Long-workload timings varied substantially (warm generation 7.48–16.75 tok/s); all slow samples are retained. The machine used Balanced power on battery, declining from 56% to 32% over the primary trials.
+
+The separate conversation check demonstrated normal lookup use: 696 accepted lookup tokens across copying/return phases, then zero lookup selections and 63 MTP selections across the two unrelated topic switches. Every output token and text byte matched plain decoding under greedy and seeded sampling. Its ordered diagnostic timings are not a promotion benchmark.
+
+A same-binary prose ABBA check with lookup probes disabled measured MTP4 at 11.00 tok/s and cost hybrid at 10.59 tok/s. It did not eliminate fallback timing/draft-depth differences; no deterministic arithmetic discrepancy was found. Timing-based legacy draft-depth decisions and system variability remain performance limitations. This diagnostic does not replace the frozen-current-profile comparison. Neither 40 nor 50 tok/s was demonstrated.
