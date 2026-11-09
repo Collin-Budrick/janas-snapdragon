@@ -17,6 +17,8 @@ struct janas_llm_model {
     uint32_t ctx, period, last_pos, last_n, max_width;
     int bad_drafts, peaky;
     float draft_conf;
+    double pass_seconds[JANAS_LLM_MAX_BLOCK + 1];
+    double draft_seconds, draft_head_seconds;
     double recovery_on_next;
     int invalid_calls, invalid_prepare, prepare_calls, feedback_calls;
     uint32_t forward_calls, mtp_calls, mtp_rows, note_rows;
@@ -39,6 +41,11 @@ static int fixture_clock_gettime(clockid_t clock_id, struct timespec *ts)
     ts->tv_sec = (time_t)(tick / UINT64_C(10000000));
     ts->tv_nsec = (long)((tick % UINT64_C(10000000)) * 100);
     return 0;
+}
+static void fixture_clock_advance(double seconds)
+{
+    if (seconds > 0)
+        fixture_clock_ticks += (uint64_t)(seconds * 10000000.0 + 0.5);
 }
 #define clock_gettime fixture_clock_gettime
 #include "../src/llm/generate.c"
@@ -95,7 +102,9 @@ int janas_llm_model_recurrent(const struct janas_llm_model *m)
 int janas_llm_model_settling(const struct janas_llm_model *m)
 { (void)m; return 0; }
 double janas_llm_model_pass_seconds(const struct janas_llm_model *m)
-{ (void)m; return 0.001; }
+{
+    return m->pass_seconds[m->last_n] > 0 ? m->pass_seconds[m->last_n] : 0.001;
+}
 const float *janas_llm_model_hidden(const struct janas_llm_model *m)
 { return m->hidden; }
 const float *janas_llm_mtp_hidden(const struct janas_llm_model *m)
@@ -161,6 +170,7 @@ int janas_llm_model_forward(struct janas_llm_model *m, const int32_t *tokens,
     m->last_n = n;
     m->last_logits = logits;
     m->forward_calls++;
+    fixture_clock_advance(m->pass_seconds[n]);
     m->runtime.gdn_recovery_seconds += m->recovery_on_next;
     m->recovery_on_next = 0;
     /* Two observed assignments per group: a constant high-reuse context.
@@ -208,7 +218,8 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
                           : next_token(m, tokens[n - 1]);
     *conf = m->draft_conf;
     m->costs.head_calls++;
-    m->costs.head_seconds += 1e-6;
+    m->costs.head_seconds += m->draft_head_seconds > 0 ? m->draft_head_seconds : 1e-6;
+    fixture_clock_advance(m->draft_seconds);
     return 0;
 }
 void janas_llm_mtp_note_tokens(struct janas_llm_model *m,
@@ -649,6 +660,161 @@ static struct janas_gen_options cost_options(float temperature)
     return o;
 }
 
+static void prepared_prefix_costs(void)
+{
+    struct planner p = {0};
+    float survival[MAX_SPEC_K] = {0.5f, 0.3f};
+    p.t[1] = 0.100; p.t[2] = 0.145; p.t[3] = 0.160;
+    p.chain = 0.020;
+    CHECK(plan_drafts(&p, survival, 2) == 1,
+          "construction still prices future chain work rather than expanding unconditionally");
+    CHECK(plan_prepared_drafts(&p, survival, 2, 0.040) == 2,
+          "prepared prefix compares one common actual preparation cost for every width");
+    CHECK(plan_prepared_drafts(&p, survival, 2, 0) == 2,
+          "prepared prefix does not charge an already executed chain again");
+    p.chain = INFINITY;
+    CHECK(plan_prepared_drafts(&p, survival, 2, 0.040) == 2,
+          "prepared selection is independent of the obsolete future-chain estimate");
+    survival[0] = survival[1] = 0;
+    CHECK(plan_prepared_drafts(&p, survival, 2, 0.040) == 0,
+          "paid preparation does not force verification of zero-confidence drafts");
+    CHECK(plan_prepared_drafts(&p, NULL, 0, 0.040) == 0,
+          "an empty prepared proposal has no speculative prefix");
+    survival[0] = 0.5f; survival[1] = 0.3f;
+    CHECK(plan_prepared_drafts(NULL, survival, 2, 0.040) == 0 &&
+          plan_prepared_drafts(&p, NULL, 2, 0.040) == 0 &&
+          plan_prepared_drafts(&p, survival, -1, 0.040) == 0 &&
+          plan_prepared_drafts(&p, survival, MAX_SPEC_K + 1, 0.040) == 0,
+          "invalid prepared-prefix arguments fail closed before reading arrays");
+    const double invalid_preparation[] = {-0.001, NAN, INFINITY};
+    for (unsigned i = 0; i < sizeof(invalid_preparation) / sizeof(*invalid_preparation); i++)
+        CHECK(plan_prepared_drafts(&p, survival, 2, invalid_preparation[i]) == 0,
+              "invalid preparation cost cannot select a speculative prefix");
+    const float invalid_survival[] = {-0.001f, 1.001f, NAN, INFINITY};
+    for (unsigned i = 0; i < sizeof(invalid_survival) / sizeof(*invalid_survival); i++) {
+        survival[1] = invalid_survival[i];
+        CHECK(plan_prepared_drafts(&p, survival, 2, 0.040) == 0,
+              "invalid draft survival cannot reach calibration-bin indexing");
+    }
+    survival[1] = 0.3f;
+    p.t[1] = INFINITY;
+    CHECK(plan_prepared_drafts(&p, survival, 2, 0.040) == 0,
+          "nonfinite plain-pass prediction cannot establish utility");
+    p.t[1] = 0.100; p.t[2] = INFINITY;
+    CHECK(plan_prepared_drafts(&p, survival, 2, 0.040) == 0,
+          "nonfinite verification prediction cannot establish utility");
+}
+
+/* A steady-state example that the old constant-width mock could not expose:
+ * building a second draft is worthwhile, but construction's chain estimate
+ * would then incorrectly make the verifier throw that paid draft away. */
+static void prepared_fallback_boundary(void)
+{
+    struct janas_llm_model a, b;
+    model_init(&a); model_init(&b);
+    a.peaky = b.peaky = 1;
+    a.draft_conf = b.draft_conf = 0.5f;
+    a.draft_seconds = b.draft_seconds = 0.020;
+    a.draft_head_seconds = b.draft_head_seconds = 0.010;
+    const double costs[] = {0, 0.100, 0.145, 0.160, 0.600, 0.800};
+    memcpy(a.pass_seconds, costs, sizeof(costs));
+    memcpy(b.pass_seconds, costs, sizeof(costs));
+    struct janas_gen_options oa = options(JANAS_SPEC_MTP, 0, 0);
+    struct janas_gen_options ob = cost_options(0);
+    oa.spec_auto = ob.spec_auto = 1;
+    struct janas_llm_session *sa = janas_llm_session_create(&a, &oa);
+    struct janas_llm_session *sb = janas_llm_session_create(&b, &ob);
+    CHECK(sa && sb, "variable-width steady-state sessions created");
+    if (!sa || !sb) {
+        janas_llm_session_destroy(sa); janas_llm_session_destroy(sb); return;
+    }
+    int32_t prompt = 0, ta = -1, tb = -1;
+    CHECK(janas_llm_session_append(sa, &prompt, 1) == 0 &&
+          janas_llm_session_append(sb, &prompt, 1) == 0,
+          "steady-state comparison starts from one canonical token");
+    memcpy(sa->pl.t, costs, sizeof(costs));
+    memcpy(sb->pl.t, costs, sizeof(costs));
+    sa->pl.chain = sb->pl.chain = 0.020;
+    sa->could_draft = sb->could_draft = 1; /* measured costs are already current */
+    janas_llm_session_reply_remaining(sa, 8);
+    janas_llm_session_reply_remaining(sb, 8);
+    CHECK(janas_llm_session_next(sa, &ta) == 0 &&
+          janas_llm_session_next(sb, &tb) == 0 && ta == tb,
+          "both planners produce the same first target token");
+    CHECK(sa->n_mdraft == 2 && sb->n_mdraft == 2 &&
+          a.costs.head_calls == 2 && b.costs.head_calls == 2,
+          "construction prepares the same bounded two-draft chain in both modes");
+    CHECK(plan_drafts(&sa->pl, sa->msurv, sa->n_mdraft) == 1 &&
+          plan_drafts(&sb->pl, sb->msurv, sb->n_mdraft) == 1,
+          "old verification pricing would discard a prepared second draft");
+    CHECK(janas_llm_session_next(sa, &ta) == 0 &&
+          janas_llm_session_next(sb, &tb) == 0 && ta == tb,
+          "prepared-prefix verification preserves the next exact target token");
+    CHECK(sa->metrics.last.pass_width == 3 && sb->metrics.last.pass_width == 3 &&
+          sa->metrics.last.accepted_prefix == 2 && sb->metrics.last.accepted_prefix == 2,
+          "legacy and hybrid both verify the useful paid prefix instead of underdrafting");
+    CHECK(memcmp(sa->pl.tried, sb->pl.tried, sizeof(sa->pl.tried)) == 0 &&
+          memcmp(sa->pl.won, sb->pl.won, sizeof(sa->pl.won)) == 0 &&
+          sa->pl.tried[cal_bin(0.5f)] == 1 && sa->pl.tried[cal_bin(0.25f)] == 1,
+          "accepted second draft trains identical original confidence bins");
+    CHECK(!a.invalid_calls && !b.invalid_calls && !a.invalid_prepare && !b.invalid_prepare,
+          "prepared-prefix selection keeps canonical target-logit and replay views");
+    canonical_mtp(sa, &a); canonical_mtp(sb, &b);
+    janas_llm_session_destroy(sa); janas_llm_session_destroy(sb);
+}
+
+static void variable_width_fallback(float temperature, unsigned shape)
+{
+    struct janas_llm_model a, b;
+    model_init(&a); model_init(&b);
+    const float confidences[] = {0.2f, 0.5f, 0.9f};
+    const double chain_costs[] = {0.010, 0.020, 0.005};
+    const double head_costs[] = {0.004, 0.010, 0.002};
+    a.draft_conf = b.draft_conf = confidences[shape];
+    a.draft_seconds = b.draft_seconds = chain_costs[shape];
+    a.draft_head_seconds = b.draft_head_seconds = head_costs[shape];
+    for (unsigned n = 1; n <= JANAS_LLM_MAX_BLOCK; n++)
+        a.pass_seconds[n] = b.pass_seconds[n] = 0.100 + 0.025 * (n - 1);
+    struct janas_gen_options oa = options(JANAS_SPEC_MTP, 0, temperature);
+    struct janas_gen_options ob = cost_options(temperature);
+    oa.spec_auto = ob.spec_auto = 1;
+    struct janas_llm_session *sa = janas_llm_session_create(&a, &oa);
+    struct janas_llm_session *sb = janas_llm_session_create(&b, &ob);
+    CHECK(sa && sb, "nonflat-cost legacy and hybrid sessions created");
+    if (!sa || !sb) {
+        janas_llm_session_destroy(sa); janas_llm_session_destroy(sb); return;
+    }
+    const int32_t prompt[] = {0, 1, 2, 3, 0, 1, 2, 3}, turn[] = {8, 9, 10};
+    for (unsigned reply = 0; reply < 3; reply++) {
+        if (reply == 2) {
+            janas_llm_session_reset(sa); janas_llm_session_reset(sb);
+        }
+        const int32_t *tokens = reply == 1 ? turn : prompt;
+        unsigned count = reply == 1 ? 3 : 8;
+        CHECK(janas_llm_session_append(sa, tokens, count) == 0 &&
+              janas_llm_session_append(sb, tokens, count) == 0,
+              "variable-cost turn/reset appends matching canonical histories");
+        janas_llm_session_reply_remaining(sa, 48);
+        janas_llm_session_reply_remaining(sb, 48);
+        for (unsigned i = 0; i < 48; i++) {
+            int32_t ta = -1, tb = -1;
+            CHECK(janas_llm_session_next(sa, &ta) == 0 &&
+                  janas_llm_session_next(sb, &tb) == 0 && ta == tb,
+                  "nonflat costs preserve greedy/seeded target transcript across turns and reset");
+            CHECK(sa->n_mdraft <= 4 && sb->n_mdraft <= 4,
+                  "global lookup ceiling eight never expands calibrated MTP4 fallback");
+        }
+        CHECK(sa->ret == sa->n && sb->ret == sb->n,
+              "variable-cost reply limit leaves no unread target output");
+        canonical_mtp(sa, &a); canonical_mtp(sb, &b);
+    }
+    CHECK(sb->hybrid_metrics.lookup_selected == 0 &&
+          sb->metrics.source_drafted[JANAS_GEN_SOURCE_LOOKUP] == 0 &&
+          !a.invalid_calls && !b.invalid_calls && !a.invalid_prepare && !b.invalid_prepare,
+          "zero-probe fallback needs no lookup proposal or invalid target row");
+    janas_llm_session_destroy(sa); janas_llm_session_destroy(sb);
+}
+
 static void cost_fallback_confidence(float temperature, int confidence_stop)
 {
     struct janas_llm_model a, b;
@@ -698,6 +864,77 @@ static void cost_fallback_confidence(float temperature, int confidence_stop)
     janas_llm_session_destroy(sa); janas_llm_session_destroy(sb);
 }
 
+/* Width one already supplies an exact label for a declined first draft. The
+ * label must not require another target row or another draft-head evaluation. */
+static void declined_first_draft_label(int cost_mode, int bad_draft, unsigned guard)
+{
+    struct janas_llm_model m;
+    model_init(&m);
+    m.peaky = 1; m.bad_drafts = bad_draft; m.draft_conf = 0.2f;
+    m.draft_seconds = 0.002; m.draft_head_seconds = 0.001;
+    m.pass_seconds[1] = 0.100; m.pass_seconds[2] = 0.145;
+    struct janas_gen_options o = cost_mode ? cost_options(0)
+                                         : options(JANAS_SPEC_MTP, 0, 0);
+    o.spec_auto = 1;
+    if (guard == 2) o.presence_penalty = 0.1f;
+    if (guard == 3) o.frequency_penalty = 0.1f;
+    if (guard == 4) { o.stop[0] = 2; o.n_stop = 1; }
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "declined-first-draft calibration session created");
+    if (!s) return;
+    struct filter_state state = {0};
+    struct janas_sample_filter filter = {
+        .ctx = &state, .active = filter_active,
+        .allows = filter_allows, .accept = filter_accept
+    };
+    if (guard == 1) janas_llm_session_filter(s, &filter);
+    int32_t prompt = 0, token = -1;
+    CHECK(janas_llm_session_append(s, &prompt, 1) == 0 &&
+          janas_llm_session_next(s, &token) == 0 && token == 1,
+          "first real target pass prepares the calibration fixture");
+    int guarded = guard >= 1 && guard <= 3;
+    CHECK(s->n_mdraft == (cost_mode && guarded ? 0 : 1),
+          "only an unguarded prepared first MTP draft can supply a free label");
+    if (s->n_mdraft) {
+        CHECK(s->pending.planner_source == JANAS_GEN_SOURCE_MTP &&
+              s->mdraft[0] == (bad_draft ? 10 : 2) && s->msurv[0] == 0.2f,
+              "prepared first-draft token and confidence are the ones actually scored");
+    }
+    unsigned bin = (unsigned)cal_bin(0.2f);
+    memset(s->pl.tried, 0, sizeof(s->pl.tried));
+    memset(s->pl.won, 0, sizeof(s->pl.won));
+    s->pl.tried[bin] = 4; /* deliberately pessimistic, still valid calibration */
+    s->pl.t[1] = 0.100; s->pl.t[2] = 0.145;
+    CHECK(!s->n_mdraft ||
+          plan_prepared_drafts(&s->pl, s->msurv, s->n_mdraft,
+                               s->pending.preparation_seconds) == 0,
+          "the measured-cost planner really declines the prepared draft");
+    /* Two remaining outputs permit a draft in this pass, but leave no useful
+       draft for the following pass. Thus head/chain call counts cannot hide
+       extra work performed just to learn the label. */
+    janas_llm_session_reply_remaining(s, 2);
+    uint32_t forwards = m.forward_calls, mtp_calls = m.mtp_calls;
+    uint64_t heads = m.costs.head_calls;
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 2 &&
+          s->metrics.last.pass_width == 1 && s->metrics.last.accepted_prefix == 0,
+          "declined draft uses only the actual first target sample at width one");
+    CHECK(s->pl.tried[bin] == (guarded ? 4 : 5) &&
+          s->pl.won[bin] == (!guarded && !bad_draft && guard != 4 ? 1 : 0),
+          "declined first draft trains once with its exact match/stop label, excluding guards");
+    double tried = 0, won = 0;
+    for (unsigned b = 0; b < CAL_BINS; b++) {
+        tried += s->pl.tried[b]; won += s->pl.won[b];
+    }
+    CHECK(tried == s->pl.tried[bin] && won == s->pl.won[bin],
+          "a declined proposal supplies no fabricated later-position labels");
+    CHECK(m.forward_calls == forwards + 1 && m.last_n == 1 &&
+          m.costs.head_calls == heads && m.mtp_calls == mtp_calls + 1 &&
+          !m.invalid_calls && !m.invalid_prepare,
+          "free calibration adds no target row, head or chain beyond required MTP maintenance");
+    canonical_mtp(s, &m);
+    janas_llm_session_destroy(s);
+}
+
 static void train_cost_lookup(struct janas_llm_session *s)
 {
     struct janas_hybrid_observation o = {
@@ -708,6 +945,43 @@ static void train_cost_lookup(struct janas_llm_session *s)
     o.delivered = o.pass_width = 9; o.lookup_suffix = 8;
     o.seconds = 0.001; o.verification_seconds = 0.0008;
     for (unsigned i = 0; i < 3; i++) janas_hybrid_observe(&s->hybrid, &o);
+}
+
+static void declined_lookup_ignores_stale_mtp(void)
+{
+    struct janas_llm_model m;
+    model_init(&m); m.period = 4; m.peaky = 1;
+    struct janas_gen_options o = cost_options(0);
+    o.spec_auto = 1;
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "stale-MTP lookup calibration session created");
+    if (!s) return;
+    train_cost_lookup(s);
+    int32_t prompt[] = {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3};
+    CHECK(janas_llm_session_append(s, prompt, 12) == 0,
+          "lookup calibration fixture appends exact repeated history");
+    s->msurv[0] = 0.2f; /* stale confidence, never scored for the lookup */
+    s->pl.tried[cal_bin(0.2f)] = 4; s->pl.won[cal_bin(0.2f)] = 2;
+    double tried[CAL_BINS], won[CAL_BINS];
+    memcpy(tried, s->pl.tried, sizeof(tried));
+    memcpy(won, s->pl.won, sizeof(won));
+    janas_llm_session_reply_remaining(s, 32);
+    int32_t token = -1;
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 0 &&
+          s->pending.planner_source == JANAS_GEN_SOURCE_LOOKUP && s->n_mdraft > 0,
+          "cheap lookup is selected while stale MTP confidence remains present");
+    uint32_t forwards = m.forward_calls;
+    janas_llm_session_reply_remaining(s, 1);
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 1 &&
+          s->metrics.last.pass_width == 1 &&
+          s->metrics.last.planner_source == JANAS_GEN_SOURCE_LOOKUP,
+          "reply clipping declines the prepared lookup without evaluating a future target row");
+    CHECK(memcmp(tried, s->pl.tried, sizeof(tried)) == 0 &&
+          memcmp(won, s->pl.won, sizeof(won)) == 0 &&
+          m.forward_calls == forwards + 1 && m.last_n == 1 && !m.costs.head_calls,
+          "declined lookup never labels an unscored MTP prediction from stale confidence");
+    canonical_mtp(s, &m);
+    janas_llm_session_destroy(s);
 }
 
 static void cost_lookup_maintenance_and_recovery(void)
@@ -920,10 +1194,23 @@ int main(void)
     abandoned_cycle_observation();
     late_hybrid_lookup();
     lookup_eos_context();
+    prepared_prefix_costs();
+    prepared_fallback_boundary();
+    for (unsigned shape = 0; shape < 3; shape++) {
+        variable_width_fallback(0, shape);
+        variable_width_fallback(1, shape);
+    }
     cost_fallback_confidence(0, 0);
     cost_fallback_confidence(1, 0);
     cost_fallback_confidence(0, 1);
     cost_fallback_confidence(1, 1);
+    for (int cost_mode = 0; cost_mode < 2; cost_mode++) {
+        declined_first_draft_label(cost_mode, 0, 0);
+        declined_first_draft_label(cost_mode, 1, 0);
+        for (unsigned guard = 1; guard <= 4; guard++)
+            declined_first_draft_label(cost_mode, 0, guard);
+    }
+    declined_lookup_ignores_stale_mtp();
     cost_lookup_maintenance_and_recovery();
     cost_recovery_conservation();
     cost_stops_and_context();

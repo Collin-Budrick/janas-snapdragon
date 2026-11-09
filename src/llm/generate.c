@@ -205,6 +205,37 @@ static int plan_drafts(const struct planner *p, const float *survs, int avail)
     return best;
 }
 
+/* The chain is already built when the target chooses a verification width.
+ * Shortening it cannot refund its head/chain work. Compare prefixes with the
+ * same actual preparation cost, rather than charging counterfactual chain
+ * steps again. Keep plan_drafts() for deciding whether to build another step.
+ * Otherwise a speculative estimate can waste freshly scored drafts while its
+ * target cost is refreshed only by the once-in-16 forced verification. */
+static int plan_prepared_drafts(const struct planner *p, const float *survs,
+                                int avail, double preparation)
+{
+    if (!p || !survs || avail < 0 || avail > MAX_SPEC_K ||
+        !isfinite(preparation) || preparation < 0)
+        return 0;
+    double cost = pass_cost(p, 1) + preparation;
+    if (!isfinite(cost) || cost <= 0) return 0;
+    double expect = 1.0, best_rate = 1.0 / cost;
+    int best = 0;
+    for (int i = 0; i < avail; i++) {
+        if (!isfinite(survs[i]) || survs[i] < 0 || survs[i] > 1)
+            return 0;
+        expect += cal_chance(p, survs[i]);
+        cost = pass_cost(p, i + 2) + preparation;
+        if (!isfinite(cost) || cost <= 0) return 0;
+        double rate = expect / cost;
+        if (rate > best_rate) {
+            best_rate = rate;
+            best = i + 1;
+        }
+    }
+    return best;
+}
+
 /*
  * After a pass at position pos that accepted acc drafts: the MTP rows of the
  * new tokens (token t_{i+1} with the main model's h_i, at position i, for
@@ -1365,7 +1396,8 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
     if (measured) {
         nd = s->n_mdraft;
         if (cost_hybrid && current.planner_source == JANAS_GEN_SOURCE_MTP && plan) {
-            nd = plan_drafts(mtp_planner(s), s->msurv, s->n_mdraft);
+            nd = plan_prepared_drafts(mtp_planner(s), s->msurv, s->n_mdraft,
+                                      current.preparation_seconds);
             if (!nd && s->n_mdraft > 0 && s->st.passes % 16 == 0) nd = 1;
         }
         if (s->has_filter || o->presence_penalty != 0 || o->frequency_penalty != 0)
@@ -1443,7 +1475,9 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
             }
         }
         if (s->mtp && drafts_wanted && s->off_left == 0 && !probe) {
-            nd = plan ? plan_drafts(&s->pl, s->msurv, drafts_cap(m, s->n_mdraft))
+            nd = plan ? plan_prepared_drafts(&s->pl, s->msurv,
+                                            drafts_cap(m, s->n_mdraft),
+                                            current.preparation_seconds)
                       : s->n_mdraft;
             /* one pass in sixteen drafts anyway, as the copies do: a pass of
                two tokens timed once while the disk was busy made the planner
@@ -1579,6 +1613,22 @@ int janas_llm_session_next(struct janas_llm_session *s, int32_t *token)
             p->tried[cal_bin(s->msurv[i])] += 1;
             p->won[cal_bin(s->msurv[i])] += i < acc;
         }
+    else if (plan && nd == 0 && s->n_mdraft > 0 &&
+             current.planner_source == JANAS_GEN_SOURCE_MTP &&
+             isfinite(s->msurv[0]) && s->msurv[0] >= 0 && s->msurv[0] <= 1 &&
+             !s->has_filter && o->presence_penalty == 0 &&
+             o->frequency_penalty == 0) {
+        /* Even a declined first draft has an exact, already-paid label: the
+         * target sampled row zero on the same canonical input. Learn that
+         * outcome, rather than starving pessimistic confidence bins until a
+         * forced speculative pass happens to revisit them. No later draft
+         * is labelled: its target row was not executed. Acceptance/row
+         * counters continue to describe only actual verified proposals. */
+        struct planner *p = cost_hybrid ? mtp_planner(s) : &s->pl;
+        int b = cal_bin(s->msurv[0]);
+        p->tried[b] += 1;
+        p->won[b] += t == s->mdraft[0] && !is_stop(o, t);
+    }
     /* a pass run while the expert cache is still filling in the background
        measures the disk, not the drafts: it teaches nothing */
     int settling = settling_now;
