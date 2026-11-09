@@ -284,3 +284,43 @@ The diagnostic trace replay changed 21 positive-depth decisions under the prepar
 Hybrid remains opt-in; the default CPU profile uses MTP4. The latest comparison uses the same current executable for both modes. Earlier trials and failed gates remain available. See the [readable report](benchmarks/snapdragon80b-20261108-hybrid-prose-fix.md), [raw trials](benchmarks/snapdragon80b-20261108-hybrid-prose-fix.json) and [validation](benchmarks/snapdragon80b-20261108-hybrid-prose-fix-validation.json).
 
 <!-- hybrid-source-pricing:end -->
+
+
+<!-- fast-validation:start -->
+
+## Faster functional validation
+
+`tools/validate-snapdragon-runtime.py --fast` retains the requested logical coverage. Quality validation loads one CPU model for widths **1, 3, 5, 8, 9 and 17**. Session validation loads one model for all **seven configurations**, reuses three immutable plain-decoding reference runs, and retains all **35 greedy/seeded comparisons** plus a bit-identical 32-token boundary check per case. Independent model-free unit executables run with bounded workers inside CPU mask `0xff`; model jobs stay serial.
+
+The fixed16 session stress case explicitly uses an S2 node budget of **32** when S2 is enabled, preserving the required 17-row target verification. Other cases retain the configured eight-node budget. The override appears in the plan and result; it does not change the runtime profile.
+
+Use native Windows ARM64 Python from the repository root. Planning remains the default and launches no executable:
+
+```powershell
+python tools/validate-snapdragon-runtime.py --fast --stage session --s2-exact on --plan
+```
+
+An explicit cache accelerates repeated checks of unchanged artifacts. Use a new output directory for every invocation:
+
+```powershell
+python tools/validate-snapdragon-runtime.py --fast --stage session --execute --s2-exact on --s2-branches 2 --s2-max-nodes 8 --s2-min-gain-percent 5 --reference lib/validation/quality80b-20261108/cpu64.qref --incremental-cache lib/validation/proof-cache --out lib/validation/session-fast-001
+```
+
+Repeat with `session-fast-002` to reuse eligible proofs. Omit `--incremental-cache` to force new executions. Cache keys bind executable and project DLL hashes, arguments and generated case-file contents, reference/tokens/attention policy, model receipt and file fingerprints, effective controls, platform and source identities. Only validated passes are stored; a failed matrix cannot populate a passing matrix entry. Reused results retain their original execution/timings and are explicitly marked **inherited proofs**, with zero new executions where applicable.
+
+`--select-check session-fixed-mtp16-adaptive` selects targeted work and explicitly marks the result as a subset. `--import-proofs <passing-output-directory>` can revalidate historical raw proofs for the current artifacts; model proofs also require `--import-model-receipt <completed-checksum-receipt>`. Changed identities and incomplete/failed source directories do not qualify; stored cache artifacts also require matching checksums. Large model payloads bind the pinned receipt plus unchanged file metadata/header checks. Importing older model proofs additionally requires the completed checksum attestation; reuse does not claim a new full payload scan.
+
+Measured on 9 November 2026 with identical artifacts and inputs:
+
+| Functional stage | Fresh fast execution | Same-artifact proof reuse |
+|---|---:|---:|
+| Six quality widths | 74.09 s | 3.82 s |
+| Seven session configurations | 200.29 s | 3.69 s |
+| 67 model-free units | 27.17 s | 1.58 s |
+| **Total** | **301.55 s** | **9.09 s** |
+
+The measured repeat-run speedup is **33.16×**, retaining 80 logical cases and 35 session comparisons; the cached run launched no new executable or model process. **A 3× fresh-validation speedup was not established**: the fresh quality stage was slower than the earlier 58.90-second separate-process run. These are functional validation timings, not inference throughput gains. The matched inference benchmark remains serial ABBA with all 42 samples and unchanged promotion gates.
+
+Raw local receipts are retained under `lib/validation/s2-exact-20261109/testing-speed/summary.json`, with fresh and cached stage receipts in their separate output directories.
+
+<!-- fast-validation:end -->
