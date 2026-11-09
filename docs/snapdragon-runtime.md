@@ -267,3 +267,20 @@ The geometric mean improved 5.2%, but prose failed the 3% regression floor, so *
 The separate conversation check demonstrated normal lookup use: 696 accepted lookup tokens across copying/return phases, then zero lookup selections and 63 MTP selections across the two unrelated topic switches. Every output token and text byte matched plain decoding under greedy and seeded sampling. Its ordered diagnostic timings are not a promotion benchmark.
 
 A same-binary prose ABBA check with lookup probes disabled measured MTP4 at 11.00 tok/s and cost hybrid at 10.59 tok/s. It did not eliminate fallback timing/draft-depth differences; no deterministic arithmetic discrepancy was found. Timing-based legacy draft-depth decisions and system variability remain performance limitations. This diagnostic does not replace the frozen-current-profile comparison. Neither 40 nor 50 tok/s was demonstrated.
+
+### Prepared MTP verification and calibration
+
+Commit `844ffb6` corrects two shared MTP planner behaviors used by ordinary MTP and cost hybrid fallback. Chain construction still estimates the cost of additional draft steps. Once the chain exists, verification compares every available prefix using the same actual incoming preparation cost plus its predicted target-pass cost. Choosing a shorter prefix cannot recover head or chain work already performed.
+
+A prepared first MTP draft that the planner declines now receives an exact calibration label from the target's already sampled first row. A matching non-stop token is a success; a mismatch or stop token is a failure. Stateful filters and nonzero presence/frequency penalties exclude this update, and lookup proposals cannot supply MTP labels from stale confidence. Later unexecuted draft positions remain unlabelled. This adds no target rows, head scoring or sampler/RNG calls. Drafted/accepted counters continue to count only proposals actually verified.
+
+The diagnostic trace replay changed 21 positive-depth decisions under the preparation-cost correction, with no depth-zero decisions rescued. Six declined first drafts in confidence bin four supplied four correct labels; a sequential replay incorporating those labels changed two subsequent choices. Labels in other bins also reduced confidence. These mechanism checks do not explain the entire earlier 13.8% prose regression or establish a throughput gain. Diagnostic timings span a power-state transition; matched benchmark and promotion results are reported separately.
+
+
+<!-- hybrid-source-pricing:start -->
+
+## Hybrid source pricing follow-up
+
+Hybrid remains opt-in; the default CPU profile uses MTP4. The latest comparison uses the same current executable for both modes. Earlier trials and failed gates remain available. See the [readable report](benchmarks/snapdragon80b-20261108-hybrid-prose-fix.md), [raw trials](benchmarks/snapdragon80b-20261108-hybrid-prose-fix.json) and [validation](benchmarks/snapdragon80b-20261108-hybrid-prose-fix-validation.json).
+
+<!-- hybrid-source-pricing:end -->

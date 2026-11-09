@@ -47,52 +47,54 @@
     "max_reply": 0,
     "preload": false
   },
-  "notes": "Opt-in cost-aware hybrid; not promoted. Matched ABBA met the aggregate rate target but failed the prose regression limit. Uses exact target verification and calibrated MTP4 fallback; see raw report and validation.",
+  "notes": "Opt-in cost-aware hybrid with source-isolated calibrated MTP4 fallback. Final same-binary matched ABBA gained 2.46% geometric-mean throughput, below the 5% promotion requirement; prose remains 2.56% slower within the 3% workload limit. All first-token gates passed. MTP4 remains the default.",
   "evidence": {
-    "report": "docs/benchmarks/snapdragon80b-20261108-hybrid-cost.json",
-    "validation_report": "docs/benchmarks/snapdragon80b-20261108-hybrid-cost-validation.json",
-    "runtime_commit": "c965f840084cd4920d6f10a428cd77b85699d286",
-    "candidate_bench_sha256": "5fa53452a270ec415b49aa33712b7ddd53ef95d845b226e839b2c0ddb58164db",
+    "report": "docs/benchmarks/snapdragon80b-20261108-hybrid-prose-fix.json",
+    "readable_report": "docs/benchmarks/snapdragon80b-20261108-hybrid-prose-fix.md",
+    "validation_report": "docs/benchmarks/snapdragon80b-20261108-hybrid-prose-fix-validation.json",
+    "runtime_commit": "ddd562e25c134270ff6cd94b66823c9b95a78f07",
+    "candidate_bench_sha256": "b1a41d32eb057f56aedf4fb0a15900be095dfd983f2ebae67ff06e5fcf11d649",
     "promotion_gate_passed": false,
-    "geometric_mean_rate_ratio": 1.0524132650362463,
+    "geometric_mean_rate_ratio": 1.0245656163637276,
     "workloads": [
       {
         "workload": "code",
-        "candidate_case": "hybrid-cost8",
+        "candidate_case": "custom",
         "complete_and_output_verified": true,
-        "candidate_to_baseline_median_rate_ratio": 0.974776367955986,
+        "candidate_to_baseline_median_rate_ratio": 1.0027242157119394,
         "scope": "warm output-tail rate ratio; full wall and TTFT retained separately; screen is discovery only",
-        "baseline_median_ttft_seconds": 8.5461595,
-        "candidate_median_ttft_seconds": 8.7875163,
-        "first_token_limit_seconds": 8.973467475,
+        "baseline_median_ttft_seconds": 7.9475708,
+        "candidate_median_ttft_seconds": 7.8412125,
+        "first_token_limit_seconds": 8.34494934,
         "first_token_passed": true,
         "workload_rate_floor_passed": true
       },
       {
         "workload": "prose",
-        "candidate_case": "hybrid-cost8",
+        "candidate_case": "custom",
         "complete_and_output_verified": true,
-        "candidate_to_baseline_median_rate_ratio": 0.8624430582998039,
+        "candidate_to_baseline_median_rate_ratio": 0.9743629946050235,
         "scope": "warm output-tail rate ratio; full wall and TTFT retained separately; screen is discovery only",
-        "baseline_median_ttft_seconds": 1.91926,
-        "candidate_median_ttft_seconds": 1.9868016,
-        "first_token_limit_seconds": 2.0152229999999998,
+        "baseline_median_ttft_seconds": 1.818642,
+        "candidate_median_ttft_seconds": 1.8144915,
+        "first_token_limit_seconds": 1.9095741000000002,
         "first_token_passed": true,
-        "workload_rate_floor_passed": false
+        "workload_rate_floor_passed": true
       },
       {
         "workload": "long",
-        "candidate_case": "hybrid-cost8",
+        "candidate_case": "custom",
         "complete_and_output_verified": true,
-        "candidate_to_baseline_median_rate_ratio": 1.3865116328151015,
+        "candidate_to_baseline_median_rate_ratio": 1.1008218642739729,
         "scope": "warm output-tail rate ratio; full wall and TTFT retained separately; screen is discovery only",
-        "baseline_median_ttft_seconds": 86.2058776,
-        "candidate_median_ttft_seconds": 49.6563672,
-        "first_token_limit_seconds": 90.51617148,
+        "baseline_median_ttft_seconds": 45.9796173,
+        "candidate_median_ttft_seconds": 45.4636962,
+        "first_token_limit_seconds": 48.278598165,
         "first_token_passed": true,
         "workload_rate_floor_passed": true
       }
     ],
-    "default_profile_retained": "profiles/snapdragon-xelite-cpu.json"
+    "default_profile_retained": "profiles/snapdragon-xelite-cpu.json",
+    "previous_report": "docs/benchmarks/snapdragon80b-20261108-hybrid-cost.json"
   }
 }
