@@ -437,6 +437,69 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertFalse(tool.attention_calibration_result(cache, frozen)["unchanged"])
         self.assertEqual(path.read_bytes(), data)
 
+    def test_execute_cli_exercises_real_child_plumbing_with_private_frozen_seeds(self):
+        # A fake process replaces the model executable, but the actual CLI,
+        # execution loop, Win32 affinity calls, child_run, logs, parsers,
+        # seeding, validation, summaries and final preservation all execute.
+        attention = self.folder / "attn.txt"
+        attention.write_bytes(b"Snapdragon_X|8|16/2/256|0|2048 1024 1024\n")
+        drafts = self.folder / "drafts-0123456789abcdef.bin"
+        drafts.write_bytes(struct.pack("<20d", *([10.0] * 10 + [7.0] * 10)))
+        output = self.folder / "executed"
+        kernel = mock.Mock()
+        kernel.GetCurrentProcess.return_value = 77
+        def affinity(handle, process, system):
+            value = getattr(handle, "value", handle)
+            process._obj.value = 255 if value == 123 else 4095
+            system._obj.value = 4095
+            return 1
+        kernel.GetProcessAffinityMask.side_effect = affinity
+        kernel.SetProcessAffinityMask.return_value = 1
+        current = {}
+        actual_child_run = tool.child_run
+        def child(run, folder, timeout):
+            self.assertEqual(run["calibration"]["sha256"], tool.sha(drafts))
+            self.assertEqual(run["attention_calibration"]["sha256"], tool.sha(attention))
+            current["run"] = run
+            return actual_child_run(run, folder, timeout)
+        def process(command, **kwargs):
+            run = current["run"]
+            cache = Path(kwargs["env"]["XDG_CACHE_HOME"]) / "janas"
+            self.assertEqual((cache / drafts.name).read_bytes(), drafts.read_bytes())
+            self.assertEqual((cache / "attn.txt").read_bytes(), attention.read_bytes())
+            for record in self.records(run):
+                kwargs["stdout"].write(json.dumps(record) + "\n")
+            result = mock.Mock()
+            result._handle = 123
+            result.returncode = 0
+            result.wait.return_value = 0
+            result.poll.return_value = 0
+            return result
+        args = ["paired", *self.argv, "--execute", "--workloads", "code", "--cooldown", "0",
+                "--candidate-case", "hybrid-cost8", "--calibration-file", str(drafts),
+                "--attention-calibration-file", str(attention), "--output", str(output)]
+        with (mock.patch.object(tool, "native_host", return_value=True),
+              mock.patch.object(tool, "source_identity", return_value={"fixture": True}),
+              mock.patch.object(tool.ctypes, "WinDLL", return_value=kernel, create=True),
+              mock.patch.object(tool.subprocess, "Popen", side_effect=process),
+              mock.patch.object(tool, "child_run", side_effect=child),
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(tool.main(args), 0)
+        records = tool.read_json(output / "results.json")
+        self.assertEqual([v["binary"] for v in records], list("ABBA"))
+        self.assertTrue(all(v["status"] == "ok" for v in records))
+        self.assertTrue(all(v["attention_calibration_final"]["unchanged"] for v in records))
+        preserved = tool.read_json(output / "calibration-preserved.json")
+        self.assertTrue(preserved["original_unchanged"])
+        self.assertTrue(preserved["attention_original_unchanged"])
+        self.assertEqual(preserved["sha256"], tool.sha(drafts))
+        self.assertEqual(preserved["attention_sha256"], tool.sha(attention))
+        with (mock.patch.object(tool, "native_host", return_value=True),
+              mock.patch.object(tool, "source_identity", return_value={"fixture": True}),
+              mock.patch.object(tool.subprocess, "Popen", side_effect=AssertionError("completed resume relaunched child")),
+              contextlib.redirect_stdout(io.StringIO())):
+            self.assertEqual(tool.main(args + ["--resume"]), 0)
+
     def test_promotion_requires_all_workloads_five_warm_and_guardrails(self):
         manifest = tool.build_plan(self.args(), self.inputs())
         records = []

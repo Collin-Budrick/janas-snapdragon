@@ -416,6 +416,8 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
              "binary": label, "binary_sha256": binary["sha256"], "warm_rounds": rounds,
               "controller_protocol": controller_protocol,
              "control": control, "performance_controls": performance_controls(control), "command": command,
+             "calibration": inputs["calibration"],
+             "attention_calibration": inputs["attention_calibration"],
              "expected": inputs["prompts"][workload]}
     return dict(value, run_sha256=digest(value))
 
