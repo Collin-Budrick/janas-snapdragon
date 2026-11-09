@@ -324,3 +324,13 @@ The measured repeat-run speedup is **33.16×**, retaining 80 logical cases and 3
 Raw local receipts are retained under `lib/validation/s2-exact-20261109/testing-speed/summary.json`, with fresh and cached stage receipts in their separate output directories.
 
 <!-- fast-validation:end -->
+
+## Exact S²-MoE scheduling adaptation (9 November 2026)
+
+The opt-in [S² profile](../profiles/snapdragon-xelite-s2-exact.json) keeps MTP4 and adds `--s2-exact on --s2-branches 2 --s2-max-nodes 8 --s2-min-gain-percent 5`. It skips unused native-MTP FFN/normalization work, builds a bounded root sibling when cost evidence or a bounded probe permits, and stages a cached continuation through the unchanged target verifier after the target samples that sibling. Canonical MTP maintenance still runs. Target routing, weights, quantization, FP16 state boundaries and seeded sampling stay unchanged.
+
+This adapts the exact scheduling concepts to Janas's existing MTP layer. Native MTP already shares immutable embedding/output weights, but its learned layer and KV slot differ from the target; target/draft KV aliasing and approximate expert gating are excluded. The implementation supports a bounded root fork, rather than arbitrary nested draft trees.
+
+The [matched report](benchmarks/snapdragon80b-20261109-s2-exact.md) retains 42 samples: code 23.65→22.75 tok/s (-3.79%), prose 19.08→19.17 (+0.50%), longer prompt 17.92→19.23 (+7.31%). Geometric-mean gain 1.24% misses 5%, and code exceeds the 3% regression allowance. **MTP4 remains the default; S² is opt-in.** All output identities and warm first-token gates passed. Neither 40 nor 50 tok/s was demonstrated.
+
+Native proof includes 17 MTP widths and 153 accepted-prefix KV/hidden/logit comparisons, every frozen target-logit width, seven greedy/seeded session configurations, 67 unit programs, and 36 copy/topic-switch transcripts. A separate instrumented real-model proof executed 53 native alternate branches and accepted one cached descendant with identical complete transcripts; its scheduling is not a production performance sample. See the [raw results](benchmarks/snapdragon80b-20261109-s2-exact.json) and [validation receipts](benchmarks/snapdragon80b-20261109-s2-exact-validation.json).

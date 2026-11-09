@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "model": {
+    "path": "models/qwen3-next-80b-a3b-q4km.jns",
+    "size": 48411922432,
+    "first_mib_sha256": "0cb659c13145b35f1e1c24c0d126c6f0e3b4b04faba5cd421908ac25f1c2e38c",
+    "full_sha256_verified_at_download": "fa3255c73106391e9cb5a97efd30f77a928fb4518d40060f795a8cff6656daed"
+  },
+  "mtp": {
+    "path": "models/qwen3-next-80b-a3b-mtp-q4k.jns",
+    "size": 937992192,
+    "first_mib_sha256": "8d2bcfca5f3c4cafae5c4fe49174152ea072ae0fd87551fb4b7a4431d9d0db84",
+    "full_sha256_verified_at_download": "5c9bc4cb6f739193fac5e4daa30c922f73255acf41443ecfc0123ef084584559"
+  },
+  "case": {
+    "profile": "cpu",
+    "speculation": "mtp",
+    "threads": 8,
+    "cache_gib": 32,
+    "draft_tokens": 4,
+    "prompt": 0,
+    "prompt_on": "cpu",
+    "drafts_on": "cpu",
+    "reply_on": "cpu",
+    "prefetch": "off",
+    "gpu_min_tokens": 0,
+    "npu_min_tokens": 0,
+    "npu_min_macs": 0,
+    "spec_planner": "legacy",
+    "spec_explore": 20,
+    "draft_vocab": "legacy",
+    "draft_vocab_rows": 0,
+    "gdn_chain": 1,
+    "gdn_journal": 1,
+    "gdn_k_only": 1,
+    "panels": "auto",
+    "s2_exact": "on",
+    "s2_branches": 2,
+    "s2_max_nodes": 8,
+    "s2_min_gain_percent": 5
+  },
+  "settings": {
+    "ctx": 2048,
+    "reserve_gib": 12,
+    "seed": 20260926,
+    "temperature": 0,
+    "max_reply": 0,
+    "preload": false
+  },
+  "evidence": {
+    "date": "2026-11-09",
+    "runtime_commit": "36fd0827a0b481bf904206447dd629ee7e1f43a4",
+    "baseline_bench_sha256": "b1a41d32eb057f56aedf4fb0a15900be095dfd983f2ebae67ff06e5fcf11d649",
+    "candidate_bench_sha256": "cc07086a77cde8fd6aab0d08c834ed3ec2939e33d9a027efc91ad78246771392",
+    "report": "docs/benchmarks/snapdragon80b-20261109-s2-exact.json",
+    "readable_report": "docs/benchmarks/snapdragon80b-20261109-s2-exact.md",
+    "validation_report": "docs/benchmarks/snapdragon80b-20261109-s2-exact-validation.json",
+    "promotion_gate_passed": false,
+    "geometric_mean_rate_ratio": 1.0123613243523997,
+    "workloads": [
+      {
+        "workload": "code",
+        "candidate_case": "custom",
+        "complete_and_output_verified": true,
+        "candidate_to_baseline_median_rate_ratio": 0.9620937397744365,
+        "scope": "warm output-tail rate ratio; full wall and TTFT retained separately; screen is discovery only",
+        "baseline_median_ttft_seconds": 7.9942424,
+        "candidate_median_ttft_seconds": 7.9091498,
+        "first_token_limit_seconds": 8.39395452,
+        "first_token_passed": true,
+        "workload_rate_floor_passed": false
+      },
+      {
+        "workload": "prose",
+        "candidate_case": "custom",
+        "complete_and_output_verified": true,
+        "candidate_to_baseline_median_rate_ratio": 1.0049739275056446,
+        "scope": "warm output-tail rate ratio; full wall and TTFT retained separately; screen is discovery only",
+        "baseline_median_ttft_seconds": 1.6598623,
+        "candidate_median_ttft_seconds": 1.7139683,
+        "first_token_limit_seconds": 1.742855415,
+        "first_token_passed": true,
+        "workload_rate_floor_passed": true
+      },
+      {
+        "workload": "long",
+        "candidate_case": "custom",
+        "complete_and_output_verified": true,
+        "candidate_to_baseline_median_rate_ratio": 1.073085810677649,
+        "scope": "warm output-tail rate ratio; full wall and TTFT retained separately; screen is discovery only",
+        "baseline_median_ttft_seconds": 46.4076691,
+        "candidate_median_ttft_seconds": 45.360519,
+        "first_token_limit_seconds": 48.728052555,
+        "first_token_passed": true,
+        "workload_rate_floor_passed": true
+      }
+    ],
+    "default_profile_retained": "profiles/snapdragon-xelite-cpu.json"
+  },
+  "notes": "Opt-in exact S2 native-MTP adaptation; target routing, quantization and sampling are unchanged. Matched 42-sample ABBA gained 1.24% geometrically, below the 5% requirement; code lost 3.79%, exceeding the 3% limit. MTP4 remains the promoted default. CPU8, 32 GiB expert cache, 12 GiB reserve, GDN111 and four MTP drafts are retained."
+}
