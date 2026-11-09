@@ -71,7 +71,8 @@ PERFORMANCE_ENV = ("JANAS_KERNELS", "JANAS_EXPERTS", "JANAS_GPU_ALWAYS",
     "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
     "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT", "JANAS_S2_EXACT", "JANAS_S2_BRANCHES",
     "JANAS_S2_MAX_NODES", "JANAS_S2_MIN_GAIN_PERCENT",
-    "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY")
+    "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY",
+    "JANAS_MOJO", "JANAS_MOJO_LIBRARY")
 PROFILE_ENV = {"JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG",
     "JANAS_TUNE", "JANAS_TUNE_THREADS", "JANAS_WARM", "JANAS_MISS_SKIP",
     "JANAS_EXPERT_BITS", "JANAS_HEAD_BITS", "JANAS_HEXAGON_ROOT", "ADSP_LIBRARY_PATH",
@@ -80,7 +81,8 @@ PROFILE_ENV = {"JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG",
     "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
     "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT", "JANAS_S2_EXACT", "JANAS_S2_BRANCHES",
     "JANAS_S2_MAX_NODES", "JANAS_S2_MIN_GAIN_PERCENT",
-    "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY"}
+    "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY",
+    "JANAS_MOJO", "JANAS_MOJO_LIBRARY"}
 
 
 def number(value: Any, name: str, low: float, high: float, integer: bool = False) -> Any:
@@ -137,7 +139,8 @@ def load_profile(path: Path, root: Path = ROOT) -> dict[str, Any]:
                                   ("draft_vocab", "legacy", DRAFT_VOCAB_POLICIES),
                                   ("hybrid_policy", "legacy", HYBRID_POLICIES),
                                    ("s2_exact", "off", {"off", "on"}),
-                                  ("panels", "auto", PANEL_POLICIES)):
+                                  ("panels", "auto", PANEL_POLICIES),
+                                  ("mojo", "off", {"off", "on"})):
         case.setdefault(key, default)
         if not isinstance(case[key], str) or case[key] not in choices:
             raise ValueError(f"case.{key} must be one of: " + ", ".join(sorted(choices)))
@@ -198,6 +201,13 @@ def load_profile(path: Path, root: Path = ROOT) -> dict[str, Any]:
     if not isinstance(runtime, dict):
         raise ValueError("runtime must be an object")
     runtime = runtime.copy()
+    if case["mojo"] == "on":
+        if case["profile"] != "cpu" or case["panels"] == "off":
+            raise ValueError("Mojo experiments require CPU execution and enabled automatic/experimental tiles")
+        module = project_path(runtime.get("mojo_library"), "runtime.mojo_library", root)
+        if not module.is_file():
+            raise ValueError(f"Build the Mojo module first: {module}")
+        runtime["mojo_library"] = module.resolve()
     if npu:
         hx = project_path(runtime.get("hexagon_root"), "runtime.hexagon_root", root)
         host = project_path(runtime.get("host_bin", str(hx / "bin")), "runtime.host_bin", root)
@@ -239,6 +249,9 @@ def launch_environment(profile: dict[str, Any], inherited: dict[str, str]) -> di
     panel = PANEL_POLICIES[case.get("panels", "auto")]
     if panel is not None:
         env["JANAS_CPU_TILES"] = panel
+    if case.get("mojo", "off") == "on":
+        env["JANAS_MOJO"] = "1"
+        env["JANAS_MOJO_LIBRARY"] = str(profile["runtime"]["mojo_library"])
     env.update(PREFETCH_POLICIES[profile["case"].get("prefetch", "auto")])
     for key, name in (("gpu_min_tokens", "JANAS_GPU_MIN_N"),
                       ("npu_min_tokens", "JANAS_NPU_MIN_N"),

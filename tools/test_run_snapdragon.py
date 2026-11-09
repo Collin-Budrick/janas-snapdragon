@@ -49,6 +49,67 @@ class LauncherTests(unittest.TestCase):
         self.path.write_text(json.dumps(self.profile), encoding="utf-8")
         return launcher.load_profile(self.path, self.root)
 
+    def test_mojo_default_c_profile_clears_inherited_module_without_mutation(self):
+        profile = self.load()
+        self.assertEqual(profile["case"]["mojo"], "off")
+        inherited = {"JANAS_MOJO": "1", "JANAS_MOJO_LIBRARY": "hostile-module",
+                     "UNCHANGED": "preserved"}
+        before = inherited.copy()
+        env = launcher.launch_environment(profile, inherited)
+        self.assertNotIn("JANAS_MOJO", env)
+        self.assertNotIn("JANAS_MOJO_LIBRARY", env)
+        self.assertEqual(env["UNCHANGED"], "preserved")
+        self.assertEqual(inherited, before)
+        for key in ("JANAS_MOJO", "JANAS_MOJO_LIBRARY"):
+            self.assertIn(key, launcher.PERFORMANCE_ENV)
+            self.assertIn(key, launcher.PROFILE_ENV)
+
+    def test_mojo_opt_in_uses_resolved_project_module_and_selected_panel_policy(self):
+        module = self.root / "module.dll"
+        module.write_bytes(b"fixture module; never loaded")
+        self.profile["case"]["mojo"] = "on"
+        self.profile["runtime"] = {"mojo_library": module.name}
+        for policy, tiles in (("auto", None), ("experimental", "1")):
+            self.profile["case"]["panels"] = policy
+            with self.subTest(policy=policy):
+                profile = self.load()
+                self.assertEqual(profile["runtime"]["mojo_library"], module.resolve())
+                env = launcher.launch_environment(profile,
+                    {"JANAS_MOJO": "0", "JANAS_MOJO_LIBRARY": "wrong",
+                     "JANAS_CPU_TILES": "0"})
+                self.assertEqual(env["JANAS_MOJO"], "1")
+                self.assertEqual(env["JANAS_MOJO_LIBRARY"], str(module.resolve()))
+                self.assertEqual(env.get("JANAS_CPU_TILES"), tiles)
+
+    def test_mojo_opt_in_requires_existing_file_cpu_and_enabled_panels(self):
+        module = self.root / "module.dll"
+        module.write_bytes(b"fixture module; never loaded")
+        self.profile["case"]["mojo"] = "on"
+        self.profile["runtime"] = {"mojo_library": str(module)}
+        self.load()
+        for value in (None, True, "", "missing-module.dll", str(self.root), "bad\0module"):
+            self.profile["runtime"]["mojo_library"] = value
+            with self.subTest(module=value), self.assertRaises(ValueError):
+                self.load()
+        self.profile["runtime"]["mojo_library"] = str(module)
+        for key, value in (("profile", "cpu+gpu"), ("panels", "off")):
+            original = self.profile["case"].get(key)
+            self.profile["case"][key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.load()
+            if original is None:
+                self.profile["case"].pop(key)
+            else:
+                self.profile["case"][key] = original
+
+    def test_mojo_mode_is_explicit_and_off_does_not_require_a_module(self):
+        self.profile["runtime"] = {"mojo_library": "missing-module.dll"}
+        self.assertEqual(self.load()["case"]["mojo"], "off")
+        for value in (True, None, 1, "auto", "ON"):
+            self.profile["case"]["mojo"] = value
+            with self.subTest(mode=value), self.assertRaisesRegex(ValueError, "case.mojo"):
+                self.load()
+
     def test_hybrid_controls_round_trip_and_reject_invalid_caps(self):
         self.profile["case"].update(hybrid_policy="cost", lookup_drafts=8,
                                     mtp_drafts=4, hybrid_probe_percent=2)

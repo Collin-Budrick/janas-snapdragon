@@ -68,6 +68,7 @@
 #include "common/pool.h"
 #include "common/sysinfo.h"
 #include "llm/quant.h"
+#include "llm/mojo.h"
 #include "common/words.h"
 #include "janas/llm.h"
 #include "llm/spec_config.h"
@@ -677,6 +678,9 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
             fprintf(stderr, "janas-bench: %s\n", config_error); goto failed;
         }
         json_text(&b, "s2_exact", s2.exact ? "on" : "off");
+        json_text(&b, "mojo", janas_mojo_enabled() ? "on" : "off");
+        if (janas_mojo_enabled())
+            json_text(&b, "mojo_status", janas_mojo_status());
         janas_buf_printf(&b, "\"s2_branches\":%d,\"s2_max_nodes\":%d,\"s2_min_gain_percent\":%d,",
                          s2.branches, s2.max_nodes, s2.min_gain_percent);
         const char *const planners[] = {"legacy", "cycle", "fixed"};
@@ -777,6 +781,8 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
         double compile0 = janas_llm_model_npu_compile_seconds(m);
         struct fair_caches caches0, caches1;
         struct janas_llm_accel_counters accel0, accel1;
+        struct janas_mojo_stats mojo0, mojo1;
+        janas_mojo_get_stats(&mojo0);
         fair_caches_read(m, &caches0);
         janas_llm_model_accel_counters(m, &accel0);
         uint64_t hash = 14695981039346656037ull;
@@ -816,6 +822,7 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
             fair_profile_end(&profile, m, phase, i);
         fair_caches_read(m, &caches1);
         janas_llm_model_accel_counters(m, &accel1);
+        janas_mojo_get_stats(&mojo1);
         struct fair_caches cache_delta = caches1;
         cache_delta.main.st =
             fair_cache_delta(&caches1.main.st, &caches0.main.st);
@@ -869,6 +876,13 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
                 janas_llm_model_gpu_used(m), janas_llm_model_npu_used(m));
             fair_caches_json(&b, &cache_delta, p->cache_bytes, 1);
             fair_accel_json(&b, &accel1, &accel0);
+            janas_buf_printf(&b,
+                ",\"mojo_calls\":%llu,\"mojo_rows\":%llu,"
+                "\"mojo_row_vectors\":%llu,\"mojo_refusals\":%llu",
+                (unsigned long long)(mojo1.calls - mojo0.calls),
+                (unsigned long long)(mojo1.rows - mojo0.rows),
+                (unsigned long long)(mojo1.row_vectors - mojo0.row_vectors),
+                (unsigned long long)(mojo1.refusals - mojo0.refusals));
             struct janas_llm_speculation_metrics sm = {
                 .size = sizeof sm, .version = JANAS_LLM_SPEC_METRICS_VERSION};
             if (janas_llm_chat_speculation_metrics(c, &sm) != JANAS_LLM_OK) {

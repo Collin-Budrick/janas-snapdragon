@@ -30,6 +30,8 @@ struct janas_q8k_panel;
 /* Private CPU group-call preparation; automatic new-shape allowlist empty.
    Returned rows (pairs on ARM) cover every vector, including an odd token. */
 int janas_quant_panels_enabled(void);
+/* Mojo-only experiments leave singleton group calls allocation-free. */
+size_t janas_quant_panels_min_vectors(void);
 size_t janas_dot_prepared_rows(
     int type, const void *w, size_t row_bytes, const uint8_t *p1,
     const uint8_t *p0, size_t pb, const struct janas_q8k_panel *panel,

@@ -38,6 +38,8 @@ VERIFY_MODEL_HASHES = False
 SEMANTIC_PROBE_PERCENT = 2
 S2_CONTROLS = {"s2_exact": "off", "s2_branches": 2, "s2_max_nodes": 8, "s2_min_gain_percent": 5}
 ATTENTION_CALIBRATION = None
+MOJO_LIBRARY = None
+MOJO_MODULE = None
 FAST = False
 UNIT_WORKERS = 4
 SELECT_CHECKS = set()
@@ -71,6 +73,7 @@ SESSION_CASES = (
 )
 VOCAB = 151936
 HARDWARE_HELPERS = {"test_npu_hexagon_check.exe", "test_hx_probe.exe"}
+OPTIONAL_MODULE_UNITS = {"test_mojo.exe"}
 
 
 def sha_bytes(value):
@@ -101,9 +104,34 @@ def environment(extra=None):
                JANAS_GDN_K_ONLY="1")
     if S2_CONTROLS["s2_exact"] == "on":
         env.update({"JANAS_" + k.upper(): str(v) for k, v in S2_CONTROLS.items()})
+    if MOJO_LIBRARY is not None:
+        env.update(JANAS_MOJO="1", JANAS_MOJO_LIBRARY=str(MOJO_LIBRARY))
     if extra:
         env.update(extra)
     return env
+
+
+def mojo_input(path):
+    if path is None:
+        return None
+    path = Path(path)
+    if not path.is_absolute() or not path.is_file():
+        raise ValueError("--mojo-library requires an absolute path to an existing module file")
+    path = path.resolve()
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": sha(path)}
+
+
+def mojo_identity(env):
+    # Small optional modules are hashed afresh even if size/times are unchanged.
+    # Cache identities must never reuse a proof across different module bytes.
+    return mojo_input(env.get("JANAS_MOJO_LIBRARY")) if env.get("JANAS_MOJO") == "1" else None
+
+
+def unit_executables():
+    excluded = HARDWARE_HELPERS | (OPTIONAL_MODULE_UNITS if MOJO_LIBRARY is None else set())
+    if MOJO_LIBRARY is not None and not (BIN / "test_mojo.exe").is_file():
+        raise ValueError("--mojo-library requires the built test_mojo.exe unit executable")
+    return sorted(p.resolve() for p in BIN.glob("test*.exe") if p.name.lower() not in excluded)
 
 
 def prepare_inputs():
@@ -199,11 +227,11 @@ def selected(name):
 def source_identity():
     # Linked dependency bits are bound by the executable hash. Track project
     # sources and fixture inputs without repeatedly hashing third-party trees.
-    files = [Path(__file__).resolve(), ROOT / "build.sh"]
+    files = [Path(__file__).resolve(), ROOT / "build.sh", ROOT / "tools/build-mojo.sh"]
     for folder in ("src", "include", "tests"):
         files += [p for p in (ROOT / folder).rglob("*") if p.is_file() and
                   "third_party" not in p.parts and p.suffix.lower() in
-                  (".c", ".h", ".inc", ".s", ".py", ".json", ".txt", ".bin")]
+                  (".c", ".h", ".inc", ".s", ".py", ".json", ".txt", ".bin", ".mojo")]
     values = {p.relative_to(ROOT).as_posix(): sha(p) for p in sorted(set(files)) if p.is_file()}
     return {"sha256": hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest(),
             "files": values, "scope": "project sources/fixtures; linked dependencies bound by executable SHA"}
@@ -247,6 +275,9 @@ def case_identity(name, argv, env, affinity=None):
         "source": CACHE_SOURCE_IDENTITY,
         "attention": ATTENTION_CALIBRATION,
         "model_free": model_free}
+    module = mojo_identity(env)
+    if module is not None:
+        identity["mojo_module"] = module
     identity["project_libraries"] = {p.name: file_identity(p) for pattern in ("libjanas*.dll", "janas*.dll")
         for p in Path(argv[0]).parent.glob(pattern)}
     identity["argument_files"] = {}
@@ -383,6 +414,9 @@ def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,), allow_c
               "stdout": str(OUT / (name + ".stdout.log")),
               "stderr": str(OUT / (name + ".stderr.log")),
               "scope": "functional validation; throughput not measured"}
+    module = mojo_identity(env)
+    if module is not None:
+        result["mojo_module"] = module
     result["cache_identity"] = identity
     result["performed_new_execution"] = True
     old_affinity = None
@@ -427,6 +461,13 @@ def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,), allow_c
     result["passed"] = (result.get("exit_code") in expected_exit and
                         not result.get("timed_out", False) and
                         not result.get("affinity_restore_error"))
+    if module is not None:
+        try:
+            unchanged = mojo_identity(env) == module
+        except (OSError, ValueError):
+            unchanged = False
+        result["mojo_module_unchanged"] = unchanged
+        result["passed"] = result["passed"] and unchanged
     save(OUT / (name + ".result.json"), result)
     print(f"{name}: exit={result.get('exit_code')} timeout={result.get('timed_out', False)}", flush=True)
     return result
@@ -435,7 +476,18 @@ def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,), allow_c
 def validate_unit_result(r,path):
     text = read_log(r)
     errors = []
-    if not re.search(re.escape(path.stem) + r"[^\n]*(?:\bok\b|\bpassed\b|\bskipped\b)", text, re.I):
+    if path.name.lower() == "test_mojo.exe":
+        try:
+            rows = [json.loads(line) for line in text.splitlines() if line.lstrip().startswith("{")]
+            value = rows[0] if len(rows) == 1 else {}
+            if (value.get("test") != "mojo" or value.get("skipped") is not False or
+                    type(value.get("cases")) is not int or value["cases"] < 1341 or
+                    type(value.get("compared_words")) is not int or value["compared_words"] < 144570 or
+                    type(value.get("failures")) is not int or value["failures"] != 0):
+                raise ValueError("incomplete or skipped Mojo unit matrix")
+        except (ValueError, TypeError, AttributeError):
+            errors.append("missing complete passing Mojo unit JSON matrix")
+    elif not re.search(re.escape(path.stem) + r"[^\n]*(?:\bok\b|\bpassed\b|\bskipped\b)", text, re.I):
         errors.append("missing named unit success/explicit skip marker")
     if re.search(r"(?im)^\s*(?:FAIL(?:ED)?\b|AddressSanitizer:|runtime error:)", text):
         errors.append("unit emitted failure/sanitizer marker")
@@ -452,7 +504,7 @@ def unit_case(path):
 
 
 def units():
-    cases = sorted(p.resolve() for p in BIN.glob("test*.exe") if p.name.lower() not in HARDWARE_HELPERS)
+    cases = unit_executables()
     if not cases and (not SELECT_CHECKS or any(n.startswith("unit-") for n in SELECT_CHECKS)):
         raise RuntimeError("no native Windows unit executables found")
     cases = [p for p in cases if selected("unit-" + p.stem)]
@@ -469,7 +521,8 @@ def units():
     summary = {"stage": "units", "count": len(results), "passed": sum(r["passed"] for r in results),
         "results": results, "executor": "parallel_model_free" if FAST else "serial",
         "workers": UNIT_WORKERS if FAST else 1, "cpu_mask": 255 if FAST else None,
-        "elapsed_seconds": time.monotonic() - started, "excluded_hardware_helpers": sorted(HARDWARE_HELPERS)}
+        "elapsed_seconds": time.monotonic() - started, "excluded_hardware_helpers": sorted(HARDWARE_HELPERS),
+        "excluded_optional_modules": sorted(OPTIONAL_MODULE_UNITS) if MOJO_LIBRARY is None else []}
     save(OUT / "units.json", summary)
     return all(r["passed"] for r in results)
 
@@ -925,6 +978,9 @@ def import_raw_proofs(folder, planned, model_attestation=None):
             if normalized(old["command"],folder)!=normalized(argv,OUT):raise ValueError("case arguments changed")
             wanted_env={k:v for k,v in env.items() if k.upper().startswith("JANAS_")}
             if old.get("janas_environment")!=wanted_env:raise ValueError("effective environment changed")
+            module=mojo_identity(env)
+            if module is not None and old.get("mojo_module")!=module:
+                raise ValueError("historical proof lacks the unchanged Mojo module identity")
             if stage!="units":
                 bound=import_model_attestation(model_attestation,old["started_utc"])
                 inputs=summary.get("inputs",{})
@@ -981,7 +1037,7 @@ def plan(stage):
     cases = []
     if stage in ("all", "units"):
         cases += [{"stage": "units", "command": [str(p)], "timeout_seconds": 600}
-                  for p in sorted(BIN.glob("test*.exe")) if p.name.lower() not in HARDWARE_HELPERS]
+                  for p in unit_executables()]
     if stage in ("all", "quality"):
         cases += [{"stage": "quality", "batch": b, "positions": 64, "timeout_seconds": 600,
                    "command": [str(BIN / "quality_check.exe"), str(MODEL), "--profile", "cpu",
@@ -1042,6 +1098,9 @@ def plan(stage):
              "fast": FAST, "unit_workers": UNIT_WORKERS if FAST else 1, "unit_cpu_mask": 255 if FAST else None,
              "driver_invocations": drivers, "full_requested_coverage": not SELECT_CHECKS,
              "selected_checks": sorted(SELECT_CHECKS), "omitted_checks": [i for i in full_ids if not selected(i)],
+             "excluded_hardware_helpers": sorted(HARDWARE_HELPERS),
+             "excluded_optional_modules": sorted(OPTIONAL_MODULE_UNITS) if MOJO_LIBRARY is None else [],
+             "mojo_module": mojo_identity(environment()),
              "incremental_cache": str(INCREMENTAL_CACHE) if INCREMENTAL_CACHE is not None else None,
              "cache_boundary": "explicit validated inherited proofs; EXE/DLL+argv+input content+model receipt/stat/header+source identities; no cache is accessed during plan",
             "requested_janas_environment": {k: v for k, v in environment().items() if k.startswith("JANAS_")},
@@ -1147,6 +1206,8 @@ def parser():
     result.add_argument("--verify-model-sha256", action="store_true", help="stream and verify both large model files before checks")
     result.add_argument("--attention-calibration-file", type=Path,
                         help="optional frozen original attn.txt, copied identically into every child private cache")
+    result.add_argument("--mojo-library", type=Path,
+                        help="explicit absolute optional Mojo module; enables it for all checks and includes test_mojo.exe")
     result.add_argument("--s2-exact", choices=("off", "on"), default="off")
     result.add_argument("--s2-branches", type=int, choices=range(1, 3), default=2)
     result.add_argument("--s2-max-nodes", type=int, choices=range(1, 33), default=8)
@@ -1163,9 +1224,15 @@ def main():
     global OUT, BIN, MODEL, MTP, QREF, CODE, RECEIPT, EXPECTED_DIGEST, EXPECTED_QREF_SHA
     global MODEL_PINS, BASELINE_QUALITY_EXE, VERIFY_MODEL_HASHES, SEMANTIC_PROBE_PERCENT, ATTENTION_CALIBRATION, S2_CONTROLS
     global FAST, UNIT_WORKERS, SELECT_CHECKS, INCREMENTAL_CACHE, CACHE_SOURCE_IDENTITY, CACHE_STATS
+    global MOJO_LIBRARY, MOJO_MODULE
     cli = parser()
     args = cli.parse_args()
     if args.import_proofs and not args.incremental_cache: cli.error("--import-proofs requires --incremental-cache")
+    try:
+        MOJO_MODULE = mojo_input(args.mojo_library)
+    except (OSError, ValueError) as error:
+        cli.error(str(error))
+    MOJO_LIBRARY = Path(MOJO_MODULE["path"]) if MOJO_MODULE is not None else None
     FAST, UNIT_WORKERS = args.fast, args.unit_workers
     SELECT_CHECKS = {v.strip() for group in args.select_check for v in group.split(",") if v.strip()}
     INCREMENTAL_CACHE = args.incremental_cache.resolve() if args.incremental_cache else None
@@ -1261,6 +1328,14 @@ def main():
         raise
     finally:
         cleanup_error = None
+        if MOJO_MODULE is not None:
+            try:
+                unchanged = mojo_input(MOJO_LIBRARY) == MOJO_MODULE
+            except (OSError, ValueError):
+                unchanged = False
+            summary["mojo_module_unchanged"] = unchanged
+            if not unchanged:
+                cleanup_error = RuntimeError("Mojo module changed during validation")
         if ATTENTION_CALIBRATION is not None:
             try:
                 preserved = attention_input(Path(ATTENTION_CALIBRATION["source_path"])) == ATTENTION_CALIBRATION

@@ -118,7 +118,8 @@ DEFAULT_CONTROL = dict(speculation="mtp", draft_tokens=4, spec_planner="legacy",
     spec_explore=20, draft_vocab="legacy", draft_vocab_rows=0, gdn_chain=1,
     gdn_journal=1, gdn_k_only=1, panels="auto", hybrid_policy="legacy",
     lookup_drafts=8, mtp_drafts=4, hybrid_probe_percent=2,
-    s2_exact="off", s2_branches=2, s2_max_nodes=8, s2_min_gain_percent=5)
+    s2_exact="off", s2_branches=2, s2_max_nodes=8, s2_min_gain_percent=5,
+    mojo="off", mojo_library="")
 CASES = {
     "baseline": dict(DEFAULT_CONTROL),
     "s2-exact": dict(DEFAULT_CONTROL, s2_exact="on"),
@@ -193,12 +194,20 @@ def valid_control(value):
         raise ValueError("S2 exact requires MTP speculation")
     if c["panels"] not in ("auto", "off", "experimental"):
         raise ValueError("Invalid panels setting")
+    if c["mojo"] not in ("off", "on") or not isinstance(c["mojo_library"], str):
+        raise ValueError("Invalid Mojo mode/library")
+    if c["mojo"] == "on" and (not c["mojo_library"] or
+            not Path(c["mojo_library"]).is_absolute() or c["panels"] == "off"):
+        raise ValueError("Mojo requires an absolute module path and enabled tiles")
     return c
 
 
 def effective_control(value):
     """Resolve aliases and omit source controls that cannot affect this mode."""
     c = valid_control(value)
+    if c["mojo"] == "off":
+        c.pop("mojo")
+        c.pop("mojo_library")
     if c["s2_exact"] == "off":
         for key in ("s2_exact", "s2_branches", "s2_max_nodes", "s2_min_gain_percent"):
             c.pop(key)
@@ -227,6 +236,8 @@ def performance_controls(c):
         JANAS_S2_MAX_NODES=str(c["s2_max_nodes"]), JANAS_S2_MIN_GAIN_PERCENT=str(c["s2_min_gain_percent"]))
     if c["panels"] != "auto":
         controls["JANAS_CPU_TILES"] = "1" if c["panels"] == "experimental" else "0"
+    if c["mojo"] == "on":
+        controls.update(JANAS_MOJO="1", JANAS_MOJO_LIBRARY=c["mojo_library"])
     return controls
 
 
@@ -242,9 +253,9 @@ def environment(cache, control, inherited=None):
 
 
 def source_identity():
-    files = [ROOT / "build.sh"]
+    files = [ROOT / "build.sh", ROOT / "tools/build-mojo.sh"]
     for folder in ("src", "include"):
-        files += [p for p in (ROOT / folder).rglob("*") if p.is_file() and p.suffix.lower() in (".c", ".h", ".inc", ".s")]
+        files += [p for p in (ROOT / folder).rglob("*") if p.is_file() and p.suffix.lower() in (".c", ".h", ".inc", ".s", ".mojo")]
     files += [Path(__file__).resolve(), PINS_FILE]
     hashes = {p.relative_to(ROOT).as_posix(): sha(p) for p in sorted(set(files))}
     return {"sha256": digest(hashes), "files": hashes,
@@ -501,6 +512,10 @@ def prepare_inputs(args):
 
 def run_spec(inputs, workload, case, control, label, rounds, sequence):
     control = valid_control(control)
+    mojo_module = None
+    if control["mojo"] == "on":
+        module = Path(control["mojo_library"])
+        mojo_module = {"path": str(module), "sha256": sha(module), "bytes": module.stat().st_size}
     retain_controller = True
     controller_protocol = ("retained_across_fresh_conversations" if retain_controller
                            else "fresh_chat_per_sample")
@@ -528,7 +543,8 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
     if retain_controller:
         command += ["--fair-retain-controller"]
     value = {"id": f"{sequence:02d}-{workload}-{label}-{case}", "workload": workload, "case": case,
-             "binary": label, "binary_sha256": binary["sha256"], "warm_rounds": rounds,
+              "binary": label, "binary_sha256": binary["sha256"], "warm_rounds": rounds,
+              "mojo_module": mojo_module,
              "execution_state_protocol": EXECUTION_STATE_TAG,
              "comparison_kind": "same_binary_different_controls" if inputs["baseline"]["sha256"] == inputs["candidate"]["sha256"] else "different_binaries",
               "controller_protocol": controller_protocol,
@@ -540,6 +556,8 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
 
 
 def make_manifest(args, protocol, runs, inputs):
+    inputs["mojo_modules"] = list({r["mojo_module"]["path"]: r["mojo_module"]
+        for r in runs if r.get("mojo_module")}.values())
     baseline = next(r["control"] for r in runs if r["binary"] == "A")
     candidates = {r["case"]: effective_control(r["control"]) for r in runs if r["binary"] == "B"}
     comparison = {"kind": runs[0]["comparison_kind"],
@@ -613,6 +631,8 @@ def validate_records(records, run):
         # Older frozen off executables legitimately omit additive S2 metadata.
         if c["s2_exact"] == "on" or "s2_exact" in setup[0]:
             expected.update({k: c[k] for k in ("s2_exact", "s2_branches", "s2_max_nodes", "s2_min_gain_percent")})
+        if c["mojo"] == "on" or "mojo" in setup[0]:
+            expected["mojo"] = c["mojo"]
         for key in ("fair_retain_controller", "conversation_cache_reuse"):
             if key in expected and type(setup[0].get(key)) is not bool:
                 errors.append("setup " + key + " must be a boolean")
@@ -621,6 +641,17 @@ def validate_records(records, run):
                 errors.append(f"setup {key} differs from protocol")
         if setup[0].get("profile_phases_enabled"):
             errors.append("phase profiling enabled during timing")
+    if c["mojo"] == "on":
+        for sample in samples:
+            if (type(sample.get("mojo_calls")) is not int or sample["mojo_calls"] <= 0 or
+                    type(sample.get("mojo_row_vectors")) is not int or sample["mojo_row_vectors"] <= 0 or
+                    type(sample.get("mojo_refusals")) is not int or sample["mojo_refusals"] != 0):
+                errors.append("Mojo sample has no proven execution or refused module work")
+    else:
+        for sample in samples:
+            if any(key in sample and (type(sample[key]) is not int or sample[key] != 0)
+                   for key in ("mojo_calls", "mojo_rows", "mojo_row_vectors", "mojo_refusals")):
+                errors.append("Unexpected Mojo execution in the C control")
     if c["s2_exact"] == "on":
         for sample in samples:
             metrics = sample.get("s2_metrics")
@@ -675,6 +706,9 @@ def validate_records(records, run):
 def verify_inputs(inputs):
     verify_calibration_source(inputs["calibration"])
     verify_calibration_source(inputs["attention_calibration"])
+    for module in inputs.get("mojo_modules", []):
+        if sha(module["path"]) != module["sha256"]:
+            raise RuntimeError("Mojo module changed after protocol was frozen")
     for key in ("baseline", "candidate"):
         if sha(inputs[key]["path"]) != inputs[key]["sha256"]:
             raise RuntimeError(key + " executable changed")

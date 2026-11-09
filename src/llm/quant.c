@@ -4,6 +4,7 @@
  * quant.c - quantized block formats and dot-product kernels (see quant.h).
  */
 #include "quant.h"
+#include "mojo.h"
 #include "quant_panel.h"
 #include "common/sysinfo.h"
 #include "quant_q6kp.h"
@@ -1958,9 +1959,18 @@ int janas_use_vnni(void)
 int janas_quant_panels_enabled(void)
 {
 #if defined(__aarch64__)
-    return use_panels;
+    return use_panels || (use_i8mm && janas_mojo_enabled());
 #else
     return 0;
+#endif
+}
+
+size_t janas_quant_panels_min_vectors(void)
+{
+#if defined(__aarch64__)
+    return use_panels ? 1 : 2;
+#else
+    return 1;
 #endif
 }
 
@@ -1971,9 +1981,17 @@ size_t janas_dot_prepared_rows(
 {
 #if defined(__aarch64__)
     size_t r2 = rows / 2 * 2;
-    if (!use_panels || !panel || !panel->x || !panel->nb || !panel->nv ||
+    if (!panel || !panel->x || !panel->nb || !panel->nv ||
         panel->nv > 9 || (panel->pairs && !panel->qs) || !r2 ||
         (type != JANAS_Q4_K && type != JANAS_Q6_K && type != JANAS_Q6_K_P))
+        return 0;
+    if (use_i8mm && panel->nv > 1) {
+        size_t done = janas_mojo_panel_rows(type, w, row_bytes, p1, p0, pb,
+                                          panel, r2, y, ys);
+        if (done)
+            return done;
+    }
+    if (!use_panels)
         return 0;
     panel_rows_neon(type, w, row_bytes, p1, p0, pb, panel, r2, y, ys);
     return r2;

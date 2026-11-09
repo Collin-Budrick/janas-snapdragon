@@ -64,6 +64,169 @@ class ProtocolTests(unittest.TestCase):
         (self.v.OUT/"session-code160.int32").write_bytes(b"frozen token fixture")
         self.v.CACHE_SOURCE_IDENTITY={"sha256":"fixture-source","files":{}}
 
+    def mojo_module(self):
+        path = self.root / "optional-mojo.dll"
+        path.write_bytes(b"fixture Mojo module; never loaded")
+        return path
+
+    def test_mojo_is_explicit_and_inherited_environment_is_cleared(self):
+        inherited = {"JANAS_MOJO": "1", "janas_mojo_library": "hostile.dll"}
+        with patch.dict(os.environ, inherited):
+            env = self.v.environment()
+            self.assertFalse(any(k.upper().startswith("JANAS_MOJO") for k in env))
+            self.assertEqual(os.environ["JANAS_MOJO"], "1")
+            module = self.mojo_module()
+            self.v.MOJO_LIBRARY = module
+            for builder in (self.v.environment, self.v.raw_model_environment):
+                selected = builder()
+                self.assertEqual(selected["JANAS_MOJO"], "1")
+                self.assertEqual(selected["JANAS_MOJO_LIBRARY"], str(module))
+
+    def test_mojo_flag_requires_absolute_existing_module_and_plan_stays_inert(self):
+        self.fast_inputs()
+        (self.v.BIN / "test_mojo.exe").write_bytes(b"fixture test; never executed")
+        module = self.mojo_module()
+        self.assertEqual(self.v.mojo_input(module), {"path": str(module.resolve()),
+            "bytes": module.stat().st_size, "sha256": self.v.sha(module)})
+        for path in (Path("relative.dll"), self.root / "missing.dll", self.root):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "absolute path.*existing"):
+                self.v.mojo_input(path)
+        argv = [str(SCRIPT), "--plan", "--stage", "units", "--bin-dir", str(self.v.BIN),
+                "--mojo-library", str(module), "--out", str(self.root / "uncreated")]
+        with patch.object(sys, "argv", argv), patch.object(self.v.subprocess, "Popen",
+                side_effect=AssertionError("plan launched a child")), contextlib.redirect_stdout(io.StringIO()) as text:
+            self.assertEqual(self.v.main(), 0)
+        value = json.loads(text.getvalue())
+        self.assertFalse((self.root / "uncreated").exists())
+        self.assertEqual(value["mojo_module"]["sha256"], self.v.sha(module))
+        self.assertIn("unit-test_mojo", [c["check_id"] for c in value["cases"]])
+        self.assertEqual(value["excluded_optional_modules"], [])
+        self.assertEqual(value["requested_janas_environment"]["JANAS_MOJO"], "1")
+
+    def test_optional_mojo_unit_selection_is_separate_from_hardware_helpers(self):
+        self.fast_inputs()
+        (self.v.BIN / "test_mojo.exe").write_bytes(b"fixture")
+        (self.v.BIN / "test_hx_probe.exe").write_bytes(b"fixture")
+        plain = self.v.plan("units")
+        self.assertEqual([c["check_id"] for c in plain["cases"]], ["unit-test_fixture"])
+        self.assertEqual(plain["excluded_optional_modules"], ["test_mojo.exe"])
+        self.assertIn("test_hx_probe.exe", plain["excluded_hardware_helpers"])
+        def fake(name, argv, env, **kwargs):
+            if Path(argv[0]).name == "test_mojo.exe":
+                self.assertEqual(env["JANAS_MOJO"], "1")
+                output = json.dumps(dict(test="mojo", cases=1341, compared_words=144570,
+                                         failures=0, skipped=False)) + "\n"
+            else:
+                output = Path(argv[0]).stem + ": ok\n"
+            return self.result(name, output)
+        with patch.object(self.v, "run", fake):
+            self.assertTrue(self.v.units())
+        units = json.loads((self.v.OUT / "units.json").read_text())
+        self.assertEqual(units["count"], 1)
+        self.assertEqual(units["excluded_optional_modules"], ["test_mojo.exe"])
+        self.v.MOJO_LIBRARY = self.mojo_module()
+        with patch.object(self.v, "run", fake):
+            self.assertTrue(self.v.units())
+        units = json.loads((self.v.OUT / "units.json").read_text())
+        self.assertEqual(units["count"], 2)
+        self.assertEqual(units["excluded_optional_modules"], [])
+
+    def test_explicit_mojo_requires_its_built_unit_and_a_complete_non_skipped_matrix(self):
+        self.fast_inputs()
+        self.v.MOJO_LIBRARY = self.mojo_module()
+        with self.assertRaisesRegex(ValueError, "test_mojo.exe"):
+            self.v.plan("units")
+        path = self.v.BIN / "test_mojo.exe"
+        path.write_bytes(b"fixture")
+        good = dict(test="mojo", cases=1341, compared_words=144570, failures=0, skipped=False)
+        for changes in ({}, {"skipped": True}, {"cases": 0}, {"cases": True},
+                        {"compared_words": 0}, {"failures": False}, {"failures": 1}):
+            value = dict(good, **changes)
+            r = self.result("unit-test_mojo", json.dumps(value) + "\n")
+            with self.subTest(changes=changes):
+                self.assertEqual(self.v.validate_unit_result(r, path)["passed"], not changes)
+
+    def test_mojo_proof_cache_hashes_module_content_even_when_size_and_mtime_match(self):
+        self.fast_inputs()
+        self.v.INCREMENTAL_CACHE = self.root / "proof-cache"
+        module = self.mojo_module()
+        self.v.MOJO_LIBRARY = module
+        exe = self.v.BIN / "test_fixture.exe"
+        env = self.v.environment()
+        identity = self.v.case_identity("unit-test_fixture", [exe], env)
+        self.assertEqual(identity["mojo_module"]["sha256"], self.v.sha(module))
+        self.assertNotIn("mojo_module", self.v.case_identity("unit-test_fixture", [exe], {}))
+        r = self.result("unit-test_fixture", "test_fixture: ok\n")
+        r.update(cache_identity=identity, command=[str(exe)], wall_seconds=1, validation_errors=[])
+        self.v.save_validated(r)
+        self.assertTrue(self.v.cache_load("unit-test_fixture", [exe], env)["proof_reused"])
+        st = module.stat()
+        original = module.read_bytes()
+        module.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        os.utime(module, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(module.stat().st_size, st.st_size)
+        self.assertNotEqual(identity, self.v.case_identity("unit-test_fixture", [exe], env))
+        self.assertIsNone(self.v.cache_load("unit-test_fixture", [exe], env))
+
+    def test_mojo_source_identity_includes_kernel_and_build_script(self):
+        root = self.root / "source"
+        (root / "tools").mkdir(parents=True)
+        (root / "src/mojo").mkdir(parents=True)
+        runner = root / "tools/validate-snapdragon-runtime.py"
+        runner.write_text("validator fixture")
+        (root / "build.sh").write_text("C build fixture")
+        (root / "tools/build-mojo.sh").write_text("Mojo build fixture")
+        (root / "src/mojo/quant_panel.mojo").write_text("Mojo leaf fixture")
+        with patch.object(self.v, "ROOT", root), patch.object(self.v, "__file__", str(runner)):
+            before = self.v.source_identity()
+            for relative in ("tools/build-mojo.sh", "src/mojo/quant_panel.mojo"):
+                self.assertEqual(before["files"][relative], self.v.sha(root / relative))
+                original = self.v.source_identity()["sha256"]
+                with (root / relative).open("a") as out:
+                    out.write(" changed")
+                self.assertNotEqual(original, self.v.source_identity()["sha256"])
+
+    def test_mojo_raw_proof_import_requires_recorded_matching_module_identity(self):
+        self.fast_inputs()
+        self.v.INCREMENTAL_CACHE = self.root / "proof-cache"
+        self.v.MOJO_LIBRARY = self.mojo_module()
+        source = self.root / "historical"
+        source.mkdir()
+        exe = self.v.BIN / "test_fixture.exe"
+        stdout, stderr = source / "unit.stdout.log", source / "unit.stderr.log"
+        stdout.write_text("test_fixture: ok\n")
+        stderr.write_text("")
+        record = dict(name="unit-test_fixture", passed=True, validation_errors=[], exit_code=0,
+            command=[str(exe)], binary_sha256=self.v.sha(exe),
+            janas_environment={k:v for k,v in self.v.environment().items() if k.startswith("JANAS_")},
+            stdout=str(stdout), stderr=str(stderr), wall_seconds=1)
+        (source / "summary.json").write_text(json.dumps(dict(passed=True)))
+        planned = {"cases": [dict(check_id="unit-test_fixture", stage="units", command=[str(exe)])]}
+        for bound in (None, self.v.mojo_identity(self.v.environment())):
+            if bound is not None:
+                record["mojo_module"] = bound
+            (source / "units.json").write_text(json.dumps(dict(results=[record])))
+            imported = self.v.import_raw_proofs(source, planned)
+            self.assertEqual(imported["results"][0]["imported"], bound is not None)
+            if bound is None:
+                self.assertIn("Mojo module identity", imported["results"][0]["reason"])
+
+    def test_mojo_module_mutation_during_child_invalidates_the_new_execution(self):
+        self.fast_inputs()
+        self.v.MOJO_LIBRARY = module = self.mojo_module()
+        class Process:
+            pid = 12345
+            def wait(self, timeout):
+                module.write_bytes(b"changed fixture module")
+                return 0
+        with (patch.object(self.v.subprocess, "Popen", return_value=Process()),
+              patch.object(self.v.subprocess, "CREATE_NEW_PROCESS_GROUP", 0, create=True),
+              contextlib.redirect_stdout(io.StringIO())):
+            result = self.v.run("unit-test_fixture", [self.v.BIN / "test_fixture.exe"], self.v.environment())
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["mojo_module_unchanged"])
+
     def session_text(self,case):
         name,planner,mode,drafts,vocab,rows=case
         text=f"settings: compute=8 io=4 planner={planner} speculation={mode} drafts={drafts} draft_vocab={vocab} rows={rows} quality=HIGH expert_bits=6 head_bits=0\n"

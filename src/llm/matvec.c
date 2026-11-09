@@ -281,7 +281,13 @@ void janas_matvec_q4k_group_stats(struct janas_pool *pool,
         first_row[i + 1] = first_row[i] + tasks[i].rows;
 
     struct janas_q8k_panels panels = {0};
+    int prepare = 0;
     if (janas_quant_panels_enabled()) {
+        size_t min_nv = janas_quant_panels_min_vectors();
+        for (size_t i = 0; i < n && !prepare; i++)
+            prepare = (tasks[i].n_vec ? tasks[i].n_vec : 1) >= min_nv;
+    }
+    if (prepare) {
         double begin = stats ? group_now() : 0;
         janas_q8k_panels_create(tasks, n, JANAS_Q8K_PANEL_CAP, &panels);
         if (stats) {

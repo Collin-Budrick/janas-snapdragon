@@ -21,6 +21,10 @@ recovery journals. The [matched release report](docs/benchmarks/snapdragon80b-20
 records the balanced workload comparison and validation boundaries. The CPU
 profile enables only the exact recovery changes that passed its promotion gates.
 
+The [modular Mojo experiment](docs/snapdragon-mojo.md) adds optional ARM64
+quantized kernels to the same fork, with C comparisons and a versioned module
+boundary for gradual migration. The established CPU profile remains available.
+
 The upstream performance figures below describe its Intel test machine.
 Results for this Snapdragon laptop are recorded separately in the guide.
 

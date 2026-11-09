@@ -1,0 +1,56 @@
+{
+  "schema": 1,
+  "model": {
+    "path": "models/qwen3-next-80b-a3b-q4km.jns",
+    "size": 48411922432,
+    "first_mib_sha256": "0cb659c13145b35f1e1c24c0d126c6f0e3b4b04faba5cd421908ac25f1c2e38c",
+    "full_sha256_verified_at_download": "fa3255c73106391e9cb5a97efd30f77a928fb4518d40060f795a8cff6656daed"
+  },
+  "mtp": {
+    "path": "models/qwen3-next-80b-a3b-mtp-q4k.jns",
+    "size": 937992192,
+    "first_mib_sha256": "8d2bcfca5f3c4cafae5c4fe49174152ea072ae0fd87551fb4b7a4431d9d0db84",
+    "full_sha256_verified_at_download": "5c9bc4cb6f739193fac5e4daa30c922f73255acf41443ecfc0123ef084584559"
+  },
+  "case": {
+    "profile": "cpu",
+    "speculation": "mtp",
+    "threads": 8,
+    "cache_gib": 32,
+    "draft_tokens": 4,
+    "prompt": 0,
+    "prompt_on": "cpu",
+    "drafts_on": "cpu",
+    "reply_on": "cpu",
+    "prefetch": "off",
+    "gpu_min_tokens": 0,
+    "npu_min_tokens": 0,
+    "npu_min_macs": 0,
+    "spec_planner": "legacy",
+    "spec_explore": 20,
+    "draft_vocab": "legacy",
+    "draft_vocab_rows": 0,
+    "gdn_chain": 1,
+    "gdn_journal": 1,
+    "gdn_k_only": 1,
+    "panels": "auto",
+    "mojo": "on"
+  },
+  "settings": {
+    "ctx": 2048,
+    "reserve_gib": 12,
+    "seed": 20260926,
+    "temperature": 0,
+    "max_reply": 0,
+    "preload": false
+  },
+  "evidence": {
+    "date": "2026-11-09",
+    "promotion_gate_passed": false,
+    "status": "experimental; correctness and matched performance qualification recorded separately",
+    "notes": "Optional runtime-free Mojo panel module. CPU8/cache32GiB/reserve12GiB/MTP4/GDN111 retained. C singleton and unavailable/unsupported-module fallback retained. Build tools/build-mojo.sh first."
+  },
+  "runtime": {
+    "mojo_library": "lib/mojo/aarch64-windows/janas_mojo.dll"
+  }
+}

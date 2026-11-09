@@ -68,6 +68,8 @@ class RuntimeProtocolTests(unittest.TestCase):
                                           "hybrid_policy", "lookup_drafts", "mtp_drafts", "hybrid_probe_percent")})
         if c["s2_exact"] == "on":
             setup.update({k: c[k] for k in ("s2_exact", "s2_branches", "s2_max_nodes", "s2_min_gain_percent")})
+        if c["mojo"] == "on":
+            setup["mojo"] = "on"
         setup.update({"fair_retain_controller": run["controller_protocol"] == "retained_across_fresh_conversations",
                           "fair_controller_protocol": run["controller_protocol"],
                           "conversation_cache_reuse": False,
@@ -91,7 +93,159 @@ class RuntimeProtocolTests(unittest.TestCase):
                     alternate_nodes=0, cached_uses=0, pruned=8, probes=0)
             if c["hybrid_policy"] == "cost":
                 samples[-1]["hybrid_metrics"] = {"schema": 1, "decisions": 8}
+            if c["mojo"] == "on":
+                samples[-1].update(mojo_calls=64, mojo_row_vectors=4096, mojo_refusals=0)
         return [setup, *samples]
+
+    def mojo_plan(self):
+        module = self.folder / "mojo-module.dll"
+        module.write_bytes(b"fixture module; never loaded")
+        control = self.folder / "mojo-control.json"
+        control.write_text(json.dumps({"mojo": "on", "mojo_library": str(module)}))
+        args = self.args(extra=["--candidate-controls", str(control)])
+        return module, tool.build_plan(args, self.inputs())
+
+    def test_mojo_control_validation_and_legacy_effective_identity(self):
+        module = self.folder / "module.dll"
+        for invalid in ({"mojo": True}, {"mojo": "auto"}, {"mojo_library": None},
+                        {"mojo": "on"}, {"mojo": "on", "mojo_library": "relative.dll"},
+                        {"mojo": "on", "mojo_library": str(module), "panels": "off"}):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                tool.valid_control(invalid)
+        control = tool.valid_control({"mojo": "on", "mojo_library": str(module)})
+        self.assertEqual(control["mojo"], "on")
+        self.assertEqual(tool.effective_control({}),
+                         tool.effective_control({"mojo": "off", "mojo_library": "ignored.dll"}))
+        self.assertNotEqual(tool.effective_control({}), tool.effective_control(control))
+
+    def test_mojo_environment_is_opt_in_and_clears_both_parent_spellings(self):
+        inherited = {"JANAS_MOJO": "1", "janas_mojo_library": "inherited.dll",
+                     "PATH": "unchanged"}
+        before = inherited.copy()
+        off, receipt = tool.environment(self.folder / "cache", tool.DEFAULT_CONTROL, inherited)
+        self.assertEqual(inherited, before)
+        self.assertEqual(off["PATH"], "unchanged")
+        self.assertFalse(any(k.upper().startswith("JANAS_MOJO") for k in off))
+        self.assertIn("janas_mojo_library", receipt["removed_inherited_key_names"])
+        module = self.folder / "chosen.dll"
+        on = tool.valid_control({"mojo": "on", "mojo_library": str(module)})
+        env, receipt = tool.environment(self.folder / "cache", on, inherited)
+        self.assertEqual(env["JANAS_MOJO"], "1")
+        self.assertEqual(env["JANAS_MOJO_LIBRARY"], str(module))
+        self.assertEqual(receipt["controls"]["JANAS_MOJO_LIBRARY"], str(module))
+
+    def test_mojo_plan_freezes_module_once_and_does_not_execute_it(self):
+        with mock.patch.object(tool.subprocess, "Popen", side_effect=AssertionError("child launched")):
+            module, plan = self.mojo_plan()
+        modules = plan["contract"]["inputs"]["mojo_modules"]
+        self.assertEqual(modules, [{"path": str(module), "sha256": tool.sha(module),
+                                    "bytes": module.stat().st_size}])
+        for run in plan["contract"]["plan"]:
+            with self.subTest(arm=run["binary"]):
+                if run["binary"] == "A":
+                    self.assertIsNone(run["mojo_module"])
+                    self.assertNotIn("JANAS_MOJO", run["performance_controls"])
+                else:
+                    self.assertEqual(run["mojo_module"], modules[0])
+                    self.assertEqual(run["performance_controls"]["JANAS_MOJO"], "1")
+                self.assertEqual(tool.validate_records(self.records(run), run), [])
+
+    def test_mojo_module_changes_after_freezing_are_rejected(self):
+        module, plan = self.mojo_plan()
+        inputs = plan["contract"]["inputs"]
+        with (mock.patch.object(tool, "source_identity", return_value=inputs["source"]),
+              mock.patch.object(tool, "verify_calibration_source")):
+            tool.verify_inputs(inputs)
+            module.write_bytes(b"modified module; never loaded")
+            with self.assertRaisesRegex(RuntimeError, "Mojo module changed"):
+                tool.verify_inputs(inputs)
+
+    def test_mojo_missing_module_cannot_produce_a_frozen_plan(self):
+        control = self.folder / "missing-mojo.json"
+        control.write_text(json.dumps({"mojo": "on",
+            "mojo_library": str(self.folder / "missing.dll")}))
+        with self.assertRaises(OSError):
+            tool.build_plan(self.args(extra=["--candidate-controls", str(control)]), self.inputs())
+
+    def test_mojo_source_identity_binds_kernel_and_build_script(self):
+        root = self.folder / "source"
+        (root / "src/mojo").mkdir(parents=True)
+        (root / "include").mkdir()
+        (root / "tools").mkdir()
+        runner = root / "tools/benchmark-snapdragon-runtime.py"
+        pins = root / "tools/pins.json"
+        files = {root / "build.sh": "C build fixture", root / "tools/build-mojo.sh": "Mojo build fixture",
+                 root / "src/mojo/quant_panel.mojo": "Mojo source fixture", runner: "runner fixture",
+                 pins: "pins fixture"}
+        for path, content in files.items():
+            path.write_text(content)
+        with (mock.patch.object(tool, "ROOT", root), mock.patch.object(tool, "PINS_FILE", pins),
+              mock.patch.object(tool, "__file__", str(runner))):
+            original = tool.source_identity()
+            for relative in ("src/mojo/quant_panel.mojo", "tools/build-mojo.sh"):
+                self.assertEqual(original["files"][relative], tool.sha(root / relative))
+                before = tool.source_identity()["sha256"]
+                with (root / relative).open("a") as out:
+                    out.write(" changed")
+                self.assertNotEqual(before, tool.source_identity()["sha256"])
+
+    def test_mojo_candidate_requires_setup_and_actual_integer_execution_counters(self):
+        _, plan = self.mojo_plan()
+        run = next(r for r in plan["contract"]["plan"] if r["binary"] == "B")
+        records = self.records(run)
+        self.assertEqual(tool.validate_records(records, run), [])
+        for mode in (None, "off", True):
+            bad = copy.deepcopy(records)
+            if mode is None:
+                bad[0].pop("mojo")
+            else:
+                bad[0]["mojo"] = mode
+            with self.subTest(mode=mode):
+                self.assertTrue(any("mojo" in e for e in tool.validate_records(bad, run)))
+        for field, values in (("mojo_calls", (None, 0, -1, True, 1.0, "1")),
+                              ("mojo_row_vectors", (None, 0, -1, True, 1.0, "1")),
+                              ("mojo_refusals", (None, 1, False, 0.0, "0"))):
+            for value in values:
+                bad = copy.deepcopy(records)
+                if value is None:
+                    bad[1].pop(field)
+                else:
+                    bad[1][field] = value
+                with self.subTest(field=field, value=value):
+                    self.assertTrue(any("Mojo" in e for e in tool.validate_records(bad, run)))
+
+    def test_c_baseline_accepts_old_metadata_and_rejects_unexpected_mojo_execution(self):
+        run = tool.build_plan(self.args(), self.inputs())["contract"]["plan"][0]
+        records = self.records(run)
+        self.assertEqual(tool.validate_records(records, run), [])
+        records[0]["mojo"] = "off"
+        for sample in records[1:]:
+            sample.update(mojo_calls=0, mojo_row_vectors=0, mojo_refusals=0)
+        self.assertEqual(tool.validate_records(records, run), [])
+        for field in ("mojo_calls", "mojo_row_vectors"):
+            bad = copy.deepcopy(records)
+            bad[1][field] = 1
+            with self.subTest(field=field):
+                self.assertTrue(any("Mojo" in e for e in tool.validate_records(bad, run)))
+        records[0]["mojo"] = "on"
+        self.assertTrue(any("mojo" in e.lower() for e in tool.validate_records(records, run)))
+
+    def test_unexecuted_mojo_candidate_cannot_qualify_a_measured_gain(self):
+        _, plan = self.mojo_plan()
+        completed = []
+        for run in plan["contract"]["plan"]:
+            records = self.records(run)
+            if run["binary"] == "B":
+                for sample in records[1:]:
+                    sample.update(output_tokens_per_second=100.0, mojo_calls=0, mojo_row_vectors=0)
+            errors = tool.validate_records(records, run)
+            completed.append({**run, "status": "invalid" if errors else "ok",
+                              "errors": errors, "records": records, "process_wall_seconds": 1.0})
+        summary = tool.summary(plan, completed)
+        self.assertFalse(summary["promotion"]["passed"])
+        for comparison in summary["comparisons"]:
+            self.assertFalse(comparison["complete_and_output_verified"])
+            self.assertIsNone(comparison["candidate_to_baseline_median_rate_ratio"])
 
     def test_s2_defaults_are_off_and_old_baseline_cli_stays_compatible(self):
         plan = tool.build_plan(self.args(extra=["--candidate-case", "s2-exact"]), self.inputs())
