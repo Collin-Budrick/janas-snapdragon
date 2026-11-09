@@ -95,3 +95,40 @@ int32_t janas_llm_chat_hybrid_metrics(const janas_llm_chat *c,
     memcpy(out, &v, requested);
     return JANAS_LLM_OK;
 }
+
+_Static_assert(sizeof(struct janas_llm_s2_metrics) -
+               offsetof(struct janas_llm_s2_metrics, cycles) ==
+               sizeof(struct janas_gen_s2_metrics), "public S2 metrics mirror layout");
+int32_t janas_llm_chat_s2_metrics(const janas_llm_chat *c,
+                                  struct janas_llm_s2_metrics *out)
+{
+    if (!c || !c->s || !out || out->size < 2 * sizeof(uint32_t) ||
+        out->size > sizeof(*out) || out->version != JANAS_LLM_S2_METRICS_VERSION)
+        return janas_api_fail(JANAS_LLM_EINVAL, "invalid S2 metrics layout");
+    uint32_t requested = out->size;
+    struct janas_gen_s2_metrics g;
+    janas_llm_session_s2_metrics(c->s, &g);
+    struct janas_llm_s2_metrics v = {0};
+    v.size = requested; v.version = JANAS_LLM_S2_METRICS_VERSION;
+    memcpy(&v.cycles, &g, sizeof(g));
+#define D(f) v.f = g.f >= c->s2m0.f ? g.f - c->s2m0.f : g.f
+    D(cycles);
+    D(primary_proposals);
+    D(root_offered);
+    D(rank2_matches);
+    D(alternate_builds);
+    D(alternate_nodes);
+    D(cached_uses);
+    D(cached_nodes);
+    D(discarded_nodes);
+    D(pruned);
+    D(probes);
+    D(maintenance_fast_calls);
+    D(cached_accepted);
+    D(alternate_seconds);
+    D(cached_cycle_seconds);
+    D(controller_seconds);
+#undef D
+    memcpy(out, &v, requested);
+    return JANAS_LLM_OK;
+}

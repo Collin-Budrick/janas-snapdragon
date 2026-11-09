@@ -99,3 +99,35 @@ void janas_hybrid_metrics_json(struct janas_buf *b,
         m->last.lookup_utility, m->last.mtp_utility, m->last.predicted_seconds,
         m->last.causal_seconds, m->last.recovery_seconds);
 }
+
+void janas_s2_metrics_json(struct janas_buf *b, const struct janas_llm_s2_metrics *m)
+{
+    janas_buf_puts(b, "{\"schema\":1,\"scope\":\"current_reply\","
+        "\"benefit_evidence\":\"observational_fresh_vs_cached_rank2_continuations\","
+        "\"reason_order\":[\"disabled\",\"no_capacity\",\"no_evidence\",\"stale\","
+        "\"cpu_cost_unknown\",\"costly\",\"beneficial\",\"probe\",\"weak_confidence\"]");
+#define U(f) janas_buf_printf(b, ",\"" #f "\":%llu", (unsigned long long)m->f)
+#define F(f) janas_buf_printf(b, ",\"" #f "\":%.9g", m->f)
+    U(cycles);
+    U(primary_proposals);
+    U(root_offered);
+    U(rank2_matches);
+    U(alternate_builds);
+    U(alternate_nodes);
+    U(cached_uses);
+    U(cached_nodes);
+    U(discarded_nodes);
+    U(pruned);
+    U(probes);
+    U(maintenance_fast_calls);
+    U(last_reason);
+    U(last_alt_nodes);
+    U(root_hidden_bytes);
+    U(cached_accepted);
+    F(alternate_seconds);
+    F(cached_cycle_seconds);
+    F(controller_seconds);
+#undef U
+#undef F
+    janas_buf_puts(b, "}");
+}

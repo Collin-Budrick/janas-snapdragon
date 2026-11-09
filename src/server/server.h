@@ -233,6 +233,8 @@ struct srv_job {
     int speculation_valid;
     struct janas_llm_hybrid_metrics hybrid;
     int hybrid_valid;
+    struct janas_llm_s2_metrics s2;
+    int s2_valid;
     uint32_t prompt_tokens;                       /* of every prompt, once */
     uint32_t completion_tokens, reasoning_tokens; /* of all of them */
     uint32_t queue_pos;       /* requests ahead of it, while it waits */

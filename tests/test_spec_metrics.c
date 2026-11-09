@@ -8,11 +8,15 @@
 #include "llm/api_spec.c"
 
 static struct janas_gen_metrics generation;
+static struct janas_gen_s2_metrics s2_generation;
 static struct janas_llm_runtime_stats runtime;
 static struct janas_mtp_costs head;
 
 int32_t janas_api_fail(int32_t code, const char *fmt, ...)
 { (void)fmt; return code; }
+void janas_llm_session_s2_metrics(const struct janas_llm_session *s,
+                                   struct janas_gen_s2_metrics *out)
+{ (void)s; *out = s2_generation; }
 void janas_llm_session_hybrid_metrics(const struct janas_llm_session *s,
                                        struct janas_gen_hybrid_metrics *out)
 { (void)s; memset(out, 0, sizeof *out); }
@@ -66,6 +70,52 @@ static void invalid(janas_llm_chat *c, uint32_t size, uint32_t version)
     CHECK(!memcmp(&out, &before, sizeof out));
 }
 
+static void s2_invalid(janas_llm_chat *c, uint32_t size, uint32_t version)
+{
+    struct janas_llm_s2_metrics out, before;
+    memset(&out, 0xa5, sizeof out); out.size=size; out.version=version;
+    memcpy(&before,&out,sizeof out);
+    CHECK(janas_llm_chat_s2_metrics(c,&out)==JANAS_LLM_EINVAL);
+    CHECK(!memcmp(&out,&before,sizeof out));
+}
+static void s2_metrics_tests(janas_llm_chat *c)
+{
+    s2_generation.cycles=10; c->s2m0.cycles=3;
+    s2_generation.alternate_builds=5; c->s2m0.alternate_builds=2;
+    s2_generation.cached_accepted=7; c->s2m0.cached_accepted=3;
+    s2_generation.alternate_seconds=5; c->s2m0.alternate_seconds=2;
+    s2_generation.cached_cycle_seconds=2; c->s2m0.cached_cycle_seconds=.5;
+    s2_generation.last_reason=6; c->s2m0.last_reason=7;
+    s2_generation.last_alt_nodes=4; s2_generation.root_hidden_bytes=4096;
+    struct janas_llm_s2_metrics out={.size=sizeof out,.version=JANAS_LLM_S2_METRICS_VERSION};
+    CHECK(janas_llm_chat_s2_metrics(c,&out)==JANAS_LLM_OK);
+    CHECK(out.cycles==7 && out.alternate_builds==3 && out.cached_accepted==4);
+    CHECK(out.alternate_seconds==3 && out.cached_cycle_seconds==1.5);
+    CHECK(out.last_reason==6 && out.last_alt_nodes==4 && out.root_hidden_bytes==4096);
+    for(size_t n=8;n<=sizeof out;n++){
+        unsigned char *box=malloc(n+32);CHECK(box);if(!box)return;
+        memset(box,0xa5,n+32);
+        struct janas_llm_s2_metrics *prefix=(void *)box;
+        prefix->size=(uint32_t)n;prefix->version=JANAS_LLM_S2_METRICS_VERSION;
+        for(unsigned call=0;call<2;call++){
+            CHECK(janas_llm_chat_s2_metrics(c,prefix)==JANAS_LLM_OK);
+            CHECK(prefix->size==n && prefix->version==JANAS_LLM_S2_METRICS_VERSION);
+            for(size_t j=n;j<n+32;j++)CHECK(box[j]==0xa5);
+            if(prefix->size!=n)break;
+        }
+        free(box);
+    }
+    /* A session reset begins a new counter epoch, without unsigned underflow. */
+    s2_generation.cycles=1;
+    CHECK(janas_llm_chat_s2_metrics(c,&out)==0 && out.cycles==1);
+    s2_invalid(c,0,1);s2_invalid(c,4,1);s2_invalid(c,sizeof out+1,1);
+    s2_invalid(c,sizeof out,0);s2_invalid(c,sizeof out,2);
+    s2_invalid(NULL,sizeof out,1);
+    CHECK(janas_llm_chat_s2_metrics(c,NULL)==JANAS_LLM_EINVAL);
+    struct janas_llm_session *session=c->s;c->s=NULL;
+    s2_invalid(c,sizeof out,1);c->s=session;
+}
+
 int main(void)
 {
     janas_llm llm = {0};
@@ -105,6 +155,7 @@ int main(void)
     for (size_t i = 0; i < 16; i++)
         CHECK(guarded.before[i] == 0xa5 && guarded.after[i] == 0xa5);
     prefixes(&c);
+    s2_metrics_tests(&c);
     invalid(&c, 0, JANAS_LLM_SPEC_METRICS_VERSION);
     invalid(&c, 4, JANAS_LLM_SPEC_METRICS_VERSION);
     invalid(&c, sizeof guarded.metrics + 1, JANAS_LLM_SPEC_METRICS_VERSION);

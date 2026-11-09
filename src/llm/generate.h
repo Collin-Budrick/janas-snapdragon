@@ -68,7 +68,21 @@ struct janas_gen_options {
     uint32_t draft_vocab_rows; /* 0: auto, or 8192/16384/32768 */
     int hybrid_policy; /* 0 legacy, 1 cost-aware source selection */
     int hybrid_lookup_max_drafts, hybrid_mtp_max_drafts, hybrid_probe_percent;
+    int s2_exact, s2_branches, s2_max_nodes, s2_min_gain_percent;
 };
+
+/* Independent opt-in S2 execution diagnostics; existing public metrics stay
+   unchanged. Branch savings require compatible measured evidence, never scoring credit. */
+struct janas_gen_s2_metrics {
+    uint64_t cycles, primary_proposals, root_offered, rank2_matches;
+    uint64_t alternate_builds, alternate_nodes, cached_uses, cached_nodes;
+    uint64_t discarded_nodes, pruned, probes, maintenance_fast_calls;
+    uint64_t last_reason, last_alt_nodes, root_hidden_bytes, cached_accepted;
+    double alternate_seconds, cached_cycle_seconds, controller_seconds;
+};
+struct janas_llm_session;
+void janas_llm_session_s2_metrics(const struct janas_llm_session *s,
+                                  struct janas_gen_s2_metrics *out);
 
 enum janas_gen_source {
     JANAS_GEN_SOURCE_PLAIN = 0,

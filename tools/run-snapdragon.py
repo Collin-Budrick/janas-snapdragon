@@ -69,7 +69,8 @@ PERFORMANCE_ENV = ("JANAS_KERNELS", "JANAS_EXPERTS", "JANAS_GPU_ALWAYS",
     "JANAS_GPU_NV", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS", "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL",
     "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES", "JANAS_SPEC_PLANNER",
     "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
-    "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT",
+    "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT", "JANAS_S2_EXACT", "JANAS_S2_BRANCHES",
+    "JANAS_S2_MAX_NODES", "JANAS_S2_MIN_GAIN_PERCENT",
     "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY")
 PROFILE_ENV = {"JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG",
     "JANAS_TUNE", "JANAS_TUNE_THREADS", "JANAS_WARM", "JANAS_MISS_SKIP",
@@ -77,7 +78,8 @@ PROFILE_ENV = {"JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG",
     "JANAS_PREFETCH", "JANAS_PREFETCH_PREFILL", "JANAS_GPU_MIN_N", "JANAS_NPU_MIN_N", "JANAS_NPU_MIN_MACS",
     "JANAS_KV", "JANAS_ATTN", "JANAS_CPU_TILES", "JANAS_SPEC_PLANNER",
     "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
-    "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT",
+    "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT", "JANAS_S2_EXACT", "JANAS_S2_BRANCHES",
+    "JANAS_S2_MAX_NODES", "JANAS_S2_MIN_GAIN_PERCENT",
     "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY"}
 
 
@@ -134,15 +136,20 @@ def load_profile(path: Path, root: Path = ROOT) -> dict[str, Any]:
     for key, default, choices in (("spec_planner", "legacy", SPEC_PLANNERS),
                                   ("draft_vocab", "legacy", DRAFT_VOCAB_POLICIES),
                                   ("hybrid_policy", "legacy", HYBRID_POLICIES),
+                                   ("s2_exact", "off", {"off", "on"}),
                                   ("panels", "auto", PANEL_POLICIES)):
         case.setdefault(key, default)
         if not isinstance(case[key], str) or case[key] not in choices:
             raise ValueError(f"case.{key} must be one of: " + ", ".join(sorted(choices)))
     for key, default, low, high in (("lookup_drafts", 8, 1, 16),
                                       ("mtp_drafts", 4, 1, 16),
-                                      ("hybrid_probe_percent", 2, 0, 100)):
+                                      ("hybrid_probe_percent", 2, 0, 100),
+                                       ("s2_branches", 2, 1, 2), ("s2_max_nodes", 8, 1, 32),
+                                       ("s2_min_gain_percent", 5, 0, 100)):
         case.setdefault(key, default)
         number(case[key], f"case.{key}", low, high, True)
+    if case["s2_exact"] == "on" and case["speculation"] not in ("mtp", "auto", "hybrid"):
+        raise ValueError("S2 exact requires MTP speculation")
     case.setdefault("spec_explore", 20)
     number(case["spec_explore"], "case.spec_explore", 0, 100, True)
     case.setdefault("draft_vocab_rows", 0)
@@ -223,6 +230,8 @@ def launch_environment(profile: dict[str, Any], inherited: dict[str, str]) -> di
             ("lookup_drafts", "JANAS_LOOKUP_DRAFTS", 8),
             ("mtp_drafts", "JANAS_MTP_DRAFTS", 4),
             ("hybrid_probe_percent", "JANAS_HYBRID_PROBE_PERCENT", 2),
+            ("s2_exact", "JANAS_S2_EXACT", "off"), ("s2_branches", "JANAS_S2_BRANCHES", 2),
+            ("s2_max_nodes", "JANAS_S2_MAX_NODES", 8), ("s2_min_gain_percent", "JANAS_S2_MIN_GAIN_PERCENT", 5),
             ("gdn_chain", "JANAS_GDN_CHAIN", 0),
             ("gdn_journal", "JANAS_GDN_JOURNAL", 0),
             ("gdn_k_only", "JANAS_GDN_K_ONLY", 0)):
@@ -268,6 +277,10 @@ def launch_command(profile: dict[str, Any], app: str, executable: Path,
         "--hybrid-probe-percent", str(c.get("hybrid_probe_percent", 2)),
         "--prompt-on", c["prompt_on"],
         "--drafts-on", c["drafts_on"], "--reply-on", c["reply_on"], "--think", "off"]
+    if c.get("s2_exact", "off") == "on":
+        command += ["--s2-exact", "on", "--s2-branches", str(c.get("s2_branches", 2)),
+                    "--s2-max-nodes", str(c.get("s2_max_nodes", 8)),
+                    "--s2-min-gain-percent", str(c.get("s2_min_gain_percent", 5))]
     if profile["mtp"] is not None and c["speculation"] in ("mtp", "hybrid", "auto"):
         command += ["--mtp", str(profile["mtp"])]
     else:
@@ -293,6 +306,8 @@ def validate_cli(executable: Path, env: dict[str, str]) -> None:
     required = ("--speculation", "--draft-tokens", "--quality", "--prompt-on",
                 "--drafts-on", "--reply-on", "--spec-planner", "--spec-explore",
                 "--draft-vocab", "--draft-vocab-rows")
+    if env.get("JANAS_S2_EXACT") == "on":
+        required += ("--s2-exact", "--s2-branches", "--s2-max-nodes", "--s2-min-gain-percent")
     missing = [x for x in required
                if not re.search(r"(?<![\w-])" + re.escape(x) + r"(?![\w-])", help_text)]
     if missing:

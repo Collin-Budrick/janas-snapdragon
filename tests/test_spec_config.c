@@ -13,6 +13,10 @@
 #include "llm/spec_config.h"
 
 static struct janas_gen_metrics fixture_gen;
+static struct janas_gen_s2_metrics fixture_s2;
+static void fixture_s2_metrics(const struct janas_llm_session *session,
+                                struct janas_gen_s2_metrics *out)
+{ (void)session; *out = fixture_s2; }
 static struct janas_gen_hybrid_metrics fixture_hybrid;
 static void fixture_hybrid_metrics(const struct janas_llm_session *s,
                                      struct janas_gen_hybrid_metrics *out)
@@ -28,11 +32,13 @@ static void fixture_runtime_stats(const struct janas_llm_model *m,
 static void fixture_mtp_costs(const struct janas_llm_model *m,
                                struct janas_mtp_costs *out)
 { (void)m; *out = fixture_mtp; }
+#define janas_llm_session_s2_metrics fixture_s2_metrics
 #define janas_llm_session_hybrid_metrics fixture_hybrid_metrics
 #define janas_llm_session_metrics fixture_session_metrics
 #define janas_llm_model_runtime_stats fixture_runtime_stats
 #define janas_llm_mtp_costs fixture_mtp_costs
 #include "../src/llm/api_spec.c"
+#undef janas_llm_session_s2_metrics
 #undef janas_llm_session_hybrid_metrics
 #undef janas_llm_session_metrics
 #undef janas_llm_model_runtime_stats
@@ -59,7 +65,8 @@ static int failures;
 static const char *const env_names[] = {
     "JANAS_SPEC_PLANNER", "JANAS_SPEC_EXPLORE", "JANAS_DRAFT_VOCAB_POLICY",
     "JANAS_DRAFT_VOCAB_ROWS", "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS",
-    "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT"
+    "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT",
+    "JANAS_S2_EXACT", "JANAS_S2_BRANCHES", "JANAS_S2_MAX_NODES", "JANAS_S2_MIN_GAIN_PERCENT"
 };
 
 static void clear_env(void)
@@ -332,6 +339,62 @@ static void hybrid_tests(struct janas_llm_chat *c)
     c->s = NULL;
 }
 
+static void s2_tests(struct janas_llm_chat *c)
+{
+    clear_env();
+    struct janas_llm_s2_config p;
+    janas_llm_s2_config_default(&p);
+    CHECK(p.size == sizeof p && p.version == 1 && p.exact == 0 &&
+          p.branches == 2 && p.max_nodes == 8 && p.min_gain_percent == 5,
+          "S2 defaults remain dormant and tagged");
+    CHECK(janas_llm_chat_set_s2_config(c, &p) == 0, "S2 default accepted");
+    struct janas_llm_s2_config bad;
+#define S_BAD(field, value) do { bad = p; bad.field = (value); \
+    struct janas_llm_s2_config old = c->s2_config; \
+    CHECK(janas_llm_chat_set_s2_config(c, &bad) == JANAS_LLM_EINVAL && \
+          memcmp(&old, &c->s2_config, sizeof old) == 0, "S2 invalid config atomic"); } while (0)
+    S_BAD(size, sizeof p - 1); S_BAD(size, sizeof p + 1); S_BAD(version, 2);
+    S_BAD(exact, -1); S_BAD(exact, 2); S_BAD(branches, 0); S_BAD(branches, 3);
+    S_BAD(max_nodes, 0); S_BAD(max_nodes, 33); S_BAD(min_gain_percent, -1); S_BAD(min_gain_percent, 101);
+#undef S_BAD
+    char error[160];
+    CHECK(janas_spec_runtime_option("--s2-exact", "on", error, sizeof error) == 1 &&
+          janas_spec_runtime_option("--s2-branches", "1", error, sizeof error) == 1 &&
+          janas_spec_runtime_option("--s2-max-nodes", "32", error, sizeof error) == 1 &&
+          janas_spec_runtime_option("--s2-min-gain-percent", "5", error, sizeof error) == 1 &&
+          janas_s2_config_env(&p, error, sizeof error) == 0 && p.exact == 1 && p.branches == 1 && p.max_nodes == 32,
+          "S2 CLI environment round trip");
+    struct janas_llm_s2_config before = p;
+    CHECK(setenv("JANAS_S2_MAX_NODES", "33", 1) == 0 &&
+          janas_s2_config_env(&p, error, sizeof error) == -1 &&
+          memcmp(&p, &before, sizeof p) == 0, "S2 environment parse atomic");
+    clear_env();
+    CHECK(janas_llm_chat_set_s2_config(c, &p) == 0, "S2 opt-in accepted");
+    struct janas_gen_options o;
+    CHECK(janas_api_options(c, &o) == 0 && o.s2_exact == 1 && o.s2_branches == 1 &&
+          o.s2_max_nodes == 32 && o.s2_min_gain_percent == 5, "S2 internal controls copied");
+    c->s = (struct janas_llm_session *)(void *)c;
+    fixture_s2.cycles = 12; c->s2m0.cycles = 4;
+    fixture_s2.cached_accepted = 7; c->s2m0.cached_accepted = 2;
+    fixture_s2.last_reason = 6; fixture_s2.root_hidden_bytes = 1234;
+    for (uint32_t n = 8; n <= sizeof(struct janas_llm_s2_metrics); n++) {
+        unsigned char *box = malloc((size_t)n + 16);
+        CHECK(box != NULL, "S2 metrics allocation"); if (!box) break;
+        memset(box, 0xa5, (size_t)n + 16);
+        struct janas_llm_s2_metrics *m = (void *)box; m->size=n; m->version=1;
+        CHECK(janas_llm_chat_s2_metrics(c,m)==0 && m->size==n,"S2 metrics bounded prefix");
+        for(unsigned j=0;j<16;j++) CHECK(box[n+j]==0xa5,"S2 prefix guard unchanged");
+        free(box);
+    }
+    struct janas_llm_s2_metrics m={.size=sizeof m,.version=1};
+    CHECK(janas_llm_chat_s2_metrics(c,&m)==0 && m.cycles==8 && m.cached_accepted==5 &&
+          m.last_reason==6 && m.root_hidden_bytes==1234,"S2 counters reply-local; gauges preserved");
+    m.version=2; struct janas_llm_s2_metrics unchanged=m;
+    CHECK(janas_llm_chat_s2_metrics(c,&m)==JANAS_LLM_EINVAL &&
+          memcmp(&m,&unchanged,sizeof m)==0,"S2 bad metrics layout atomic");
+    c->s=NULL;
+}
+
 int main(void)
 {
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])] = {0};
@@ -350,6 +413,7 @@ int main(void)
     parser_tests(&c);
     metrics_tests(&c);
     hybrid_tests(&c);
+    s2_tests(&c);
     for (unsigned i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         if (saved_env[i]) CHECK(setenv(env_names[i], saved_env[i], 1) == 0, "restore parent environment");
         else CHECK(unsetenv(env_names[i]) == 0, "restore absent parent environment");

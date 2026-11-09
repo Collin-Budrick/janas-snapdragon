@@ -430,6 +430,29 @@ JANAS_LLM_API int32_t janas_llm_chat_set_speculation_config(
 #define JANAS_LLM_HYBRID_REASON_MTP_REFRESH 5
 #define JANAS_LLM_HYBRID_REASON_COOLDOWN 6
 #define JANAS_LLM_HYBRID_REASON_NO_CAPACITY 7
+/* Independent tagged S2 controls; existing public parameter layouts are unchanged.
+   Exact changes proposals/scheduling only; target weights/routes remain unchanged. */
+#define JANAS_LLM_S2_CONFIG_VERSION 1
+struct janas_llm_s2_config {
+    uint32_t size, version;
+    int32_t exact, branches, max_nodes, min_gain_percent;
+};
+JANAS_LLM_API void janas_llm_s2_config_default(struct janas_llm_s2_config *config);
+JANAS_LLM_API int32_t janas_llm_chat_set_s2_config(
+    janas_llm_chat *c, const struct janas_llm_s2_config *config);
+
+#define JANAS_LLM_S2_METRICS_VERSION 1
+/* Additive diagnostics, scoped to the current reply; sizes may request a prefix.
+   Branch benefit estimates use compatible observed correction classes, not
+   exact same-state counterfactuals or future target routing. */
+struct janas_llm_s2_metrics {
+    uint32_t size, version;
+    uint64_t cycles, primary_proposals, root_offered, rank2_matches, alternate_builds, alternate_nodes, cached_uses, cached_nodes, discarded_nodes, pruned, probes, maintenance_fast_calls, last_reason, last_alt_nodes, root_hidden_bytes, cached_accepted;
+    double alternate_seconds, cached_cycle_seconds, controller_seconds;
+};
+JANAS_LLM_API int32_t janas_llm_chat_s2_metrics(
+    const janas_llm_chat *c, struct janas_llm_s2_metrics *metrics);
+
 struct janas_llm_hybrid_config {
     uint32_t size, version;
     int32_t policy, lookup_max_drafts, mtp_max_drafts, probe_percent;

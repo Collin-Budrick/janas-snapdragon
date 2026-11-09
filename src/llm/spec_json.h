@@ -8,4 +8,6 @@ void janas_spec_metrics_json(struct janas_buf *out,
                               const struct janas_llm_speculation_metrics *m);
 void janas_hybrid_metrics_json(struct janas_buf *out,
                                 const struct janas_llm_hybrid_metrics *m);
+void janas_s2_metrics_json(struct janas_buf *out,
+                            const struct janas_llm_s2_metrics *m);
 #endif

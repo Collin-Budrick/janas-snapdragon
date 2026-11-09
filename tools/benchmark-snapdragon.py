@@ -56,8 +56,9 @@ PANEL_POLICIES = {"auto": {}, "off": {"JANAS_CPU_TILES": "0"},
                   "experimental": {"JANAS_CPU_TILES": "1"}}
 EXPERIMENT_ENV = ("JANAS_SPEC_PLANNER", "JANAS_SPEC_EXPLORE",
     "JANAS_DRAFT_VOCAB_POLICY", "JANAS_DRAFT_VOCAB_ROWS",
-    "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT", "JANAS_GDN_CHAIN",
-    "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY")
+    "JANAS_HYBRID_POLICY", "JANAS_LOOKUP_DRAFTS", "JANAS_MTP_DRAFTS", "JANAS_HYBRID_PROBE_PERCENT",
+    "JANAS_GDN_CHAIN", "JANAS_GDN_JOURNAL", "JANAS_GDN_K_ONLY",
+    "JANAS_S2_EXACT", "JANAS_S2_BRANCHES", "JANAS_S2_MAX_NODES", "JANAS_S2_MIN_GAIN_PERCENT")
 RECORDED_PERFORMANCE_ENV = (
     "JANAS_GPU", "JANAS_NPU", "JANAS_GPU_DEVICE", "JANAS_GPU_SG", "JANAS_TUNE",
     "JANAS_TUNE_THREADS", "JANAS_WARM", "JANAS_MISS_SKIP", "JANAS_EXPERT_BITS",
@@ -94,6 +95,10 @@ class Case:
     lookup_drafts: int = 8
     mtp_drafts: int = 4
     hybrid_probe_percent: int = 2
+    s2_exact: str = "off"
+    s2_branches: int = 2
+    s2_max_nodes: int = 8
+    s2_min_gain_percent: int = 5
     gdn_chain: int = 0
     gdn_journal: int = 0
     gdn_k_only: int = 0
@@ -112,6 +117,13 @@ class Case:
                                  (self.hybrid_probe_percent, 0, 100)):
             if type(value) is not int or not low <= value <= high:
                 raise ValueError("Invalid hybrid source ceiling/probe percentage")
+        if self.s2_exact not in ("off", "on"):
+            raise ValueError("Invalid S2 exact mode")
+        for value, low, high in ((self.s2_branches, 1, 2), (self.s2_max_nodes, 1, 32), (self.s2_min_gain_percent, 0, 100)):
+            if type(value) is not int or not low <= value <= high:
+                raise ValueError("Invalid S2 bound")
+        if self.s2_exact == "on" and self.speculation not in ("mtp", "auto", "hybrid"):
+            raise ValueError("S2 exact requires MTP speculation")
         if self.draft_vocab not in ("legacy", "adaptive"):
             raise ValueError("Invalid draft vocabulary policy")
         if type(self.draft_vocab_rows) is not int or self.draft_vocab_rows not in (0, 8192, 16384, 32768):
@@ -137,6 +149,7 @@ class Case:
                                    spec_planner="legacy", spec_explore=20,
                                    draft_vocab="legacy", draft_vocab_rows=0,
                                    hybrid_policy="legacy", lookup_drafts=8, mtp_drafts=4, hybrid_probe_percent=2,
+                                    s2_exact="off", s2_branches=2, s2_max_nodes=8, s2_min_gain_percent=5,
                                    gdn_chain=0, gdn_journal=0, gdn_k_only=0,
                                    panels="auto")
 
@@ -163,7 +176,7 @@ def screen_cases(args: argparse.Namespace) -> list[Case]:
                            **{name: getattr(args, name, field.default)
                               for name, field in Case.__dataclass_fields__.items()
                               if name in ("spec_planner", "spec_explore", "draft_vocab",
-                                          "draft_vocab_rows", "hybrid_policy", "lookup_drafts", "mtp_drafts", "hybrid_probe_percent", "gdn_chain", "gdn_journal",
+                                          "draft_vocab_rows", "hybrid_policy", "lookup_drafts", "mtp_drafts", "hybrid_probe_percent", "s2_exact", "s2_branches", "s2_max_nodes", "s2_min_gain_percent", "gdn_chain", "gdn_journal",
                                           "gdn_k_only", "panels")}))
     return with_references(cases)
 
@@ -260,6 +273,8 @@ def run_case(args: argparse.Namespace, case: Case, prompt_path: Path,
                 "JANAS_LOOKUP_DRAFTS": str(case.lookup_drafts),
                 "JANAS_MTP_DRAFTS": str(case.mtp_drafts),
                 "JANAS_HYBRID_PROBE_PERCENT": str(case.hybrid_probe_percent),
+                "JANAS_S2_EXACT": case.s2_exact, "JANAS_S2_BRANCHES": str(case.s2_branches),
+                "JANAS_S2_MAX_NODES": str(case.s2_max_nodes), "JANAS_S2_MIN_GAIN_PERCENT": str(case.s2_min_gain_percent),
                 "JANAS_GDN_CHAIN": str(case.gdn_chain),
                 "JANAS_GDN_JOURNAL": str(case.gdn_journal),
                 "JANAS_GDN_K_ONLY": str(case.gdn_k_only)})
@@ -291,6 +306,10 @@ def run_case(args: argparse.Namespace, case: Case, prompt_path: Path,
                "--draft-vocab", case.draft_vocab, "--draft-vocab-rows", str(case.draft_vocab_rows),
                "--hybrid-policy", case.hybrid_policy, "--lookup-drafts", str(case.lookup_drafts),
                "--mtp-drafts", str(case.mtp_drafts), "--hybrid-probe-percent", str(case.hybrid_probe_percent), "--json"]
+    if case.s2_exact == "on":
+        command += ["--s2-exact", "on", "--s2-branches", str(case.s2_branches),
+                    "--s2-max-nodes", str(case.s2_max_nodes),
+                    "--s2-min-gain-percent", str(case.s2_min_gain_percent)]
     if case.speculation in ("mtp", "auto", "hybrid"):
         command += ["--mtp", str(args.mtp)]
     else:
@@ -433,6 +452,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--cache-gib", default="8,24,0", help="last value is used for screening; 0 is auto")
     p.add_argument("--draft-tokens", default="2,4,8")
     p.add_argument("--spec-planner", choices=("legacy", "cycle", "fixed"), default="legacy")
+    p.add_argument("--s2-exact", choices=("off", "on"), default="off")
+    p.add_argument("--s2-branches", type=int, choices=range(1, 3), default=2)
+    p.add_argument("--s2-max-nodes", type=int, choices=range(1, 33), default=8)
+    p.add_argument("--s2-min-gain-percent", type=int, choices=range(101), default=5)
     p.add_argument("--hybrid-policy", choices=("legacy", "cost"), default="legacy")
     p.add_argument("--lookup-drafts", type=int, choices=range(1, 17), default=8)
     p.add_argument("--mtp-drafts", type=int, choices=range(1, 17), default=4)

@@ -549,6 +549,13 @@ struct janas_llm_model {
     uint32_t *ix_sel, *ix_pos;
 
     double phase[JANAS_PH_COUNT];
+    /* Last scored draft head, for allocation-free alternative extraction.
+       Appended so established field offsets stay unchanged. Invalidated by
+       the next MTP forward; row/policy/epoch checks reject a repacked head.
+       No target or recurrent state is cached. */
+    double dh_scored_sum;
+    uint32_t dh_scored_best, dh_scored_rows, dh_scored_policy;
+    uint64_t dh_scored_epoch;
 };
 
 /* Shared by the files of the forward pass (model*.c). */

@@ -26,6 +26,19 @@ def row(case, rate=10, signature=None, prompts=None):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_s2_case_is_explicit_bounded_and_reference_stays_off(self):
+        case = bench.Case("cpu", "mtp", 8, 32, 4, s2_exact="on", s2_branches=1)
+        self.assertEqual(case.cpu_reference().s2_exact, "off")
+        for bad in ({"s2_exact": "bad"}, {"s2_branches": 0}, {"s2_max_nodes": 33}, {"s2_min_gain_percent": True}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError): dataclasses.replace(case, **bad)
+        with self.assertRaises(ValueError): dataclasses.replace(case, speculation="none")
+        args=argparse.Namespace(bench=Path("bench.exe"), model=Path("main"), mtp=Path("mtp"), reserve_gib=12, ctx=2048, gen=128, rounds=1, warmups=0, seed=7, timeout=30, n_prompts=1)
+        response=subprocess.CompletedProcess([],0,"","")
+        with tempfile.TemporaryDirectory() as tmp, patch.object(bench.subprocess,"run",return_value=response) as run:
+            result=bench.run_case(args,case,Path("prompt.txt"),Path(tmp),"screen")
+            self.assertIn("--s2-exact",result["command"])
+            self.assertEqual(run.call_args.kwargs["env"]["JANAS_S2_EXACT"],"on")
+
     def test_hybrid_controls_bound_sources_and_reference_policy(self):
         base = bench.Case("cpu", "hybrid", 8, 32, 8, hybrid_policy="cost",
                           lookup_drafts=8, mtp_drafts=4, hybrid_probe_percent=2)

@@ -1,11 +1,17 @@
 """Native Windows functional gates. Default --plan launches no executable.
 Execution requires explicit --execute after coordinating exclusive device use.
-Every execution uses a fresh output directory and runs one child at a time.
+Every execution uses a fresh output directory. Optional --fast reuses model
+loads and runs independent model-free units concurrently; model jobs stay serial.
 No throughput or cold-cache claims are inferred from these checks.
 """
 from __future__ import annotations
 import argparse
 import ctypes
+import contextlib
+import concurrent.futures
+import platform
+import shutil
+import threading
 import hashlib
 import json
 import math
@@ -30,7 +36,17 @@ RECEIPT = ROOT / "tools" / "snapdragon-runtime-models.json"
 BASELINE_QUALITY_EXE = None
 VERIFY_MODEL_HASHES = False
 SEMANTIC_PROBE_PERCENT = 2
+S2_CONTROLS = {"s2_exact": "off", "s2_branches": 2, "s2_max_nodes": 8, "s2_min_gain_percent": 5}
 ATTENTION_CALIBRATION = None
+FAST = False
+UNIT_WORKERS = 4
+SELECT_CHECKS = set()
+INCREMENTAL_CACHE = None
+CACHE_SOURCE_IDENTITY = None
+CACHE_STATS = {"hits": 0, "misses": 0, "stored": 0, "rejected": 0}
+CACHE_LOCK = threading.Lock()
+FILE_IDENTITIES = {}
+CACHE_PROTOCOL = "native-functional-proof-v1"
 EXPECTED_DIGEST = "c70a79fcb00b7e3d"
 EXPECTED_QREF_SHA = "52b0f576b85e9df0d2ba24380ff974f836a0f467fdcb46bbf19a747535883390"
 EXPECTED_INPUTS = {
@@ -83,6 +99,8 @@ def environment(extra=None):
                JANAS_MISS_SKIP="0", JANAS_PREFETCH="0", JANAS_PREFETCH_PREFILL="0",
                JANAS_CPU_TILES="1", JANAS_GDN_CHAIN="1", JANAS_GDN_JOURNAL="1",
                JANAS_GDN_K_ONLY="1")
+    if S2_CONTROLS["s2_exact"] == "on":
+        env.update({"JANAS_" + k.upper(): str(v) for k, v in S2_CONTROLS.items()})
     if extra:
         env.update(extra)
     return env
@@ -167,11 +185,191 @@ def seed_attention_calibration(cache, frozen):
             "sha256": frozen["sha256"], "bytes": frozen["bytes"], "original_mutated": False}
 
 
-def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,)):
+def raw_model_environment(extra=None):
+    result=environment(extra)
+    for key in tuple(result):
+        if key.startswith("JANAS_S2_"): result.pop(key)
+    return result
+
+
+def selected(name):
+    return not SELECT_CHECKS or name in SELECT_CHECKS
+
+
+def source_identity():
+    # Linked dependency bits are bound by the executable hash. Track project
+    # sources and fixture inputs without repeatedly hashing third-party trees.
+    files = [Path(__file__).resolve(), ROOT / "build.sh"]
+    for folder in ("src", "include", "tests"):
+        files += [p for p in (ROOT / folder).rglob("*") if p.is_file() and
+                  "third_party" not in p.parts and p.suffix.lower() in
+                  (".c", ".h", ".inc", ".s", ".py", ".json", ".txt", ".bin")]
+    values = {p.relative_to(ROOT).as_posix(): sha(p) for p in sorted(set(files)) if p.is_file()}
+    return {"sha256": hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest(),
+            "files": values, "scope": "project sources/fixtures; linked dependencies bound by executable SHA"}
+
+
+def file_identity(path, large=False):
+    path = Path(path).resolve()
+    st = path.stat()
+    fingerprint = (str(path), st.st_size, st.st_mtime_ns, st.st_ctime_ns, large)
+    if fingerprint not in FILE_IDENTITIES:
+        item = {"path": str(path), "bytes": st.st_size, "mtime_ns": st.st_mtime_ns,
+                "ctime_ns": st.st_ctime_ns}
+        if large:
+            with path.open("rb") as stream:
+                item["first_mib_sha256"] = sha_bytes(stream.read(1 << 20))
+            item["payload_boundary"] = "pinned receipt plus unchanged size/time/header; no new full payload scan"
+        else:
+            item["sha256"] = sha(path)
+        FILE_IDENTITIES[fingerprint] = item
+    return FILE_IDENTITIES[fingerprint]
+
+
+def case_identity(name, argv, env, affinity=None):
+    global CACHE_SOURCE_IDENTITY
+    if CACHE_SOURCE_IDENTITY is None:
+        CACHE_SOURCE_IDENTITY = source_identity()
+    def normalize(value):
+        value = str(value)
+        prefix = str(OUT) + os.sep
+        head, separator, tail = value.partition("=")
+        if separator and tail.startswith(prefix):
+            return head + "=@output/" + tail[len(prefix):].replace(os.sep,"/")
+        return "@output/" + value[len(prefix):].replace(os.sep, "/") if value.startswith(prefix) else value
+    model_free = name.startswith("unit-")
+    identity = {"protocol": CACHE_PROTOCOL, "name": name,
+        "executable": file_identity(argv[0]), "arguments": [normalize(x) for x in argv[1:]],
+        "environment": {k: v for k, v in env.items() if k.upper().startswith("JANAS_")},
+        "affinity": affinity, "unit_cpu8_parent": bool(FAST and model_free),
+        "platform": {"os": os.name, "machine": platform.machine(),
+                     "processor": os.environ.get("PROCESSOR_IDENTIFIER", ""), "version":platform.version()},
+        "source": CACHE_SOURCE_IDENTITY,
+        "attention": ATTENTION_CALIBRATION,
+        "model_free": model_free}
+    identity["project_libraries"] = {p.name: file_identity(p) for pattern in ("libjanas*.dll", "janas*.dll")
+        for p in Path(argv[0]).parent.glob(pattern)}
+    identity["argument_files"] = {}
+    for index,value in enumerate(argv[1:]):
+        candidate = str(value).split("=",1)[-1]
+        path = Path(candidate)
+        if path.is_file() and path.resolve() not in (MODEL.resolve(), MTP.resolve()):
+            item = file_identity(path)
+            identity["argument_files"][str(index)] = {"logical_path": normalize(path),
+                "bytes": item["bytes"], "sha256": item["sha256"]}
+    if not model_free:
+        identity["models"] = {k: dict(file_identity(p, large=True), pinned_bytes=MODEL_PINS[k][0],
+                                      pinned_sha256=MODEL_PINS[k][1]) for k,p in (("main", MODEL), ("mtp", MTP))}
+        identity["reference"] = file_identity(QREF)
+        identity["tokens"] = file_identity(CODE)
+        identity["model_receipt"] = file_identity(RECEIPT)
+        identity["frozen_inputs"] = {p.name: dict(file_identity(p)) for p in
+            (OUT / "reference32.int32", OUT / "reference32.f32", OUT / "session-code160.int32") if p.is_file()}
+        # Output-directory paths are not semantic input identities.
+        for item in identity["frozen_inputs"].values():
+            item.pop("path", None); item.pop("mtime_ns", None); item.pop("ctime_ns", None)
+    return identity
+
+
+def identity_key(identity):
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def cache_load(name, argv, env, affinity=None):
+    if INCREMENTAL_CACHE is None:
+        return None
+    identity = case_identity(name, argv, env, affinity)
+    key = identity_key(identity)
+    folder = INCREMENTAL_CACHE / key
+    try:
+        manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+        if (manifest.get("schema") != 1 or manifest.get("validated_pass_only") is not True or
+            manifest.get("identity") != identity or manifest.get("key") != key):
+            raise ValueError("cache identity mismatch")
+        if set(manifest.get("artifacts",{})) != {"stdout.log","stderr.log","record.json"}:
+            raise ValueError("cache proof artifact set incomplete")
+        if any(sha(folder / filename) != digest for filename,digest in manifest["artifacts"].items()):
+            raise ValueError("cache proof checksum mismatch")
+        value = json.loads((folder / "record.json").read_text(encoding="utf-8"))
+        if value.get("passed") is not True or value.get("validation_errors") or not finite_json(value):
+            raise ValueError("cache entry is not a validated finite passing proof")
+        original = {k: value.get(k) for k in ("command", "started_utc", "wall_seconds", "stdout", "stderr")}
+        for stream in ("stdout", "stderr"):
+            destination = OUT / (name + "." + stream + ".log")
+            shutil.copyfile(folder / (stream + ".log"), destination)
+            value[stream] = str(destination)
+        value.update(proof_reused=True, performed_new_execution=False,
+                     requested_command=[str(x) for x in argv], cache_key=key,
+                     cache_identity=identity, original_proof=original,
+                     source_proof_receipt=str(folder / "manifest.json"),
+                     identity_checked_utc=datetime.now(timezone.utc).isoformat(),
+                     scope="explicit inherited functional proof; not a fresh execution or timing sample")
+        with CACHE_LOCK: CACHE_STATS["hits"] += 1
+        save(OUT / (name + ".result.json"), value)
+        return value
+    except FileNotFoundError:
+        with CACHE_LOCK: CACHE_STATS["misses"] += 1
+        return None
+    except (ValueError, KeyError, TypeError, OSError):
+        with CACHE_LOCK:
+            CACHE_STATS["misses"] += 1; CACHE_STATS["rejected"] += 1
+        return None
+
+
+def save_validated(result, allow_inherited=False):
+    save(OUT / (result["name"] + ".result.json"), result)
+    if INCREMENTAL_CACHE is None:
+        return
+    identity = result.get("cache_identity")
+    if identity is not None and not result.get("passed"):
+        (INCREMENTAL_CACHE / identity_key(identity) / "manifest.json").unlink(missing_ok=True)
+        return
+    if not result.get("passed") or (result.get("proof_reused") and not allow_inherited):
+        return
+    if identity is None:
+        return
+    key = identity_key(identity)
+    folder = INCREMENTAL_CACHE / key
+    folder.mkdir(parents=True, exist_ok=True)
+    artifacts = {}
+    for stream in ("stdout", "stderr"):
+        path = folder / (stream + ".log")
+        shutil.copyfile(result[stream], path); artifacts[path.name] = sha(path)
+    save(folder / "record.json", result); artifacts["record.json"] = sha(folder / "record.json")
+    save(folder / "manifest.json", {"schema": 1, "key": key, "identity": identity,
+        "artifacts": artifacts, "validated_pass_only": True})
+    with CACHE_LOCK: CACHE_STATS["stored"] += 1
+
+
+@contextlib.contextmanager
+def cpu8_parent():
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel.GetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+    kernel.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    handle = kernel.GetCurrentProcess()
+    old, system = ctypes.c_size_t(), ctypes.c_size_t()
+    if not kernel.GetProcessAffinityMask(handle, ctypes.byref(old), ctypes.byref(system)) or (0xff & ~old.value):
+        raise RuntimeError("Fast units require CPU mask0xff within the current allowed process mask")
+    if not kernel.SetProcessAffinityMask(handle, 0xff):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        yield
+    finally:
+        if not kernel.SetProcessAffinityMask(handle, old.value):
+            raise RuntimeError("Could not restore parent affinity after parallel model-free units")
+
+
+def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,), allow_cache=True):
     argv = [str(x) for x in argv]
     if not Path(argv[0]).is_absolute():
         raise ValueError("argv[0] must be an absolute Windows executable path")
     env = dict(env)
+    if allow_cache:
+        cached = cache_load(name, argv, env, affinity)
+        if cached is not None:
+            return cached
+    identity = case_identity(name, argv, env, affinity) if INCREMENTAL_CACHE is not None and allow_cache else None
     cache = OUT / "cache" / name
     cache.mkdir(parents=True, exist_ok=False)
     env["XDG_CACHE_HOME"] = cache.as_posix()
@@ -185,6 +383,8 @@ def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,)):
               "stdout": str(OUT / (name + ".stdout.log")),
               "stderr": str(OUT / (name + ".stderr.log")),
               "scope": "functional validation; throughput not measured"}
+    result["cache_identity"] = identity
+    result["performed_new_execution"] = True
     old_affinity = None
     kernel = None
     handle = None
@@ -232,26 +432,44 @@ def run(name, argv, env, timeout=600, affinity=None, expected_exit=(0,)):
     return result
 
 
+def validate_unit_result(r,path):
+    text = read_log(r)
+    errors = []
+    if not re.search(re.escape(path.stem) + r"[^\n]*(?:\bok\b|\bpassed\b|\bskipped\b)", text, re.I):
+        errors.append("missing named unit success/explicit skip marker")
+    if re.search(r"(?im)^\s*(?:FAIL(?:ED)?\b|AddressSanitizer:|runtime error:)", text):
+        errors.append("unit emitted failure/sanitizer marker")
+    r.update(validation_errors=errors, explicit_skip=bool(re.search(r"(?i)\bskipped\b", text)),
+             parent_cpu_mask=255 if FAST else None,
+             executor=r.get("executor","inherited_proof") if r.get("proof_reused") else "bounded_parallel_model_free" if FAST else "serial")
+    r["passed"] = r["passed"] and not errors
+    save_validated(r)
+    return r
+
+
+def unit_case(path):
+    return validate_unit_result(run("unit-"+path.stem,[path],environment()),path)
+
+
 def units():
     cases = sorted(p.resolve() for p in BIN.glob("test*.exe") if p.name.lower() not in HARDWARE_HELPERS)
-    if not cases:
+    if not cases and (not SELECT_CHECKS or any(n.startswith("unit-") for n in SELECT_CHECKS)):
         raise RuntimeError("no native Windows unit executables found")
-    results = []
-    for p in cases:
-        r = run("unit-" + p.stem, [p], environment())
-        text = read_log(r)
-        errors = []
-        if not re.search(re.escape(p.stem) + r"[^\n]*(?:\bok\b|\bpassed\b|\bskipped\b)", text, re.I):
-            errors.append("missing named unit success/explicit skip marker")
-        if re.search(r"(?im)^\s*(?:FAIL(?:ED)?\b|AddressSanitizer:|runtime error:)", text):
-            errors.append("unit emitted failure/sanitizer marker")
-        r.update(validation_errors=errors, explicit_skip=bool(re.search(r"(?i)\bskipped\b", text)))
-        r["passed"] = r["passed"] and not errors
-        save(OUT / (r["name"] + ".result.json"), r)
-        results.append(r)
-    summary = {"stage": "units", "count": len(results),
-               "passed": sum(r["passed"] for r in results), "results": results,
-               "excluded_hardware_helpers": sorted(HARDWARE_HELPERS)}
+    cases = [p for p in cases if selected("unit-" + p.stem)]
+    started = time.monotonic()
+    if FAST and cases:
+        # One process-affinity change on the calling thread, never racing
+        # per-child parent-mask mutations from worker threads.
+        if INCREMENTAL_CACHE is not None:
+            case_identity("unit-" + cases[0].stem, [cases[0]], environment())
+        with cpu8_parent(), concurrent.futures.ThreadPoolExecutor(max_workers=UNIT_WORKERS) as pool:
+            results = list(pool.map(unit_case, cases))
+    else:
+        results = [unit_case(p) for p in cases]
+    summary = {"stage": "units", "count": len(results), "passed": sum(r["passed"] for r in results),
+        "results": results, "executor": "parallel_model_free" if FAST else "serial",
+        "workers": UNIT_WORKERS if FAST else 1, "cpu_mask": 255 if FAST else None,
+        "elapsed_seconds": time.monotonic() - started, "excluded_hardware_helpers": sorted(HARDWARE_HELPERS)}
     save(OUT / "units.json", summary)
     return all(r["passed"] for r in results)
 
@@ -271,63 +489,134 @@ def finite_json(value):
     return True
 
 
+def quality_argv(batch):
+    return [BIN / "quality_check.exe", MODEL, "--profile", "cpu", "--steps", "64", "--batch", str(batch),
+            "--context", "1024", "--cache-mib", "24576", "--threads", "8", "--reference", QREF]
+
+
+def validate_quality_result(r, batch, matrix=None):
+    records = []
+    parse_errors = []
+    for line in Path(r["stdout"]).read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            v = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(v, dict) and "finite_logits" in v:
+            if finite_json(v):
+                records.append(v)
+            else:
+                parse_errors.append("quality record contains a nonfinite JSON number")
+    errors = list(parse_errors) + list(r.get("driver_validation_errors", []))
+    if len(records) != 1:
+        errors.append("expected exactly one quality metrics record")
+    else:
+        m = records[0]
+        checks = {"finite_logits": True, "hardware_execution_verified": True,
+                  "positions": 64, "batch": batch,
+                  "context": 1024, "cache_mib": 24576, "vocab": VOCAB, "threads": 8,
+                  "profile": "cpu", "profile_effective": "cpu",
+                  "expert_bits": 6, "min_quality": 2, "tuning": False,
+                  "expert_skip": False, "head_requantized": False,
+                  "gpu_selected": 0, "npu_selected": 0,
+                  "comparison": "compared_to_cpu", "logit_fnv1a64": EXPECTED_DIGEST,
+                  "top1_agreement": 1, "nll_delta": 0, "logit_max_abs": 0,
+                  "logit_mae": 0, "logit_rmse": 0, "mean_kl_ref_to_candidate": 0}
+        for key, want in checks.items():
+            if key not in m or m[key] != want:
+                errors.append(f"{key}: expected {want!r}, got {m.get(key)!r}")
+        for key in ("nll", "perplexity", "reference_nll", "reference_perplexity"):
+            if not isinstance(m.get(key), (int, float)) or not math.isfinite(m[key]):
+                errors.append(f"nonfinite/missing {key}")
+        counters = m.get("accelerator_counters", {})
+        for key in ("npu_products", "npu_ffns", "npu_layer_passes",
+                    "gpu_product_submissions", "gpu_products", "gpu_whole_passes"):
+            if counters.get(key) != 0:
+                errors.append(f"CPU profile has missing/nonzero {key}")
+    if matrix is not None and records:
+        m = records[0]
+        checks = {"completed": True, "exit_code": 0, "matrix_index": matrix[0],
+            "matrix_count": matrix[1], "max_batch_capacity": matrix[2], "model_load_count": 1,
+            "functional_only": True, "sequence_restart": "forward_position_zero",
+            "actual_batches": [min(batch, 64 - i) for i in range(0, 64, batch)]}
+        for key,want in checks.items():
+            if m.get(key) != want: errors.append("matrix " + key + " differs from complete-width protocol")
+    r.update(metrics=records, validation_errors=errors)
+    r["passed"] = r["passed"] and not errors
+    save_validated(r)
+    return r
+
+
 def quality():
+    if FAST: return quality_fast()
     results = []
     for batch in BATCHES:
-        r = run(f"quality64-batch{batch}", [BIN / "quality_check.exe", MODEL,
-                "--profile", "cpu", "--steps", "64", "--batch", str(batch),
-                "--context", "1024", "--cache-mib", "24576", "--threads", "8",
-                "--reference", QREF], environment())
-        records = []
-        parse_errors = []
-        for line in Path(r["stdout"]).read_text(encoding="utf-8", errors="replace").splitlines():
-            try:
-                v = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(v, dict) and "finite_logits" in v:
-                if finite_json(v):
-                    records.append(v)
-                else:
-                    parse_errors.append("quality record contains a nonfinite JSON number")
-        errors = list(parse_errors)
-        if len(records) != 1:
-            errors.append("expected exactly one quality metrics record")
-        else:
-            m = records[0]
-            checks = {"finite_logits": True, "hardware_execution_verified": True,
-                      "positions": 64, "batch": batch,
-                      "context": 1024, "cache_mib": 24576, "vocab": VOCAB, "threads": 8,
-                      "profile": "cpu", "profile_effective": "cpu",
-                      "expert_bits": 6, "min_quality": 2, "tuning": False,
-                      "expert_skip": False, "head_requantized": False,
-                      "gpu_selected": 0, "npu_selected": 0,
-                      "comparison": "compared_to_cpu", "logit_fnv1a64": EXPECTED_DIGEST,
-                      "top1_agreement": 1, "nll_delta": 0, "logit_max_abs": 0,
-                      "logit_mae": 0, "logit_rmse": 0, "mean_kl_ref_to_candidate": 0}
-            for key, want in checks.items():
-                if key not in m or m[key] != want:
-                    errors.append(f"{key}: expected {want!r}, got {m.get(key)!r}")
-            for key in ("nll", "perplexity", "reference_nll", "reference_perplexity"):
-                if not isinstance(m.get(key), (int, float)) or not math.isfinite(m[key]):
-                    errors.append(f"nonfinite/missing {key}")
-            counters = m.get("accelerator_counters", {})
-            for key in ("npu_products", "npu_ffns", "npu_layer_passes",
-                        "gpu_product_submissions", "gpu_products", "gpu_whole_passes"):
-                if counters.get(key) != 0:
-                    errors.append(f"CPU profile has missing/nonzero {key}")
-        r.update(metrics=records, validation_errors=errors)
-        r["passed"] = r["passed"] and not errors
-        save(OUT / (r["name"] + ".result.json"), r)
+        if not selected(f"quality64-batch{batch}"): continue
+        r = validate_quality_result(run(f"quality64-batch{batch}", quality_argv(batch), raw_model_environment()), batch)
         results.append(r)
-        save(OUT / "quality.json", {"stage": "quality", "results": results, "passed": all(x["passed"] for x in results)})
-        if not r["passed"]:
-            return False
+        save(OUT / "quality.json", {"stage": "quality", "results": results, "executor": "serial", "passed": all(x["passed"] for x in results)})
+        if not r["passed"]: return False
     return True
 
 
+def quality_fast():
+    started = time.monotonic()
+    batches = [b for b in BATCHES if selected(f"quality64-batch{b}")]
+    if not batches:
+        save(OUT/"quality.json", {"stage":"quality","executor":"single_model_matrix","results":[],"passed":True})
+        return True
+    argv = quality_argv(batches[0]); at = argv.index("--batch")
+    argv[at:at+2] = ["--batches", ",".join(map(str,batches))]
+    driver = run("quality64-matrix", argv, raw_model_environment(), timeout=600*len(batches))
+    records = []
+    for line in Path(driver["stdout"]).read_text(encoding="utf-8",errors="replace").splitlines():
+        try: value = json.loads(line)
+        except ValueError: continue
+        if isinstance(value,dict) and "batch" in value: records.append(value)
+    ids = [v.get("batch") for v in records]
+    protocol = [] if ids == batches else ["matrix missing/duplicate/unrequested/reordered batch records"]
+    results=[]
+    for index,batch in enumerate(batches):
+        name=f"quality64-batch{batch}"; rows=[r for r in records if r.get("batch")==batch]
+        stdout=OUT/(name+".stdout.log");stderr=OUT/(name+".stderr.log")
+        stdout.write_text("\n".join(json.dumps(v) for v in rows)+"\n",encoding="utf-8")
+        shutil.copyfile(driver["stderr"],stderr)
+        m=rows[0] if len(rows)==1 else {}
+        result=dict(driver,name=name,stdout=str(stdout),stderr=str(stderr),
+            logical_command=[str(x) for x in quality_argv(batch)],
+            driver_exit_code=driver.get("exit_code"),driver_wall_seconds=driver["wall_seconds"],
+            exit_code=m.get("exit_code"),wall_seconds=m.get("width_seconds"),
+            driver_validation_errors=list(protocol),cache_identity=None)
+        result["passed"] = (m.get("completed") is True and m.get("exit_code")==0 and
+            not driver.get("timed_out") and not driver.get("affinity_restore_error") and not protocol)
+        results.append(validate_quality_result(result,batch,(index,len(batches),max(batches))))
+    passed=driver.get("exit_code")==0 and all(r["passed"] for r in results)
+    driver.update(passed=passed,matrix_validated=passed,
+                  validation_errors=[] if passed else ["one or more complete matrix checks failed"])
+    save_validated(driver)  # Cache the whole validated matrix, never a partial pass.
+    save(OUT/"quality.json",{"stage":"quality","executor":"single_model_matrix","results":results,
+        "passed":passed,"elapsed_seconds":time.monotonic()-started,"driver":driver,
+        "logical_checks":len(results),"model_processes":0 if driver.get("proof_reused") else 1})
+    return passed
+
+
+def validate_eval_result(r,block,reject):
+    text = read_log(r)
+    required = [f"blocks of {block}: 32/32 positions bit-identical to token by token, max |diff| 0;",
+                f"blocks of {block} keeping {block - reject}:",
+                "32/32 input positions covered",
+                "top-1 agreement 32/32, max |diff| 0.000, mean |diff| 0.0000"]
+    errors = ["missing success marker: " + x for x in required if x not in text]
+    r.update(validation_errors=errors, block=block, rejected_suffix=reject,
+             kept_prefix=block - reject,
+             comparison_note="eval context4096 vs original QREF1024; strict bytes required without tolerance")
+    r["passed"] = r["passed"] and not errors
+    save_validated(r)
+    return r
+
+
 def evaluation():
-    env = environment({"JANAS_ATTN": "float", "JANAS_HEAD_BITS": "6"})
+    env = raw_model_environment({"JANAS_ATTN": "float", "JANAS_HEAD_BITS": "6"})
     probe = run("eval-cli-capabilities", [BIN / "llm_eval.exe"], env, expected_exit=(2,))
     help_text = read_log(probe)
     missing = [flag for flag in ("block=", "reject=", "strict=") if flag not in help_text]
@@ -338,20 +627,11 @@ def evaluation():
         return False
     results = []
     for block, reject in EVAL_PAIRS:
+        if not selected(f"eval32-block{block}-reject{reject}"): continue
         r = run(f"eval32-block{block}-reject{reject}", [BIN / "llm_eval.exe", MODEL,
                 OUT / "reference32.int32", OUT / "reference32.f32", "24576",
                 "0,1,2,3,4,5,6,7", "8,9,10,11", f"block={block}", f"reject={reject}", "strict=1"], env)
-        text = read_log(r)
-        required = [f"blocks of {block}: 32/32 positions bit-identical to token by token, max |diff| 0;",
-                    f"blocks of {block} keeping {block - reject}:",
-                    "32/32 input positions covered",
-                    "top-1 agreement 32/32, max |diff| 0.000, mean |diff| 0.0000"]
-        errors = ["missing success marker: " + x for x in required if x not in text]
-        r.update(validation_errors=errors, block=block, rejected_suffix=reject,
-                 kept_prefix=block - reject,
-                 comparison_note="eval context4096 vs original QREF1024; strict bytes required without tolerance")
-        r["passed"] = r["passed"] and not errors
-        save(OUT / (r["name"] + ".result.json"), r)
+        r=validate_eval_result(r,block,reject)
         results.append(r)
         save(OUT / "eval.json", {"stage": "eval", "capability_probe": probe, "results": results,
                                   "passed": all(x["passed"] for x in results)})
@@ -360,89 +640,191 @@ def evaluation():
     return True
 
 
+def session_s2_controls(name):
+    controls = dict(S2_CONTROLS)
+    # Keep the established 17-row stress proof. The production eight-node
+    # ceiling intentionally prevents it, so this one explicit stress case
+    # raises its test-only budget instead of weakening the coverage assertion.
+    if name == "fixed-mtp16-adaptive" and controls["s2_exact"] == "on":
+        controls["s2_max_nodes"] = 32
+    return controls
+
+
 def session_controls(name):
-    if not name.startswith("hybrid-cost"):
-        return []
-    return ["hybrid_policy=cost", "lookup_drafts=8", "mtp_drafts=4",
-            "hybrid_probe_percent=" + ("100" if name.endswith("-probe") else "2")]
+    controls = []
+    if name.startswith("hybrid-cost"):
+        controls += ["hybrid_policy=cost", "lookup_drafts=8", "mtp_drafts=4",
+                     "hybrid_probe_percent=" + ("100" if name.endswith("-probe") else "2")]
+    if S2_CONTROLS["s2_exact"] == "on":
+        controls += [k + "=" + str(v) for k, v in session_s2_controls(name).items()]
+    return controls
+
+
+def session_argv(case):
+    name,planner,mode,drafts,vocab,rows=case
+    return [BIN / "llm_session.exe", MODEL, OUT / "session-code160.int32", "mtp=" + str(MTP),
+        "planner="+planner,"speculation="+mode,f"drafts={drafts}","draft_vocab="+vocab,f"rows={rows}"] + session_controls(name)
+
+
+def validate_session_result(r, case):
+    name,planner,mode,drafts,vocab,rows=case
+    text = read_log(r)
+    expected = ["greedy: turns vs all at once", "greedy + speculation: turn 1",
+                "greedy + speculation: turn 2", "sampling, speculation off vs on: turn 1",
+                "sampling, speculation off vs on: turn 2"]
+    errors = ["missing successful comparison: " + value for value in expected
+              if not re.search(re.escape(value) + r"\s+identical", text)]
+    errors += list(r.get("driver_validation_errors", []))
+    if "llm_session: ok" not in text:
+        errors.append("missing session success marker")
+    if not re.search(r"sampling differs from greedy\s+yes", text):
+        errors.append("sampling did not demonstrably differ from greedy")
+    settings = re.search(r"^settings: (.+)$", text, re.M)
+    if not settings or any(x not in settings.group(1) for x in
+            (f"planner={planner}", f"speculation={mode}", f"drafts={drafts}",
+             f"draft_vocab={vocab}", f"rows={rows}", "quality=HIGH", "expert_bits=6", "head_bits=0")):
+        errors.append("missing/mismatched resolved high-quality settings")
+    records = []
+    for line in text.splitlines():
+        if line.startswith("runtime:"):
+            fields = dict((k, int(v)) for k, v in re.findall(r"([a-z_]+)=(\d+)", line))
+            fields["verified"] = line.endswith(" verified")
+            records.append(fields)
+    selected = [v for v in records if v.get("mode") == (4 if mode == "hybrid" else 2)]
+    want_planner = {"legacy": 0, "cycle": 1, "fixed": 2}[planner]
+    expected_records = 2 if r.get("reference_reused") else 4
+    if len(records) != expected_records or len(selected) != 2 or not all(v["verified"] for v in records):
+        errors.append("expected verified runtime records including two selected-mode passes")
+    if r.get("reference_reused"):
+        plain = r.get("shared_reference_runtime", [])
+        if len(plain) != 2 or any(v.get("mode") != 0 or not v.get("verified") for v in plain):
+            errors.append("shared plain reference runtime evidence missing")
+    for v in selected:
+        if v.get("planner") != want_planner or v.get("cycles", 0) <= 0:
+            errors.append("selected planner was not actually exercised")
+        if mode == "hybrid" and v.get("lookup_attempts", 0) <= 0:
+            errors.append("hybrid did not consult the history index")
+    hybrid_records = []
+    if name.startswith("hybrid-cost"):
+        for line in text.splitlines():
+            if line.startswith("hybrid:"):
+                fields = dict((k, int(v)) for k, v in re.findall(r"([a-z_]+)=(\d+)", line))
+                fields["verified"] = line.endswith(" verified")
+                hybrid_records.append(fields)
+        if len(hybrid_records) != 2 or not all(v.get("verified") and v.get("decisions", 0) > 0 and
+                                               v.get("mtp", 0) > 0 for v in hybrid_records):
+            errors.append("cost-aware hybrid selection/MTP fallback not proven")
+    mtp_exercised = bool(selected) and all(v.get("mtp_drafts", 0) > 0 and
+                                           v.get("head_calls", 0) > 0 for v in selected)
+    adaptive_verified = vocab == "adaptive" and mtp_exercised and all(
+        v.get("repacks", 0) > 0 and v.get("head_rows", 0) > 0 for v in selected)
+    if mode == "mtp" and not mtp_exercised:
+        errors.append("MTP proposals were not actually verified in both greedy and sampled runs")
+    if name == "fixed-mtp16-adaptive":
+        if not adaptive_verified:
+            errors.append("fixed adaptive-head execution unverified")
+        if not all(v.get("max_width", 0) == 17 for v in selected):
+            errors.append("17-row target verification not proven by runtime counters")
+    r.update(s2_controls_effective=session_s2_controls(name),
+             stress_override="S2 total-node budget32 retains fixed16/17-row target coverage" if name == "fixed-mtp16-adaptive" and S2_CONTROLS["s2_exact"] == "on" else None,
+             validation_errors=errors, runtime_records=records, hybrid_records=hybrid_records,
+             mtp_execution_verified=mtp_exercised, adaptive_execution_verified=adaptive_verified,
+             adaptive_note="not exercised or currently a legacy comparison epoch" if vocab == "adaptive" and not adaptive_verified else None)
+    r["passed"] = r["passed"] and not errors
+    save_validated(r)
+    return r
 
 
 def session():
-    results = []
-    for name, planner, mode, drafts, vocab, rows in SESSION_CASES:
-        r = run("session-" + name, [BIN / "llm_session.exe", MODEL,
-                OUT / "session-code160.int32", "mtp=" + str(MTP), "planner=" + planner,
-                "speculation=" + mode, f"drafts={drafts}", "draft_vocab=" + vocab, f"rows={rows}"] + session_controls(name),
-                environment({"JANAS_ATTN": "float"}), affinity=0xff)
-        text = read_log(r)
-        expected = ["greedy: turns vs all at once", "greedy + speculation: turn 1",
-                    "greedy + speculation: turn 2", "sampling, speculation off vs on: turn 1",
-                    "sampling, speculation off vs on: turn 2"]
-        errors = ["missing successful comparison: " + value for value in expected
-                  if not re.search(re.escape(value) + r"\s+identical", text)]
-        if "llm_session: ok" not in text:
-            errors.append("missing session success marker")
-        if not re.search(r"sampling differs from greedy\s+yes", text):
-            errors.append("sampling did not demonstrably differ from greedy")
-        settings = re.search(r"^settings: (.+)$", text, re.M)
-        if not settings or any(x not in settings.group(1) for x in
-                (f"planner={planner}", f"speculation={mode}", f"drafts={drafts}",
-                 f"draft_vocab={vocab}", f"rows={rows}", "quality=HIGH", "expert_bits=6", "head_bits=0")):
-            errors.append("missing/mismatched resolved high-quality settings")
-        records = []
-        for line in text.splitlines():
-            if line.startswith("runtime:"):
-                fields = dict((k, int(v)) for k, v in re.findall(r"([a-z_]+)=(\d+)", line))
-                fields["verified"] = line.endswith(" verified")
-                records.append(fields)
-        selected = [v for v in records if v.get("mode") == (4 if mode == "hybrid" else 2)]
-        want_planner = {"legacy": 0, "cycle": 1, "fixed": 2}[planner]
-        if len(records) != 4 or len(selected) != 2 or not all(v["verified"] for v in records):
-            errors.append("expected four verified runtime records, including two selected-mode passes")
-        for v in selected:
-            if v.get("planner") != want_planner or v.get("cycles", 0) <= 0:
-                errors.append("selected planner was not actually exercised")
-            if mode == "hybrid" and v.get("lookup_attempts", 0) <= 0:
-                errors.append("hybrid did not consult the history index")
-        hybrid_records = []
-        if name.startswith("hybrid-cost"):
-            for line in text.splitlines():
-                if line.startswith("hybrid:"):
-                    fields = dict((k, int(v)) for k, v in re.findall(r"([a-z_]+)=(\d+)", line))
-                    fields["verified"] = line.endswith(" verified")
-                    hybrid_records.append(fields)
-            if len(hybrid_records) != 2 or not all(v.get("verified") and v.get("decisions", 0) > 0 and
-                                                   v.get("mtp", 0) > 0 for v in hybrid_records):
-                errors.append("cost-aware hybrid selection/MTP fallback not proven")
-        mtp_exercised = bool(selected) and all(v.get("mtp_drafts", 0) > 0 and
-                                               v.get("head_calls", 0) > 0 for v in selected)
-        adaptive_verified = vocab == "adaptive" and mtp_exercised and all(
-            v.get("repacks", 0) > 0 and v.get("head_rows", 0) > 0 for v in selected)
-        if mode == "mtp" and not mtp_exercised:
-            errors.append("MTP proposals were not actually verified in both greedy and sampled runs")
-        if name == "fixed-mtp16-adaptive":
-            if not adaptive_verified:
-                errors.append("fixed adaptive-head execution unverified")
-            if not all(v.get("max_width", 0) == 17 for v in selected):
-                errors.append("17-row target verification not proven by runtime counters")
-        r.update(validation_errors=errors, runtime_records=records, hybrid_records=hybrid_records,
-                 mtp_execution_verified=mtp_exercised, adaptive_execution_verified=adaptive_verified,
-                 adaptive_note="not exercised or currently a legacy comparison epoch" if vocab == "adaptive" and not adaptive_verified else None)
-        r["passed"] = r["passed"] and not errors
-        save(OUT / (r["name"] + ".result.json"), r)
+    if FAST: return session_fast()
+    results=[]
+    for case in SESSION_CASES:
+        name=case[0]
+        if not selected("session-"+name): continue
+        r=validate_session_result(run("session-"+name,session_argv(case),environment({"JANAS_ATTN":"float"}),affinity=0xff),case)
         results.append(r)
-        save(OUT / "sessions.json", {"stage": "session", "results": results,
-                                      "passed": all(x["passed"] for x in results)})
-        if not r["passed"]:
-            return False
+        save(OUT/"sessions.json",{"stage":"session","executor":"serial","results":results,
+            "passed":all(x["passed"] for x in results)})
+        if not r["passed"]: return False
     return True
 
 
-def semantic_hybrid():
-    name = "semantic-hybrid-copy-switch"
-    r = run(name, [BIN / "llm_hybrid.exe", MODEL, MTP,
-                  "probe=" + str(SEMANTIC_PROBE_PERCENT)],
-            environment(), timeout=1800, affinity=0xff)
+def session_manifest_content(cases):
+    return "\n".join("\t".join([case[0]] + [str(a) for a in session_argv(case)[4:]])
+                      for case in cases) + "\n"
+
+
+def session_fast():
+    started=time.monotonic();cases=[c for c in SESSION_CASES if selected("session-"+c[0])]
+    manifest=OUT/"session-cases.tsv"
+    manifest.write_text(session_manifest_content(cases),encoding="utf-8")
+    if not cases:
+        save(OUT/"sessions.json",{"stage":"session","executor":"single_model_matrix","results":[],"passed":True})
+        return True
+    argv=[BIN/"llm_session.exe",MODEL,OUT/"session-code160.int32","mtp="+str(MTP),"cases="+str(manifest)]
+    driver=run("session-matrix",argv,environment({"JANAS_ATTN":"float"}),timeout=600*len(cases),affinity=0xff)
+    references=[];outcomes=[];sections={};reference_lines=[];current=None
+    for line in Path(driver["stdout"]).read_text(encoding="utf-8",errors="replace").splitlines():
+        if line.startswith("session-reference: "):
+            try: references.append(json.loads(line.split(": ",1)[1]))
+            except ValueError: references.append({})
+        elif line.startswith("session-case-begin: "):
+            current=line.split(": ",1)[1];sections.setdefault(current,[])
+        elif line.startswith("session-case: "):
+            try: outcomes.append(json.loads(line.split(": ",1)[1]))
+            except ValueError: outcomes.append({})
+            current=None
+        elif current is not None: sections[current].append(line)
+        else: reference_lines.append(line)
+    reference_runtime=[]
+    for line in reference_lines:
+        if line.startswith("runtime:"):
+            fields={k:int(v) for k,v in re.findall(r"([a-z_]+)=(\d+)",line)}
+            fields["verified"]=line.endswith(" verified");reference_runtime.append(fields)
+    names=[c[0] for c in cases];protocol=[]
+    if [r.get("name") for r in outcomes]!=names:protocol.append("session matrix missing/duplicate/unrequested/reordered case records")
+    reference=references[0] if len(references)==1 else {}
+    if (len(references)!=1 or reference.get("version")!=1 or reference.get("valid") is not True or
+        reference.get("model_runs")!=3 or reference.get("functional_only") is not True or
+        not re.fullmatch(r"[0-9a-f]{16}",str(reference.get("content_key","")))):
+        protocol.append("shared immutable three-run reference proof missing/invalid")
+    results=[]
+    for index,case in enumerate(cases):
+        name=case[0];matches=[r for r in outcomes if r.get("name")==name];m=matches[0] if len(matches)==1 else {}
+        errors=list(protocol)
+        wanted={"index":index,"exit_code":0,"checks":5,"functional_only":True,"reference_reused":True,
+                "actual_model_runs":2,"boundary_forward_calls":1,"content_key":reference.get("content_key")}
+        for key,want in wanted.items():
+            if m.get(key)!=want:errors.append("session matrix "+key+" differs from independent-case protocol")
+        text="\n".join(sections.get(name,[]))+"\n"
+        if not re.search(r"(?m)^boundary: head=[0-9a-f]{16} mtp_kv=[0-9a-f]{16} logits=[0-9a-f]{16} identical$",text):
+            errors.append("32-token bit-identical case-boundary oracle missing")
+        stdout=OUT/("session-"+name+".stdout.log");stderr=OUT/("session-"+name+".stderr.log")
+        stdout.write_text(text,encoding="utf-8");shutil.copyfile(driver["stderr"],stderr)
+        result=dict(driver,name="session-"+name,stdout=str(stdout),stderr=str(stderr),
+            logical_command=[str(x) for x in session_argv(case)],case_manifest_sha256=sha(manifest),
+            shared_reference=reference,reference_reused=m.get("reference_reused"),
+            shared_reference_runtime=reference_runtime,
+            reference_identity_binding=driver.get("cache_identity") or case_identity("session-matrix",argv,environment({"JANAS_ATTN":"float"}),0xff),
+            driver_exit_code=driver.get("exit_code"),driver_wall_seconds=driver["wall_seconds"],
+            exit_code=m.get("exit_code"),wall_seconds=m.get("wall_seconds"),driver_validation_errors=errors,
+            matrix_case=m,cache_identity=None)
+        result["passed"]=(m.get("exit_code")==0 and not driver.get("timed_out") and
+                          not driver.get("affinity_restore_error") and not errors)
+        results.append(validate_session_result(result,case))
+    passed=driver.get("exit_code")==0 and all(r["passed"] for r in results)
+    driver.update(passed=passed,matrix_validated=passed,
+                  validation_errors=[] if passed else ["one or more complete matrix checks failed"])
+    save_validated(driver)
+    save(OUT/"sessions.json",{"stage":"session","executor":"single_model_reference_matrix",
+        "results":results,"passed":passed,"driver":driver,"elapsed_seconds":time.monotonic()-started,
+        "logical_checks":len(cases)*5,"case_manifest_sha256":sha(manifest),"shared_reference":reference,
+        "actual_model_runs":0 if driver.get("proof_reused") else 3+2*len(cases),
+        "original_proof_model_runs":3+2*len(cases),"model_processes":0 if driver.get("proof_reused") else 1})
+    return passed
+
+
+def validate_semantic_result(r):
     records, errors = [], []
     for line in Path(r["stdout"]).read_text(encoding="utf-8", errors="replace").splitlines():
         if not line.lstrip().startswith("{"):
@@ -469,13 +851,115 @@ def semantic_hybrid():
         errors.append("copy lookup and post-switch MTP fallback were not both exercised")
     if any(v.get("input_threads") != 8 or v.get("output_threads") != 8 for v in samples):
         errors.append("semantic compute settings differ from CPU8")
-    r.update(validation_errors=errors, semantic_records=records,
+    if S2_CONTROLS["s2_exact"] == "on":
+        mtp_samples = [v for v in samples if v.get("mode") == "mtp4"]
+        if not mtp_samples or sum(v.get("s2_cycles", 0) for v in mtp_samples) == 0:
+            errors.append("S2 MTP generation was not exercised")
+        if sum(v.get("s2_maintenance_fast_calls", 0) for v in mtp_samples) == 0:
+            errors.append("S2 maintenance path was not exercised")
+    r.update(s2_controls=dict(S2_CONTROLS), validation_errors=errors, semantic_records=records,
              probe_percent=SEMANTIC_PROBE_PERCENT,
              performance_boundary="functional scenario; source order is not matched ABBA",
              forced_probe_functional_only=SEMANTIC_PROBE_PERCENT != 2)
     r["passed"] = r["passed"] and not errors
     save(OUT / "semantic-hybrid.json", r)
-    return r["passed"]
+    save_validated(r)
+    return r
+
+
+def semantic_hybrid():
+    if not selected("semantic-hybrid-copy-switch"): return True
+    name = "semantic-hybrid-copy-switch"
+    r = run(name, [BIN / "llm_hybrid.exe", MODEL, MTP,
+                  "probe=" + str(SEMANTIC_PROBE_PERCENT)],
+            environment(), timeout=1800, affinity=0xff)
+    return validate_semantic_result(r)["passed"]
+
+
+def import_model_attestation(path, proof_started):
+    if path is None: raise ValueError("model proof import requires --import-model-receipt")
+    attestation=json.loads(Path(path).read_text(encoding="utf-8"))
+    if attestation.get("complete") is not True: raise ValueError("model payload attestation incomplete")
+    for role,model in (("main",MODEL),("mtp",MTP)):
+        record=attestation.get("files",{}).get(model.name,{})
+        stat=model.stat();size,digest=MODEL_PINS[role]
+        if (record.get("sha256_verified") is not True or record.get("sha256")!=digest or
+            record.get("bytes")!=size or stat.st_size!=size or record.get("mtime_ns")!=stat.st_mtime_ns):
+            raise ValueError("model attestation does not match current unchanged payload: "+role)
+        verified=datetime.fromisoformat(record["verified_utc"].replace("Z","+00:00"))
+        started=datetime.fromisoformat(proof_started.replace("Z","+00:00"))
+        if started<verified:raise ValueError("source proof predates completed model checksum attestation")
+    return {"path":str(path),"sha256":sha(path),"complete":True,
+            "boundary":"prior full SHA plus unchanged size/mtime/current header; no new payload rescan"}
+
+
+def import_raw_proofs(folder, planned, model_attestation=None):
+    folder=Path(folder).resolve();summary=json.loads((folder/"summary.json").read_text(encoding="utf-8"))
+    if summary.get("passed") is not True:raise ValueError("only complete passing validation directories may be imported")
+    wanted={c["check_id"]:c for c in planned["cases"]}
+    candidates=[]
+    for name in ("units.json","quality.json","eval.json","sessions.json"):
+        path=folder/name
+        if path.is_file():candidates+=json.loads(path.read_text(encoding="utf-8")).get("results",[])
+    path=folder/"semantic-hybrid.json"
+    if path.is_file():candidates.append(json.loads(path.read_text(encoding="utf-8")))
+    results=[]
+    def normalized(argv,output):
+        prefix=str(output)+os.sep;values=[]
+        for arg in map(str,argv):
+            head,sep,tail=arg.partition("=")
+            if sep and tail.startswith(prefix):arg=head+"=@output/"+tail[len(prefix):].replace(os.sep,"/")
+            elif arg.startswith(prefix):arg="@output/"+arg[len(prefix):].replace(os.sep,"/")
+            values.append(arg)
+        return values
+    for old in candidates:
+        name=old.get("name");spec=wanted.get(name)
+        if spec is None:continue
+        try:
+            if old.get("passed") is not True or old.get("validation_errors"):raise ValueError("source case is not a validated pass")
+            argv=spec["command"];env=environment(spec.get("environment_overrides"));stage=spec["stage"]
+            if stage in ("quality","eval"):env=raw_model_environment(spec.get("environment_overrides"))
+            if sha(argv[0])!=old.get("binary_sha256"):raise ValueError("executable SHA changed")
+            if stage=="units" and FAST and old.get("parent_cpu_mask")!=255 and old.get("process_affinity_mask")!=255:
+                raise ValueError("historical unit proof does not attest the fast CPU8 process mask")
+            if normalized(old["command"],folder)!=normalized(argv,OUT):raise ValueError("case arguments changed")
+            wanted_env={k:v for k,v in env.items() if k.upper().startswith("JANAS_")}
+            if old.get("janas_environment")!=wanted_env:raise ValueError("effective environment changed")
+            if stage!="units":
+                bound=import_model_attestation(model_attestation,old["started_utc"])
+                inputs=summary.get("inputs",{})
+                if inputs.get("source_qref_sha256")!=EXPECTED_QREF_SHA or inputs.get("inputs")!=EXPECTED_INPUTS:
+                    raise ValueError("frozen reference/token identity differs")
+            else:bound=None
+            seed=old.get("attention_calibration_seed")
+            if ATTENTION_CALIBRATION is not None:
+                if not seed or seed.get("sha256")!=ATTENTION_CALIBRATION["sha256"]:
+                    raise ValueError("attention seed changed")
+                private=Path(old["XDG_CACHE_HOME"])/"janas"/"attn.txt"
+                if not private.is_file() or sha(private)!=ATTENTION_CALIBRATION["sha256"]:
+                    raise ValueError("original private attention policy missing/retimed")
+            elif seed is not None:raise ValueError("attention policy changed")
+            r=dict(old,proof_reused=True,performed_new_execution=False,
+                   cache_identity=case_identity(name,argv,env,spec.get("process_affinity_mask")),
+                   imported_raw_proof={"directory":str(folder),"summary_sha256":sha(folder/"summary.json"),
+                     "model_attestation":bound,"revalidated_by_current_checker":True},
+                   scope="explicit imported historical raw proof, revalidated against current artifact/input identities")
+            for stream in ("stdout","stderr"):
+                path=Path(old[stream]).resolve()
+                if not path.is_file() or folder not in path.parents:raise ValueError("source log missing/outside proof directory")
+                destination=OUT/(name+"."+stream+".log");shutil.copyfile(path,destination);r[stream]=str(destination)
+            if stage=="units":r=validate_unit_result(r,Path(argv[0]))
+            elif stage=="quality":r=validate_quality_result(r,spec["batch"])
+            elif stage=="eval":r=validate_eval_result(r,spec["block"],spec["reject"])
+            elif stage=="session":r=validate_session_result(r,next(c for c in SESSION_CASES if "session-"+c[0]==name))
+            else:r=validate_semantic_result(r)
+            if not r["passed"]:raise ValueError("current strict checker rejected historical output")
+            save_validated(r,allow_inherited=True)
+            results.append({"name":name,"imported":True,"cache_key":identity_key(r["cache_identity"])})
+        except (ValueError,KeyError,OSError) as error:
+            results.append({"name":name,"imported":False,"reason":str(error)})
+    return {"directory":str(folder),"results":results,"executables_launched":False,
+            "scope":"explicit inherited proof import; no fresh inference or timing claim"}
 
 
 def model_metadata():
@@ -513,6 +997,8 @@ def plan(stage):
     if stage in ("all", "session"):
         cases += [{"stage": "session", "name": n, "planner": p, "speculation": m,
                    "drafts": d, "draft_vocab": v, "rows": r, "timeout_seconds": 600,
+                    "s2_controls_effective": session_s2_controls(n),
+                    "stress_override": "S2 total-node budget32 retains fixed16/17-row target coverage" if n == "fixed-mtp16-adaptive" and S2_CONTROLS["s2_exact"] == "on" else None,
                    "environment_overrides": {"JANAS_ATTN": "float"}, "process_affinity_mask": 255,
                    "command": [str(BIN / "llm_session.exe"), str(MODEL), str(OUT / "session-code160.int32"),
                        "mtp=" + str(MTP), "planner=" + p, "speculation=" + m, f"drafts={d}",
@@ -524,15 +1010,48 @@ def plan(stage):
             "process_affinity_mask": 255,
             "command": [str(BIN / "llm_hybrid.exe"), str(MODEL), str(MTP),
                         "probe=" + str(SEMANTIC_PROBE_PERCENT)]})
+    for c in cases:
+        stage_name=c["stage"]
+        c["check_id"] = ("unit-" + Path(c["command"][0]).stem if stage_name=="units" else
+            f"quality64-batch{c['batch']}" if stage_name=="quality" else
+            f"eval32-block{c['block']}-reject{c['reject']}" if stage_name=="eval" else
+            "session-"+c["name"] if stage_name=="session" else "semantic-hybrid-copy-switch")
+    full_ids=[c["check_id"] for c in cases]
+    unknown=SELECT_CHECKS-set(full_ids)
+    if unknown: raise ValueError("unknown/not-in-stage selected checks: "+", ".join(sorted(unknown)))
+    cases=[c for c in cases if selected(c["check_id"])]
+    drivers=[]
+    if FAST:
+        for stage_name in ("units","quality","eval","session","hybrid"):
+            chosen=[c for c in cases if c["stage"]==stage_name]
+            if not chosen: continue
+            if stage_name=="quality":
+                batches=[c["batch"] for c in chosen];argv=quality_argv(batches[0]);at=argv.index("--batch")
+                argv[at:at+2]=["--batches",",".join(map(str,batches))]
+                drivers.append({"stage":stage_name,"command":[str(x) for x in argv],"logical_checks":[c["check_id"] for c in chosen]})
+            elif stage_name=="session":
+                ids={c["name"] for c in chosen};ordered=[c for c in SESSION_CASES if c[0] in ids]
+                content=session_manifest_content(ordered)
+                drivers.append({"stage":stage_name,"command":[str(BIN/"llm_session.exe"),str(MODEL),str(OUT/"session-code160.int32"),"mtp="+str(MTP),"cases="+str(OUT/"session-cases.tsv")],
+                    "logical_checks":[c["check_id"] for c in chosen],"case_manifest_content":content,
+                    "case_manifest_sha256":sha_bytes(content.encode()),"reference_model_runs":3,
+                    "candidate_model_runs":2*len(chosen),"comparisons_per_case":5})
+            else: drivers += [{"stage":stage_name,"command":c["command"],"logical_checks":[c["check_id"]]} for c in chosen]
     return {"mode": "plan", "launches_executables": False, "output_directory": str(OUT),
-            "sequential": True, "stage": stage, "cases": cases,
+            "sequential": not FAST, "models_sequential": True, "stage": stage, "cases": cases,
+             "fast": FAST, "unit_workers": UNIT_WORKERS if FAST else 1, "unit_cpu_mask": 255 if FAST else None,
+             "driver_invocations": drivers, "full_requested_coverage": not SELECT_CHECKS,
+             "selected_checks": sorted(SELECT_CHECKS), "omitted_checks": [i for i in full_ids if not selected(i)],
+             "incremental_cache": str(INCREMENTAL_CACHE) if INCREMENTAL_CACHE is not None else None,
+             "cache_boundary": "explicit validated inherited proofs; EXE/DLL+argv+input content+model receipt/stat/header+source identities; no cache is accessed during plan",
             "requested_janas_environment": {k: v for k, v in environment().items() if k.startswith("JANAS_")},
             "cleared_inherited_controls": "all JANAS_* before applying listed controls",
             "locked_reference_digest": EXPECTED_DIGEST, "qref_sha256": EXPECTED_QREF_SHA,
             "execution_requires": "native Windows ARM64 Python --execute after coordinating exclusive device use",
             "reference": str(QREF), "frozen_tokens": str(CODE), "receipt": str(RECEIPT),
             "reference_generation": "--create-reference reconstructs the locked CPU reference; its digest and SHA must match the receipt",
-            "scope": "functional quality and correctness only; no performance claims"}
+            "scope": "functional quality and correctness only; no performance claims",
+            "s2_controls": dict(S2_CONTROLS)}
 
 
 def load_receipt(path):
@@ -612,6 +1131,12 @@ def parser():
     mode = result.add_mutually_exclusive_group()
     mode.add_argument("--plan", action="store_true", help="default; list checks without launching anything")
     mode.add_argument("--execute", action="store_true", help="explicitly run sequential native Windows checks")
+    result.add_argument("--fast", action="store_true", help="same logical coverage: reuse model loads/references; bounded parallel model-free units")
+    result.add_argument("--unit-workers", type=int, choices=range(1,9), default=4, help="--fast model-free workers sharing CPU mask0xff (models stay serial)")
+    result.add_argument("--select-check", action="append", default=[], help="explicit check IDs, comma-separated; marks subset scope; default requests all checks")
+    result.add_argument("--import-proofs", type=Path, action="append", default=[], help="explicit completed passing raw-proof directories to revalidate/import into the requested cache")
+    result.add_argument("--import-model-receipt", type=Path, help="completed model-checksum receipt required when importing model-based historical proofs")
+    result.add_argument("--incremental-cache", type=Path, help="explicit validated-pass proof cache; inherited proofs are labelled and identities rechecked")
     result.add_argument("--out", "--output", dest="out", type=Path, help="NEW output directory; existing paths rejected")
     result.add_argument("--bin-dir", type=Path, default=ROOT / "bin/aarch64-windows")
     result.add_argument("--model", type=Path, help="main JNS file; default from model receipt under models/")
@@ -622,6 +1147,10 @@ def parser():
     result.add_argument("--verify-model-sha256", action="store_true", help="stream and verify both large model files before checks")
     result.add_argument("--attention-calibration-file", type=Path,
                         help="optional frozen original attn.txt, copied identically into every child private cache")
+    result.add_argument("--s2-exact", choices=("off", "on"), default="off")
+    result.add_argument("--s2-branches", type=int, choices=range(1, 3), default=2)
+    result.add_argument("--s2-max-nodes", type=int, choices=range(1, 33), default=8)
+    result.add_argument("--s2-min-gain-percent", type=int, choices=range(101), default=5)
     result.add_argument("--semantic-probe-percent", type=int, choices=range(101), default=2,
                         metavar="0..100", help="hybrid semantic check; default production 2, other values functional only")
     result.add_argument("--create-reference", action="store_true", help="create a missing CPU64 reference and require its locked digest/SHA")
@@ -632,9 +1161,17 @@ def parser():
 
 def main():
     global OUT, BIN, MODEL, MTP, QREF, CODE, RECEIPT, EXPECTED_DIGEST, EXPECTED_QREF_SHA
-    global MODEL_PINS, BASELINE_QUALITY_EXE, VERIFY_MODEL_HASHES, SEMANTIC_PROBE_PERCENT, ATTENTION_CALIBRATION
+    global MODEL_PINS, BASELINE_QUALITY_EXE, VERIFY_MODEL_HASHES, SEMANTIC_PROBE_PERCENT, ATTENTION_CALIBRATION, S2_CONTROLS
+    global FAST, UNIT_WORKERS, SELECT_CHECKS, INCREMENTAL_CACHE, CACHE_SOURCE_IDENTITY, CACHE_STATS
     cli = parser()
     args = cli.parse_args()
+    if args.import_proofs and not args.incremental_cache: cli.error("--import-proofs requires --incremental-cache")
+    FAST, UNIT_WORKERS = args.fast, args.unit_workers
+    SELECT_CHECKS = {v.strip() for group in args.select_check for v in group.split(",") if v.strip()}
+    INCREMENTAL_CACHE = args.incremental_cache.resolve() if args.incremental_cache else None
+    CACHE_SOURCE_IDENTITY = None
+    CACHE_STATS = {"hits":0,"misses":0,"stored":0,"rejected":0}
+    FILE_IDENTITIES.clear()
     RECEIPT = args.model_receipt.resolve()
     receipt = load_receipt(RECEIPT)
     BIN = args.bin_dir.resolve()
@@ -648,12 +1185,18 @@ def main():
     BASELINE_QUALITY_EXE = args.baseline_quality_exe.resolve() if args.baseline_quality_exe else None
     VERIFY_MODEL_HASHES = args.verify_model_sha256
     SEMANTIC_PROBE_PERCENT = args.semantic_probe_percent
+    S2_CONTROLS = {k: getattr(args, k) for k in ("s2_exact", "s2_branches", "s2_max_nodes", "s2_min_gain_percent")}
     ATTENTION_CALIBRATION = attention_input(args.attention_calibration_file)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     OUT = args.out.resolve() if args.out else ROOT / "lib/validation" / ("snapdragon-runtime-" + stamp + "-" + str(os.getpid()))
     if args.create_reference and args.stage == "units":
         cli.error("reference generation is a model check, incompatible with --stage units")
-    planned = plan(args.stage)
+    try:
+        planned = plan(args.stage)
+    except ValueError as error:
+        cli.error(str(error))
+    planned["import_proofs"] = [str(p) for p in args.import_proofs]
+    planned["import_model_receipt"] = str(args.import_model_receipt) if args.import_model_receipt else None
     planned["create_reference"] = args.create_reference
     if args.create_reference:
         part = QREF.with_name(QREF.name + "." + OUT.name + ".part")
@@ -669,11 +1212,17 @@ def main():
         return 0
     if os.name != "nt":
         cli.error("use native Windows ARM64 Python; plans work on every platform")
+    if INCREMENTAL_CACHE is not None and (INCREMENTAL_CACHE == OUT or OUT in INCREMENTAL_CACHE.parents):
+        cli.error("incremental cache must be outside the new output directory")
     OUT.mkdir(parents=True, exist_ok=False)
+    if INCREMENTAL_CACHE is not None:
+        INCREMENTAL_CACHE.mkdir(parents=True,exist_ok=True)
+        CACHE_SOURCE_IDENTITY = source_identity()
     lock = OUT / "runner.lock"
     fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     os.write(fd, str(os.getpid()).encode("ascii")); os.close(fd)
-    summary = {"scope": "functional; sequential one-model-at-a-time", "stages": [],
+    execution_started=time.monotonic()
+    summary = {"scope": "functional; model jobs serial; explicit inherited cache proofs labelled", "stages": [],
                "started_utc": datetime.now(timezone.utc).isoformat(),
                "runner_sha256": sha(__file__), "native_python": sys.executable,
                "receipt": receipt, "receipt_sha256": sha(RECEIPT),
@@ -681,7 +1230,7 @@ def main():
                "removed_inherited_janas_names": sorted(k for k in os.environ if k.upper().startswith("JANAS_")),
                "plan": planned}
     try:
-        if args.stage != "units":
+        if any(c["stage"] != "units" for c in planned["cases"]):
             summary["models"] = model_metadata()
             if args.create_reference:
                 if not create_reference():
@@ -690,11 +1239,16 @@ def main():
             if not QREF.is_file():
                 raise ValueError("reference missing; supply --reference or explicitly use --create-reference")
             summary["inputs"] = prepare_inputs()
+        if args.import_proofs:
+            summary["imported_proofs"]=[import_raw_proofs(p,planned,args.import_model_receipt) for p in args.import_proofs]
+            save(OUT/"proof-imports.json",summary["imported_proofs"])
         stages = [("units", units), ("quality", quality), ("eval", evaluation), ("session", session), ("hybrid", semantic_hybrid)]
         for name, fn in stages:
             if args.stage not in ("all", name): continue
+            if SELECT_CHECKS and not any(c["stage"] == name for c in planned["cases"]): continue
+            started=time.monotonic()
             passed = fn()
-            summary["stages"].append({"name": name, "passed": passed})
+            summary["stages"].append({"name": name, "passed": passed,"wall_seconds":time.monotonic()-started})
             save(OUT / "summary.json", summary)
             if not passed:
                 summary["passed"] = False
@@ -706,13 +1260,32 @@ def main():
         summary["error"] = {"type": type(error).__name__, "message": str(error)}
         raise
     finally:
+        cleanup_error = None
         if ATTENTION_CALIBRATION is not None:
-            if attention_input(Path(ATTENTION_CALIBRATION["source_path"])) != ATTENTION_CALIBRATION:
-                raise RuntimeError("Original attention calibration changed during validation")
-            summary["attention_calibration_original_unchanged"] = True
+            try:
+                preserved = attention_input(Path(ATTENTION_CALIBRATION["source_path"])) == ATTENTION_CALIBRATION
+            except (OSError,ValueError): preserved = False
+            summary["attention_calibration_original_unchanged"] = preserved
+            if not preserved: cleanup_error = RuntimeError("Original attention calibration changed during validation")
         summary["ended_utc"] = datetime.now(timezone.utc).isoformat()
+        summary["wall_seconds"] = time.monotonic()-execution_started
+        summary["fast"] = FAST
+        summary["full_requested_coverage"] = not SELECT_CHECKS
+        summary["cache"] = dict(CACHE_STATS, enabled=INCREMENTAL_CACHE is not None,
+            directory=str(INCREMENTAL_CACHE) if INCREMENTAL_CACHE is not None else None,
+            boundary="cached passes are inherited proofs, never fresh runtime measurements")
+        if CACHE_SOURCE_IDENTITY is not None:
+            summary["source_identity"] = CACHE_SOURCE_IDENTITY
+            summary["source_unchanged"] = source_identity() == CACHE_SOURCE_IDENTITY
+            if not summary["source_unchanged"]:
+                summary["source_change_error"] = "project/validator source changed during validation"
+                cleanup_error = RuntimeError("Project/validator source changed during validation")
+        if cleanup_error is not None:
+            summary["passed"] = False
+            summary["cleanup_error"] = {"type":type(cleanup_error).__name__,"message":str(cleanup_error)}
         save(OUT / "summary.json", summary)
         lock.unlink(missing_ok=True)
+        if cleanup_error is not None: raise cleanup_error
 
 
 if __name__ == "__main__":

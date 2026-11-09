@@ -117,9 +117,12 @@ PROMPTS = {
 DEFAULT_CONTROL = dict(speculation="mtp", draft_tokens=4, spec_planner="legacy",
     spec_explore=20, draft_vocab="legacy", draft_vocab_rows=0, gdn_chain=1,
     gdn_journal=1, gdn_k_only=1, panels="auto", hybrid_policy="legacy",
-    lookup_drafts=8, mtp_drafts=4, hybrid_probe_percent=2)
+    lookup_drafts=8, mtp_drafts=4, hybrid_probe_percent=2,
+    s2_exact="off", s2_branches=2, s2_max_nodes=8, s2_min_gain_percent=5)
 CASES = {
     "baseline": dict(DEFAULT_CONTROL),
+    "s2-exact": dict(DEFAULT_CONTROL, s2_exact="on"),
+    "s2-maintenance": dict(DEFAULT_CONTROL, s2_exact="on", s2_branches=1),
     "legacy": dict(DEFAULT_CONTROL),
     "tiles": dict(DEFAULT_CONTROL, panels="experimental"),
     "gdn-journal": dict(DEFAULT_CONTROL, gdn_chain=1, gdn_journal=1),
@@ -181,6 +184,13 @@ def valid_control(value):
                            ("hybrid_probe_percent", 0, 100)):
         if type(c[key]) is not int or not low <= c[key] <= high:
             raise ValueError("Invalid integer " + key)
+    if c["s2_exact"] not in ("off", "on"):
+        raise ValueError("Invalid S2 exact mode")
+    for key, low, high in (("s2_branches", 1, 2), ("s2_max_nodes", 1, 32), ("s2_min_gain_percent", 0, 100)):
+        if type(c[key]) is not int or not low <= c[key] <= high:
+            raise ValueError("Invalid integer " + key)
+    if c["s2_exact"] == "on" and c["speculation"] not in ("mtp", "auto", "hybrid"):
+        raise ValueError("S2 exact requires MTP speculation")
     if c["panels"] not in ("auto", "off", "experimental"):
         raise ValueError("Invalid panels setting")
     return c
@@ -189,6 +199,9 @@ def valid_control(value):
 def effective_control(value):
     """Resolve aliases and omit source controls that cannot affect this mode."""
     c = valid_control(value)
+    if c["s2_exact"] == "off":
+        for key in ("s2_exact", "s2_branches", "s2_max_nodes", "s2_min_gain_percent"):
+            c.pop(key)
     if c["speculation"] == "auto":
         c["speculation"] = "mtp"  # This runner always supplies the MTP sidecar.
     if c["speculation"] != "hybrid" or c["hybrid_policy"] != "cost":
@@ -209,7 +222,9 @@ def performance_controls(c):
         JANAS_DRAFT_VOCAB_ROWS=str(c["draft_vocab_rows"]), JANAS_GDN_CHAIN=str(c["gdn_chain"]),
         JANAS_GDN_JOURNAL=str(c["gdn_journal"]), JANAS_GDN_K_ONLY=str(c["gdn_k_only"]),
         JANAS_HYBRID_POLICY=c["hybrid_policy"], JANAS_LOOKUP_DRAFTS=str(c["lookup_drafts"]),
-        JANAS_MTP_DRAFTS=str(c["mtp_drafts"]), JANAS_HYBRID_PROBE_PERCENT=str(c["hybrid_probe_percent"]))
+        JANAS_MTP_DRAFTS=str(c["mtp_drafts"]), JANAS_HYBRID_PROBE_PERCENT=str(c["hybrid_probe_percent"]),
+        JANAS_S2_EXACT=c["s2_exact"], JANAS_S2_BRANCHES=str(c["s2_branches"]),
+        JANAS_S2_MAX_NODES=str(c["s2_max_nodes"]), JANAS_S2_MIN_GAIN_PERCENT=str(c["s2_min_gain_percent"]))
     if c["panels"] != "auto":
         controls["JANAS_CPU_TILES"] = "1" if c["panels"] == "experimental" else "0"
     return controls
@@ -504,6 +519,12 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
                     "--lookup-drafts", str(control["lookup_drafts"]),
                     "--mtp-drafts", str(control["mtp_drafts"]),
                     "--hybrid-probe-percent", str(control["hybrid_probe_percent"])]
+    # The frozen pre-S2 executable does not know these options. Off means no
+    # S2 CLI arguments on either arm; unknown inherited settings are cleared.
+    if control["s2_exact"] == "on":
+        command += ["--s2-exact", "on", "--s2-branches", str(control["s2_branches"]),
+                    "--s2-max-nodes", str(control["s2_max_nodes"]),
+                    "--s2-min-gain-percent", str(control["s2_min_gain_percent"])]
     if retain_controller:
         command += ["--fair-retain-controller"]
     value = {"id": f"{sequence:02d}-{workload}-{label}-{case}", "workload": workload, "case": case,
@@ -589,6 +610,9 @@ def validate_records(records, run):
             expected.update({k: c[k] for k in ("hybrid_policy", "lookup_drafts", "mtp_drafts", "hybrid_probe_percent")})
         else:
             expected.update(controller_fields)
+        # Older frozen off executables legitimately omit additive S2 metadata.
+        if c["s2_exact"] == "on" or "s2_exact" in setup[0]:
+            expected.update({k: c[k] for k in ("s2_exact", "s2_branches", "s2_max_nodes", "s2_min_gain_percent")})
         for key in ("fair_retain_controller", "conversation_cache_reuse"):
             if key in expected and type(setup[0].get(key)) is not bool:
                 errors.append("setup " + key + " must be a boolean")
@@ -597,6 +621,14 @@ def validate_records(records, run):
                 errors.append(f"setup {key} differs from protocol")
         if setup[0].get("profile_phases_enabled"):
             errors.append("phase profiling enabled during timing")
+    if c["s2_exact"] == "on":
+        for sample in samples:
+            metrics = sample.get("s2_metrics")
+            if not isinstance(metrics, dict) or metrics.get("schema") != 1:
+                errors.append("S2 diagnostics missing or wrong schema")
+            elif any(type(metrics.get(k)) is not int or metrics[k] < 0 for k in
+                     ("cycles", "alternate_builds", "alternate_nodes", "cached_uses", "pruned", "probes")):
+                errors.append("S2 diagnostic counters invalid")
     phases = ["fresh_process"] + ["warm"] * run["warm_rounds"]
     if [r.get("phase") for r in samples] != phases:
         errors.append("wrong sample phase sequence")

@@ -55,6 +55,207 @@ class ProtocolTests(unittest.TestCase):
                         "npu_layer_passes", "gpu_product_submissions", "gpu_products",
                         "gpu_whole_passes"), 0))
 
+    def fast_inputs(self):
+        self.v.BIN=self.root/"bin";self.v.BIN.mkdir(exist_ok=True)
+        for name in ("quality_check.exe","llm_session.exe","test_fixture.exe"):
+            (self.v.BIN/name).write_bytes(("fixture "+name).encode())
+        for key,name in (("MODEL","model.jns"),("MTP","mtp.jns"),("QREF","reference.qref"),("CODE","tokens.json"),("RECEIPT","receipt.json")):
+            path=self.root/name;path.write_bytes(("fixture "+name).encode());setattr(self.v,key,path)
+        (self.v.OUT/"session-code160.int32").write_bytes(b"frozen token fixture")
+        self.v.CACHE_SOURCE_IDENTITY={"sha256":"fixture-source","files":{}}
+
+    def session_text(self,case):
+        name,planner,mode,drafts,vocab,rows=case
+        text=f"settings: compute=8 io=4 planner={planner} speculation={mode} drafts={drafts} draft_vocab={vocab} rows={rows} quality=HIGH expert_bits=6 head_bits=0\n"
+        for n in range(2):
+            text+=(f"runtime: mode={4 if mode=='hybrid' else 2} planner={dict(legacy=0,cycle=1,fixed=2)[planner]} cycles=32 max_width={17 if drafts==16 else 5} lookup_attempts=8 mtp_drafts=32 head_calls=32 repacks={2 if vocab=='adaptive' else 0} head_policy=0 head_rows=16384 head_epoch=2 verified\n")
+            if name.startswith("hybrid-cost"):
+                text+="hybrid: policy=cost decisions=12 offered=8 lookup=1 mtp=11 probes=1 cooldown=0 accepted=1 verified\n"
+        for marker in ("greedy: turns vs all at once","greedy + speculation: turn 1","greedy + speculation: turn 2","sampling, speculation off vs on: turn 1","sampling, speculation off vs on: turn 2"):
+            text+=marker+" identical\n"
+        return text+"sampling differs from greedy yes\nboundary: head=0123456789abcdef mtp_kv=0123456789abcdef logits=0123456789abcdef identical\nllm_session: ok\n"
+
+    def test_fast_plan_is_inert_and_has_identical_logical_coverage(self):
+        self.fast_inputs();serial=self.v.plan("all");self.v.FAST=True;fast=self.v.plan("all")
+        self.assertEqual([c["check_id"] for c in serial["cases"]],[c["check_id"] for c in fast["cases"]])
+        self.assertTrue(fast["full_requested_coverage"]);self.assertTrue(fast["models_sequential"])
+        drivers=fast["driver_invocations"]
+        quality=next(c for c in drivers if c["stage"]=="quality")
+        self.assertIn("1,3,5,8,9,17",quality["command"])
+        session=next(c for c in drivers if c["stage"]=="session")
+        self.assertEqual(len(session["logical_checks"]),7);self.assertEqual(session["reference_model_runs"],3)
+        self.assertEqual(session["candidate_model_runs"],14)
+        self.assertFalse((self.v.OUT/"session-cases.tsv").exists())
+
+    def test_fast_quality_checks_every_width_and_rejects_partial_or_reordered_matrix(self):
+        self.fast_inputs();self.v.FAST=True
+        for bad in (None,"missing","reorder","drift","nan"):
+            calls=[]
+            def fake(name,argv,env,**kwargs):
+                calls.append(argv);batches=[int(x) for x in argv[argv.index("--batches")+1].split(",")]
+                records=[]
+                for n,b in enumerate(batches):
+                    r=self.quality_record(b);r.update(completed=True,exit_code=0,matrix_index=n,matrix_count=len(batches),max_batch_capacity=max(batches),model_load_count=1,functional_only=True,sequence_restart="forward_position_zero",actual_batches=[min(b,64-i) for i in range(0,64,b)],width_seconds=.1)
+                    records.append(r)
+                if bad=="missing":records.pop()
+                if bad=="reorder":records.reverse()
+                if bad=="drift":records[2]["logit_max_abs"]=.001
+                if bad=="nan":records[2]["nll"]=float("nan")
+                r=self.result(name,"\n".join(map(json.dumps,records))+"\n");r.update(wall_seconds=1,binary_sha256="fixture")
+                return r
+            with patch.object(self.v,"run",fake):self.assertEqual(self.v.quality(),bad is None)
+            self.assertEqual(len(calls),1)
+            rows=json.loads((self.v.OUT/"quality.json").read_text())["results"]
+            self.assertEqual([r["name"] for r in rows],[f"quality64-batch{b}" for b in self.v.BATCHES])
+
+    def test_fast_session_requires_all_cases_shared_references_and_boundary_oracle(self):
+        self.fast_inputs();self.v.FAST=True;self.v.S2_CONTROLS["s2_exact"]="on"
+        for bad in (None,"key","boundary","case"):
+            def fake(name,argv,env,**kwargs):
+                manifest=Path(next(x[6:] for x in argv if isinstance(x,str) and x.startswith("cases=")))
+                lines=manifest.read_text().splitlines();self.assertEqual(len(lines),7)
+                self.assertIn("s2_max_nodes=32",lines[4]);self.assertIn("s2_max_nodes=8",lines[0])
+                text="runtime: mode=0 planner=0 cycles=32 verified\nruntime: mode=0 planner=0 cycles=32 verified\n"
+                text+='session-reference: '+json.dumps(dict(version=1,valid=True,model_runs=3,content_key="0123456789abcdef",functional_only=True))+"\n"
+                for n,case in enumerate(self.v.SESSION_CASES):
+                    text+="session-case-begin: "+case[0]+"\n"
+                    body=self.session_text(case)
+                    if bad=="boundary" and n==2:body=body.replace("boundary:","removed:")
+                    text+=body
+                    r=dict(name=case[0],index=n,exit_code=0,wall_seconds=.1,checks=5,functional_only=True,reference_reused=True,actual_model_runs=2,boundary_forward_calls=1,content_key="0123456789abcdef")
+                    if bad=="key" and n==2:r["content_key"]="ffffffffffffffff"
+                    if bad!="case" or n!=2:text+="session-case: "+json.dumps(r)+"\n"
+                r=self.result(name,text);r.update(wall_seconds=1,binary_sha256="fixture",cache_identity={"fixture":"binding"});return r
+            with patch.object(self.v,"run",fake):self.assertEqual(self.v.session(),bad is None)
+            rows=json.loads((self.v.OUT/"sessions.json").read_text())["results"]
+            self.assertEqual(len(rows),7)
+            if bad != "case": self.assertTrue(all(r["reference_reused"] is True for r in rows))
+
+    def test_parallel_units_are_bounded_cpu8_and_keep_input_order(self):
+        self.fast_inputs();self.v.FAST=True;self.v.UNIT_WORKERS=2
+        for n in range(5):(self.v.BIN/f"test_{n}.exe").write_bytes(b"fixture")
+        def fake(name,argv,env,**kwargs):return self.result(name,Path(argv[0]).stem+": ok\n")
+        with patch.object(self.v,"run",fake),patch.object(self.v,"cpu8_parent") as affinity:
+            self.assertTrue(self.v.units());affinity.assert_called_once()
+        result=json.loads((self.v.OUT/"units.json").read_text())
+        self.assertEqual(result["workers"],2);self.assertEqual(result["cpu_mask"],255)
+        self.assertEqual([r["name"] for r in result["results"]],sorted(r["name"] for r in result["results"]))
+
+    def test_explicit_selection_marks_subset_and_rejects_unknown_ids(self):
+        self.v.SELECT_CHECKS={"session-fixed-mtp16-adaptive"};self.v.FAST=True
+        plan=self.v.plan("session");self.assertFalse(plan["full_requested_coverage"])
+        self.assertEqual(len(plan["cases"]),1);self.assertEqual(len(plan["omitted_checks"]),6)
+        self.v.SELECT_CHECKS={"typo"}
+        with self.assertRaisesRegex(ValueError,"unknown"):self.v.plan("session")
+
+    def test_cache_binds_generated_content_models_controls_sources_and_output_paths(self):
+        self.fast_inputs()
+        cases=self.v.OUT/"session-cases.tsv";cases.write_text("one\tplanner=legacy\n")
+        argv=[self.v.BIN/"llm_session.exe",self.v.MODEL,self.v.OUT/"session-code160.int32","cases="+str(cases)]
+        first=self.v.case_identity("session-matrix",argv,{"JANAS_S2_EXACT":"on"},255)
+        cases.write_text("two\tplanner=legacy\n")
+        self.assertNotEqual(first,self.v.case_identity("session-matrix",argv,{"JANAS_S2_EXACT":"on"},255))
+        cases.write_text("one\tplanner=legacy\n")
+        for path in (self.v.MODEL,self.v.QREF,self.v.CODE,self.v.RECEIPT):
+            before=self.v.case_identity("session-matrix",argv,{"JANAS_S2_EXACT":"on"},255)
+            path.write_bytes(path.read_bytes()+b"x")
+            self.assertNotEqual(before,self.v.case_identity("session-matrix",argv,{"JANAS_S2_EXACT":"on"},255))
+        old=self.v.OUT;new=self.root/"other-output";new.mkdir();self.v.OUT=new
+        for p in old.glob("*.int32"): (new/p.name).write_bytes(p.read_bytes())
+        (new/cases.name).write_bytes(cases.read_bytes())
+        newargv=[argv[0],argv[1],new/"session-code160.int32","cases="+str(new/cases.name)]
+        same=self.v.case_identity("session-matrix",newargv,{"JANAS_S2_EXACT":"on"},255)
+        self.v.OUT=old
+        self.assertEqual(same,self.v.case_identity("session-matrix",argv,{"JANAS_S2_EXACT":"on"},255))
+        self.assertNotEqual(same,self.v.case_identity("session-matrix",argv,{"JANAS_S2_EXACT":"off"},255))
+        self.v.CACHE_SOURCE_IDENTITY={"sha256":"different"}
+        self.assertNotEqual(same,self.v.case_identity("session-matrix",argv,{"JANAS_S2_EXACT":"on"},255))
+
+    def test_cache_reuses_only_intact_validated_proofs_and_invalidates_new_failure(self):
+        self.fast_inputs();self.v.INCREMENTAL_CACHE=self.root/"proof-cache"
+        exe=self.v.BIN/"test_fixture.exe";identity=self.v.case_identity("unit-test_fixture",[exe],{})
+        r=self.result("unit-test_fixture","test_fixture: ok\n");r.update(cache_identity=identity,command=[str(exe)],wall_seconds=1,validation_errors=[])
+        self.v.save_validated(r)
+        cached=self.v.cache_load("unit-test_fixture",[exe],{})
+        self.assertTrue(cached["proof_reused"]);self.assertFalse(cached["performed_new_execution"])
+        self.assertEqual(cached["wall_seconds"],1)
+        folder=self.v.INCREMENTAL_CACHE/self.v.identity_key(identity)
+        (folder/"stdout.log").write_text("test_fixture: forged\n")
+        self.assertIsNone(self.v.cache_load("unit-test_fixture",[exe],{}))
+        self.v.save_validated(r)
+        r["passed"]=False;r["validation_errors"]=["new failure"]
+        self.v.save_validated(r)
+        self.assertIsNone(self.v.cache_load("unit-test_fixture",[exe],{}))
+
+    def test_explicit_raw_proof_import_revalidates_and_rejects_changed_artifacts(self):
+        self.fast_inputs();self.v.INCREMENTAL_CACHE=self.root/"proof-cache"
+        source=self.root/"historical";source.mkdir();exe=self.v.BIN/"test_fixture.exe"
+        stdout=source/"unit.stdout.log";stderr=source/"unit.stderr.log"
+        stdout.write_text("test_fixture: ok\n");stderr.write_text("")
+        record=dict(name="unit-test_fixture",passed=True,validation_errors=[],exit_code=0,
+            command=[str(exe)],binary_sha256=self.v.sha(exe),janas_environment={k:v for k,v in self.v.environment().items() if k.startswith("JANAS_")},
+            stdout=str(stdout),stderr=str(stderr),wall_seconds=1)
+        (source/"summary.json").write_text(json.dumps(dict(passed=True)))
+        (source/"units.json").write_text(json.dumps(dict(results=[record])))
+        plan={"cases":[dict(check_id="unit-test_fixture",stage="units",command=[str(exe)])]}
+        imported=self.v.import_raw_proofs(source,plan)
+        self.assertTrue(imported["results"][0]["imported"])
+        hit=self.v.cache_load("unit-test_fixture",[exe],self.v.environment())
+        self.assertTrue(hit["proof_reused"]);self.assertFalse(hit["performed_new_execution"])
+        self.assertTrue(hit["imported_raw_proof"]["revalidated_by_current_checker"])
+        exe.write_bytes(b"changed executable")
+        imported=self.v.import_raw_proofs(source,plan)
+        self.assertFalse(imported["results"][0]["imported"])
+        self.assertIn("executable SHA",imported["results"][0]["reason"])
+        (source/"summary.json").write_text(json.dumps(dict(passed=False)))
+        with self.assertRaisesRegex(ValueError,"complete passing"):self.v.import_raw_proofs(source,plan)
+
+    def test_model_proof_import_requires_completed_earlier_unchanged_payload_attestation(self):
+        self.fast_inputs()
+        self.v.MODEL_PINS={role:(path.stat().st_size,self.v.sha(path)) for role,path in (("main",self.v.MODEL),("mtp",self.v.MTP))}
+        with self.assertRaisesRegex(ValueError,"requires"):self.v.import_model_attestation(None,"2026-11-09T00:00:00+00:00")
+        records={path.name:dict(sha256_verified=True,sha256=self.v.sha(path),bytes=path.stat().st_size,
+            mtime_ns=path.stat().st_mtime_ns,verified_utc="2026-11-08T00:00:00+00:00") for path in (self.v.MODEL,self.v.MTP)}
+        receipt=self.root/"completed-model-receipt.json";receipt.write_text(json.dumps(dict(complete=True,files=records)))
+        self.assertTrue(self.v.import_model_attestation(receipt,"2026-11-09T00:00:00+00:00")["complete"])
+        with self.assertRaisesRegex(ValueError,"predates"):self.v.import_model_attestation(receipt,"2026-11-07T00:00:00+00:00")
+        self.v.MODEL.write_bytes(b"changed payload")
+        with self.assertRaisesRegex(ValueError,"unchanged payload"):self.v.import_model_attestation(receipt,"2026-11-09T00:00:00+00:00")
+
+    def test_failed_whole_quality_matrix_never_caches_partial_passes(self):
+        self.fast_inputs();self.v.FAST=True;self.v.INCREMENTAL_CACHE=self.root/"proof-cache"
+        def fake(name,argv,env,**kwargs):
+            rows=[]
+            for n,b in enumerate(self.v.BATCHES):
+                r=self.quality_record(b);r.update(completed=True,exit_code=0,matrix_index=n,matrix_count=6,max_batch_capacity=17,model_load_count=1,functional_only=True,sequence_restart="forward_position_zero",actual_batches=[min(b,64-i) for i in range(0,64,b)],width_seconds=.1)
+                if b==5:r["logit_max_abs"]=.1
+                rows.append(r)
+            r=self.result(name,"\n".join(map(json.dumps,rows))+"\n");r.update(wall_seconds=1,binary_sha256="fixture",cache_identity={"fixture":"quality"});return r
+        with patch.object(self.v,"run",fake):self.assertFalse(self.v.quality())
+        self.assertFalse(list(self.v.INCREMENTAL_CACHE.glob("*/manifest.json")))
+
+    def test_s2_fixed16_stress_has_explicit32_node_override_only(self):
+        self.v.S2_CONTROLS.update(s2_exact="on",s2_max_nodes=8)
+        self.assertIn("s2_max_nodes=32",self.v.session_controls("fixed-mtp16-adaptive"))
+        self.assertIn("s2_max_nodes=8",self.v.session_controls("legacy-mtp4"))
+        self.assertEqual(self.v.S2_CONTROLS["s2_max_nodes"],8)
+        case=next(c for c in self.v.plan("session")["cases"] if c["name"]=="fixed-mtp16-adaptive")
+        self.assertEqual(case["s2_controls_effective"]["s2_max_nodes"],32)
+        self.assertIsNotNone(case["stress_override"])
+
+    def test_s2_validation_is_separately_opt_in_and_recorded(self):
+        self.assertFalse(any(k.startswith("JANAS_S2_") for k in self.v.environment()))
+        self.assertFalse(any(v.startswith("s2_") for v in self.v.session_controls("legacy-mtp4")))
+        self.v.S2_CONTROLS.update(s2_exact="on", s2_branches=1)
+        controls=self.v.session_controls("legacy-mtp4")
+        self.assertIn("s2_exact=on",controls);self.assertIn("s2_branches=1",controls)
+        self.assertEqual(self.v.environment()["JANAS_S2_EXACT"],"on")
+        plan=self.v.plan("session")
+        self.assertEqual(plan["s2_controls"]["s2_exact"],"on")
+        self.assertTrue(all("s2_exact=on" in c["command"] for c in plan["cases"]))
+        args=self.v.parser().parse_args(["--plan","--s2-exact","on","--s2-branches","1"])
+        self.assertEqual(args.s2_exact,"on")
+
     def test_source_relative_root_and_plan_never_launches_or_creates_output(self):
         out = self.root / "uncreated"
         argv = [str(SCRIPT), "--plan", "--stage", "quality", "--out", str(out),

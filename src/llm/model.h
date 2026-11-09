@@ -364,6 +364,26 @@ const float *janas_llm_mtp_hidden(const struct janas_llm_model *m);
 int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
                         const float *hidden, uint32_t n, uint32_t pos0,
                         int32_t *token, float *conf);
+/* Opt-in native Qwen3-Next CPU helpers. The first updates the MTP KV slot
+   without post-attention FFN/hidden work; the second computes only the last
+   row's post-attention FFN and scores the unchanged draft head. Other models
+   and accelerator paths retain the existing full-forward behavior. Neither
+   function changes the target's weights, routing, KV or recurrent state. */
+int janas_llm_mtp_branch_capable(const struct janas_llm_model *m);
+int janas_llm_mtp_maintain(struct janas_llm_model *m, const int32_t *tokens,
+                           const float *hidden, uint32_t n, uint32_t pos0);
+int janas_llm_mtp_draft_tail(struct janas_llm_model *m, const int32_t *tokens,
+                             const float *hidden, uint32_t n, uint32_t pos0,
+                             int32_t *token, float *conf);
+#define JANAS_MTP_CANDIDATES_MAX 16
+/* Up to n alternatives from the same most recently scored draft-head logits,
+   ordered by descending logit with the legacy row-order tie break. IDs are
+   global vocabulary IDs; probabilities share the original softmax denominator
+   and candidate zero equals the original token/confidence bit for bit. Call
+   before the next MTP forward or vocabulary change. Returns count, 0 for n=0,
+   or -1 for invalid/stale head metadata; failure leaves output arrays intact. */
+int janas_llm_mtp_candidates(const struct janas_llm_model *m, int32_t *ids,
+                             float *probs, uint32_t n);
 void janas_llm_mtp_note_tokens(struct janas_llm_model *m, const int32_t *tokens,
                                uint32_t n);
 

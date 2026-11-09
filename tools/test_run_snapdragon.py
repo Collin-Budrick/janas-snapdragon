@@ -74,6 +74,37 @@ class LauncherTests(unittest.TestCase):
                 self.load()
             self.profile["case"][key] = old
 
+    def test_s2_profile_controls_are_opt_in_bounded_and_replayed(self):
+        original = self.load()
+        command = launcher.launch_command(original, "server", Path("server.exe"), "127.0.0.1", 8089, False)
+        self.assertNotIn("--s2-exact", command)
+        self.profile["mtp"] = self.identity(self.model)
+        self.profile["case"].update(speculation="mtp", s2_exact="on", s2_branches=1, s2_max_nodes=8, s2_min_gain_percent=5)
+        profile = self.load()
+        hostile = {"JANAS_S2_EXACT": "off", "JANAS_S2_BRANCHES": "99"}
+        env = launcher.launch_environment(profile, hostile)
+        self.assertEqual(hostile["JANAS_S2_BRANCHES"], "99")
+        self.assertEqual(env["JANAS_S2_EXACT"], "on")
+        self.assertEqual(env["JANAS_S2_BRANCHES"], "1")
+        command = launcher.launch_command(profile, "server", Path("server.exe"), "127.0.0.1", 8089, False)
+        for name, value in (("--s2-exact", "on"), ("--s2-branches", "1"), ("--s2-max-nodes", "8"), ("--s2-min-gain-percent", "5")):
+            self.assertEqual(command[command.index(name)+1], value)
+        for key,value in (("s2_exact", True), ("s2_branches", 3), ("s2_max_nodes", 0), ("s2_min_gain_percent", 101)):
+            old=self.profile["case"][key];self.profile["case"][key]=value
+            with self.subTest(key=key), self.assertRaises(ValueError): self.load()
+            self.profile["case"][key]=old
+
+    def test_s2_on_requires_additive_cli_capability_but_off_accepts_old_app(self):
+        flags="--speculation --draft-tokens --quality --prompt-on --drafts-on --reply-on --spec-planner --spec-explore --draft-vocab --draft-vocab-rows"
+        response=subprocess.CompletedProcess([],0,flags,"")
+        with patch.object(launcher.subprocess,"run",return_value=response):
+            launcher.validate_cli(Path("app.exe"),{"JANAS_S2_EXACT":"off"})
+            with self.assertRaisesRegex(ValueError,"--s2-exact"):
+                launcher.validate_cli(Path("app.exe"),{"JANAS_S2_EXACT":"on"})
+        response=subprocess.CompletedProcess([],0,flags+" --s2-exact --s2-branches --s2-max-nodes --s2-min-gain-percent","")
+        with patch.object(launcher.subprocess,"run",return_value=response):
+            launcher.validate_cli(Path("app.exe"),{"JANAS_S2_EXACT":"on"})
+
     def test_profile_is_explicit(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             launcher.parser().parse_args([])

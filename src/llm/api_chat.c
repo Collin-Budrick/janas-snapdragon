@@ -73,6 +73,10 @@ static int32_t gen_options(const janas_llm_chat *c, struct janas_gen_options *o)
     o->hybrid_lookup_max_drafts = c->hybrid_config.lookup_max_drafts;
     o->hybrid_mtp_max_drafts = c->hybrid_config.mtp_max_drafts;
     o->hybrid_probe_percent = c->hybrid_config.probe_percent;
+    o->s2_exact = c->s2_config.exact;
+    o->s2_branches = c->s2_config.branches;
+    o->s2_max_nodes = c->s2_config.max_nodes;
+    o->s2_min_gain_percent = c->s2_config.min_gain_percent;
     if (o->spec_mode == JANAS_SPEC_HYBRID && o->hybrid_policy == JANAS_LLM_HYBRID_COST)
         o->spec_planner = JANAS_LLM_SPEC_PLANNER_LEGACY;
 
@@ -135,9 +139,11 @@ int32_t janas_llm_chat_create(janas_llm *llm,
     c->llm = llm;
     janas_llm_speculation_config_default(&c->spec_config);
     janas_llm_hybrid_config_default(&c->hybrid_config);
+    janas_llm_s2_config_default(&c->s2_config);
     char spec_error[160];
     if (janas_spec_config_env(&c->spec_config, spec_error, sizeof spec_error) != 0 ||
-        janas_hybrid_config_env(&c->hybrid_config, spec_error, sizeof spec_error) != 0) {
+        janas_hybrid_config_env(&c->hybrid_config, spec_error, sizeof spec_error) != 0 ||
+        janas_s2_config_env(&c->s2_config, spec_error, sizeof spec_error) != 0) {
         free(c);
         return janas_api_fail(JANAS_LLM_EINVAL, "%s", spec_error);
     }
@@ -243,6 +249,28 @@ void janas_llm_hybrid_config_default(struct janas_llm_hybrid_config *p)
     p->lookup_max_drafts = 8; p->mtp_max_drafts = 4; p->probe_percent = 2;
 }
 
+void janas_llm_s2_config_default(struct janas_llm_s2_config *p)
+{
+    if (!p) return;
+    memset(p, 0, sizeof(*p));
+    p->size = sizeof(*p); p->version = JANAS_LLM_S2_CONFIG_VERSION;
+    p->branches = 2; p->max_nodes = 8; p->min_gain_percent = 5;
+}
+int32_t janas_llm_chat_set_s2_config(janas_llm_chat *c,
+                                     const struct janas_llm_s2_config *p)
+{
+    if (!c || !p || p->size != sizeof(*p) || p->version != JANAS_LLM_S2_CONFIG_VERSION ||
+        p->exact < 0 || p->exact > 1 || p->branches < 1 || p->branches > 2 ||
+        p->max_nodes < 1 || p->max_nodes > 32 ||
+        p->min_gain_percent < 0 || p->min_gain_percent > 100)
+        return janas_api_fail(JANAS_LLM_EINVAL, "invalid S2 configuration");
+    struct janas_llm_s2_config old = c->s2_config;
+    c->s2_config = *p;
+    int32_t rc = take_params(c, &c->p);
+    if (rc != JANAS_LLM_OK) c->s2_config = old;
+    return rc;
+}
+
 int32_t janas_llm_chat_set_hybrid_config(janas_llm_chat *c,
                                          const struct janas_llm_hybrid_config *p)
 {
@@ -285,6 +313,7 @@ int32_t janas_llm_chat_reset(janas_llm_chat *c)
     janas_llm_session_reset(c->s);
     janas_llm_session_metrics(c->s, &c->gm0);
     janas_llm_session_hybrid_metrics(c->s, &c->hm0);
+    janas_llm_session_s2_metrics(c->s, &c->s2m0);
     janas_llm_model_runtime_stats(c->llm->m, &c->rt0);
     janas_llm_mtp_costs(c->llm->m, &c->mt0);
     free(c->system);
@@ -1035,6 +1064,7 @@ static int32_t send_turn(janas_llm_chat *c, const char *text, size_t n,
     janas_llm_session_stats(c->s, &c->st0);
     janas_llm_session_metrics(c->s, &c->gm0);
     janas_llm_session_hybrid_metrics(c->s, &c->hm0);
+    janas_llm_session_s2_metrics(c->s, &c->s2m0);
     janas_llm_model_runtime_stats(c->llm->m, &c->rt0);
     janas_llm_mtp_costs(c->llm->m, &c->mt0);
     janas_expert_cache_stats(janas_llm_model_cache(c->llm->m), &c->cs0);

@@ -671,6 +671,14 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
         json_text(&b, "hybrid_fallback_planner", hc.policy ? "legacy" : "configured");
         janas_buf_printf(&b, "\"lookup_drafts\":%d,\"mtp_drafts\":%d,\"hybrid_probe_percent\":%d,",
                          hc.lookup_max_drafts, hc.mtp_max_drafts, hc.probe_percent);
+        struct janas_llm_s2_config s2;
+        janas_llm_s2_config_default(&s2);
+        if (janas_s2_config_env(&s2, config_error, sizeof config_error) != 0) {
+            fprintf(stderr, "janas-bench: %s\n", config_error); goto failed;
+        }
+        json_text(&b, "s2_exact", s2.exact ? "on" : "off");
+        janas_buf_printf(&b, "\"s2_branches\":%d,\"s2_max_nodes\":%d,\"s2_min_gain_percent\":%d,",
+                         s2.branches, s2.max_nodes, s2.min_gain_percent);
         const char *const planners[] = {"legacy", "cycle", "fixed"};
         json_text(&b, "spec_planner", planners[sc.planner]);
         json_text(&b, "draft_vocab", sc.draft_vocab_policy ? "adaptive" : "legacy");
@@ -873,6 +881,11 @@ static int fair_bench(const char *path, struct janas_llm_params *p,
             if (janas_llm_chat_hybrid_metrics(c, &hm) != JANAS_LLM_OK) goto failed;
             janas_buf_puts(&b, ",\"hybrid_metrics\":");
             janas_hybrid_metrics_json(&b, &hm);
+            struct janas_llm_s2_metrics s2m = {
+                .size = sizeof s2m, .version = JANAS_LLM_S2_METRICS_VERSION};
+            if (janas_llm_chat_s2_metrics(c, &s2m) != JANAS_LLM_OK) goto failed;
+            janas_buf_puts(&b, ",\"s2_metrics\":");
+            janas_s2_metrics_json(&b, &s2m);
 
             if (f->profile_phases)
                 fair_profile_json(&b, &profile, st.output_tokens);

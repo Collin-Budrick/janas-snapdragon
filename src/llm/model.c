@@ -985,20 +985,28 @@ void janas_llm_mtp_note_tokens(struct janas_llm_model *m, const int32_t *tokens,
     }
 }
 
-int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
-                        const float *hidden, uint32_t n, uint32_t pos0,
-                        int32_t *token, float *conf)
+enum mtp_output { MTP_HIDDEN_ALL, MTP_HIDDEN_LAST, MTP_KV_ONLY };
+static int mtp_forward_core(struct janas_llm_model *m, const int32_t *tokens,
+                            const float *hidden, uint32_t n, uint32_t pos0,
+                            float *logits, int all_logits, enum mtp_output output);
+
+int janas_llm_mtp_branch_capable(const struct janas_llm_model *m)
 {
-    if (m->asst) { /* Gemma 4's assistant: the last row alone */
-        uint32_t dm = m->d_model;
-        if (n < 1 || n > m->blk)
-            return -1;
-        return janas_m_assist_draft(
-            m, tokens[n - 1], hidden + (size_t)(n - 1) * dm, pos0 + n - 1,
-            m->mtp_hid + (size_t)(n - 1) * dm, token, conf);
-    }
-    if (janas_llm_mtp_forward(m, tokens, hidden, n, pos0, NULL, 0) != 0)
-        return -1;
+    if (!m || !m->a || !m->a->name || strcmp(m->a->name, "qwen3next") || !m->mtp ||
+        m->asst || m->hc_n || m->gpu || m->npu || m->mtp_layer.rec ||
+        m->mtp_layer.swa || m->mtp_layer.lat_down || m->miss_skip != 0 ||
+        m->ana_mode || m->ana_frame || m->ana_tok || m->trace || m->n_media ||
+        !m->kv_cap || !m->kv_ring || !m->kv_swa ||
+        m->mtp_layer.slot != m->n_attn)
+        return 0;
+    uint32_t slot = m->mtp_layer.slot;
+    return !m->kv_ring[slot] && !m->kv_swa[slot] &&
+           m->kv_cap[slot] == m->n_ctx;
+}
+
+static int mtp_score_head(struct janas_llm_model *m, uint32_t n,
+                           int32_t *token, float *conf)
+{
     janas_m_apply_candidate(m, janas_tuner_best(&m->tuner, 0),
                             1); /* one-row head */
     double td = now();
@@ -1037,24 +1045,124 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
     m->phase[JANAS_PH_OUTPUT] += head_time;
     m->mtp_head_s += head_time;
     m->mtp_head_calls++;
+    struct janas_mtp_costs scored;
+    janas_llm_mtp_costs(m, &scored);
+    m->dh_scored_sum = sum;
+    m->dh_scored_best = best;
+    m->dh_scored_rows = rows;
+    m->dh_scored_policy = scored.vocab_policy;
+    m->dh_scored_epoch = scored.vocab_epoch;
     return 0;
 }
 
-static int mtp_forward_core(struct janas_llm_model *m, const int32_t *tokens,
-                            const float *hidden, uint32_t n, uint32_t pos0,
-                            float *logits, int all_logits);
+int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
+                         const float *hidden, uint32_t n, uint32_t pos0,
+                         int32_t *token, float *conf)
+{
+    if (m->asst) { /* Gemma 4's assistant: the last row alone */
+        uint32_t dm = m->d_model;
+        if (n < 1 || n > m->blk)
+            return -1;
+        return janas_m_assist_draft(
+            m, tokens[n - 1], hidden + (size_t)(n - 1) * dm, pos0 + n - 1,
+            m->mtp_hid + (size_t)(n - 1) * dm, token, conf);
+    }
+    if (janas_llm_mtp_forward(m, tokens, hidden, n, pos0, NULL, 0) != 0)
+        return -1;
+    return mtp_score_head(m, n, token, conf);
+}
+
+int janas_llm_mtp_candidates(const struct janas_llm_model *m, int32_t *ids,
+                             float *probs, uint32_t n)
+{
+    if (!n) return 0;
+    if (!m || !ids || !probs || n > JANAS_MTP_CANDIDATES_MAX || m->asst ||
+        !m->dh_logits || !m->mtp_head_calls || !isfinite(m->dh_scored_sum) ||
+        m->dh_scored_sum <= 0)
+        return -1;
+    struct janas_mtp_costs current;
+    janas_llm_mtp_costs(m, &current);
+    uint32_t rows = current.vocab_rows;
+    if (!rows || rows != m->dh_scored_rows || m->dh_scored_best >= rows ||
+        current.vocab_policy != m->dh_scored_policy ||
+        current.vocab_epoch != m->dh_scored_epoch ||
+        !isfinite(m->dh_logits[m->dh_scored_best]))
+        return -1;
+    if (n > rows) n = rows;
+    uint32_t order[JANAS_MTP_CANDIDATES_MAX], count = 0;
+    for (uint32_t row = 0; row < rows; row++) {
+        float value = m->dh_logits[row];
+        if (isnan(value) || value == INFINITY) return -1;
+        uint32_t at = 0;
+        /* Strict greater-than keeps the original first-row tie winner. */
+        while (at < count && !(value > m->dh_logits[order[at]])) at++;
+        if (at >= n) continue;
+        if (count < n) count++;
+        for (uint32_t j = count - 1; j > at; j--) order[j] = order[j - 1];
+        order[at] = row;
+    }
+    if (order[0] != m->dh_scored_best) return -1;
+    int32_t selected[JANAS_MTP_CANDIDATES_MAX];
+    float probabilities[JANAS_MTP_CANDIDATES_MAX];
+    float maximum = m->dh_logits[m->dh_scored_best];
+    for (uint32_t i = 0; i < count; i++) {
+        selected[i] = janas_llm_mtp_vocab_token(m, order[i]);
+        if (selected[i] < 0 || (uint32_t)selected[i] >= m->n_vocab) return -1;
+        probabilities[i] = i == 0 ? (float)(1.0 / m->dh_scored_sum)
+            : (float)((double)janas_exp_det(m->dh_logits[order[i]] - maximum) /
+                      m->dh_scored_sum);
+    }
+    memcpy(ids, selected, (size_t)count * sizeof(*ids));
+    memcpy(probs, probabilities, (size_t)count * sizeof(*probs));
+    return (int)count;
+}
+
 int janas_llm_mtp_forward(struct janas_llm_model *m, const int32_t *tokens,
                           const float *hidden, uint32_t n, uint32_t pos0,
                           float *logits, int all_logits)
 {
     double start = now();
-    int rc = mtp_forward_core(m, tokens, hidden, n, pos0, logits, all_logits);
+    m->dh_scored_sum = 0;
+    int rc = mtp_forward_core(m, tokens, hidden, n, pos0, logits, all_logits,
+                              MTP_HIDDEN_ALL);
     m->mtp_maintenance_s += now() - start;
     return rc;
 }
+
+int janas_llm_mtp_maintain(struct janas_llm_model *m, const int32_t *tokens,
+                           const float *hidden, uint32_t n, uint32_t pos0)
+{
+    if (!m || !tokens || !hidden || !n || n > m->blk || pos0 > m->n_ctx ||
+        n > m->n_ctx - pos0)
+        return -1;
+    if (!janas_llm_mtp_branch_capable(m))
+        return janas_llm_mtp_forward(m, tokens, hidden, n, pos0, NULL, 0);
+    double start = now();
+    m->dh_scored_sum = 0;
+    int rc = mtp_forward_core(m, tokens, hidden, n, pos0, NULL, 0, MTP_KV_ONLY);
+    m->mtp_maintenance_s += now() - start;
+    return rc;
+}
+
+int janas_llm_mtp_draft_tail(struct janas_llm_model *m, const int32_t *tokens,
+                             const float *hidden, uint32_t n, uint32_t pos0,
+                             int32_t *token, float *conf)
+{
+    if (!m || !tokens || !hidden || !token || !conf || !n || n > m->blk ||
+        pos0 > m->n_ctx || n > m->n_ctx - pos0)
+        return -1;
+    if (!janas_llm_mtp_branch_capable(m))
+        return janas_llm_mtp_draft(m, tokens, hidden, n, pos0, token, conf);
+    double start = now();
+    m->dh_scored_sum = 0;
+    int rc = mtp_forward_core(m, tokens, hidden, n, pos0, NULL, 0, MTP_HIDDEN_LAST);
+    m->mtp_maintenance_s += now() - start;
+    return rc ? rc : mtp_score_head(m, n, token, conf);
+}
+
 static int mtp_forward_core(struct janas_llm_model *m, const int32_t *tokens,
                             const float *hidden, uint32_t n, uint32_t pos0,
-                            float *logits, int all_logits)
+                            float *logits, int all_logits, enum mtp_output output)
 {
     if (m->asst) /* no keys and values of its own: nothing to fill */
         return logits || n < 1 || n > m->blk ? -1 : 0;
@@ -1121,22 +1229,44 @@ static int mtp_forward_core(struct janas_llm_model *m, const int32_t *tokens,
         janas_q8k_quantize(m->xn + (size_t)j * dm, m->xq + j * nbd, dm);
     }
     janas_m_attn_layer(m, ly, n, pos0);
-    for (uint32_t j = 0; j < n; j++) {
+    if (output == MTP_KV_ONLY) return 0;
+    uint32_t ffn_first = output == MTP_HIDDEN_LAST ? n - 1 : 0;
+    for (uint32_t j = ffn_first; j < n; j++) {
         rms_norm(m->xn + (size_t)j * dm, m->x + (size_t)j * dm,
                  f32(m, ly->ffn_norm), dm, m->eps);
         janas_q8k_quantize(m->xn + (size_t)j * dm, m->xq + j * nbd, dm);
     }
-    if (janas_m_moe_block(m, ly, m->mtp_cache, m->mtp_jl, m->mtp_cl, n,
-                          MOE_ALL) != 0)
+    if (ffn_first) {
+        /* Only attention's K/V depend on preceding rows. Keep the caller's
+           token-major buffers and expose the final residual/input as row zero
+           to the unchanged expert implementation. All views are restored on
+           failure as well as success. */
+        float *saved_x = m->x, *saved_xn = m->xn;
+        struct janas_block_q8k *saved_xq = m->xq;
+        const struct janas_block_q8k *saved_moe_xq = m->moe_xq;
+        float *saved_moe_out = m->moe_out;
+        uint32_t saved_moe_w = m->moe_w;
+        m->x += (size_t)ffn_first * dm;
+        m->xn += (size_t)ffn_first * dm;
+        m->xq += (size_t)ffn_first * nbd;
+        int rc = janas_m_moe_block(m, ly, m->mtp_cache, m->mtp_jl, m->mtp_cl, 1,
+                                   MOE_ALL);
+        m->x = saved_x; m->xn = saved_xn; m->xq = saved_xq;
+        m->moe_xq = saved_moe_xq; m->moe_out = saved_moe_out; m->moe_w = saved_moe_w;
+        if (rc != 0) return -1;
+    } else if (janas_m_moe_block(m, ly, m->mtp_cache, m->mtp_jl, m->mtp_cl, n,
+                                 MOE_ALL) != 0) {
         return -1;
+    }
     double td = now();
     uint32_t first = all_logits ? 0 : n - 1;
-    for (uint32_t j = 0; j < n; j++) {
+    for (uint32_t j = ffn_first; j < n; j++) {
         rms_norm(m->xn + (size_t)j * dm, m->x + (size_t)j * dm,
                  f32(m, m->mtp_norm), dm, m->eps);
         janas_q8k_quantize(m->xn + (size_t)j * dm, m->xq + j * nbd, dm);
     }
-    memcpy(m->mtp_hid, m->xn, (size_t)n * dm * sizeof(float));
+    memcpy(m->mtp_hid + (size_t)ffn_first * dm,
+           m->xn + (size_t)ffn_first * dm, (size_t)(n - ffn_first) * dm * sizeof(float));
     if (!logits) { /* only the KV cache and the hidden states wanted */
         m->phase[JANAS_PH_OUTPUT] += now() - td;
         return 0;

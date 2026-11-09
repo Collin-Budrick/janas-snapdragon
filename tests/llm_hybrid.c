@@ -135,6 +135,8 @@ static int run(janas_llm *llm, int sampler, int mode, int probe,
         if (failed("stats", janas_llm_chat_stats(chat, &st)) ||
             failed("spec_metrics", janas_llm_chat_speculation_metrics(chat, &sm)) ||
             failed("hybrid_metrics", janas_llm_chat_hybrid_metrics(chat, &hm))) goto fail;
+        struct janas_llm_s2_metrics s2 = {.size = sizeof(s2), .version = JANAS_LLM_S2_METRICS_VERSION};
+        if (failed("s2_metrics", janas_llm_chat_s2_metrics(chat, &s2))) goto fail;
         if (mode == 2) {
             if (turn != copy_turns) *lookup += hm.lookup_accepted;
             else *fallback += hm.mtp_selected;
@@ -156,7 +158,12 @@ static int run(janas_llm *llm, int sampler, int mode, int probe,
                sm.verification_rows, hm.lookup_selected, hm.mtp_selected, hm.probes,
                hm.cooldown_skips, hm.reason_count[JANAS_LLM_HYBRID_REASON_LOOKUP_FASTER],
                hm.lookup_drafted, hm.lookup_accepted, hm.lookup_delivered, hm.mtp_delivered);
-        json_string(actual.text, actual.bytes); puts("}"); fflush(stdout);
+        json_string(actual.text, actual.bytes);
+        printf(",\"s2_cycles\":%" PRIu64 ",\"s2_alternate_builds\":%" PRIu64
+               ",\"s2_cached_uses\":%" PRIu64 ",\"s2_cached_accepted\":%" PRIu64
+               ",\"s2_maintenance_fast_calls\":%" PRIu64 "}", s2.cycles,
+               s2.alternate_builds, s2.cached_uses, s2.cached_accepted, s2.maintenance_fast_calls);
+        puts(""); fflush(stdout);
         if (!identity || st.input_threads != 8 || st.output_threads != 8 ||
             st.finish == JANAS_LLM_FINISH_CONTEXT) goto fail;
     }

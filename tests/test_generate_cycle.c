@@ -6,6 +6,7 @@
  * unsupported saved-state paths, so ordinary archive linkage stays isolated. */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -16,6 +17,9 @@
 struct janas_llm_model {
     uint32_t ctx, period, last_pos, last_n, max_width;
     int bad_drafts, peaky;
+    int s2_capable, s2_candidate_failure, s2_wrong_alternative, s2_bad_alt_child;
+    uint32_t s2_bad_root_pos, maintain_calls, tail_calls, candidate_calls;
+    int32_t head_input, head_token;
     float draft_conf;
     double pass_seconds[JANAS_LLM_MAX_BLOCK + 1];
     double draft_seconds, draft_head_seconds;
@@ -47,9 +51,20 @@ static void fixture_clock_advance(double seconds)
     if (seconds > 0)
         fixture_clock_ticks += (uint64_t)(seconds * 10000000.0 + 0.5);
 }
+static int fixture_refuse_root_allocation;
+static void *fixture_malloc(size_t bytes)
+{
+    if (fixture_refuse_root_allocation && bytes == sizeof(float)) {
+        fixture_refuse_root_allocation = 0;
+        return NULL;
+    }
+    return malloc(bytes);
+}
+#define malloc fixture_malloc
 #define clock_gettime fixture_clock_gettime
 #include "../src/llm/generate.c"
 #undef clock_gettime
+#undef malloc
 
 static int failures;
 #define CHECK(c, text) do { if (!(c)) { \
@@ -62,6 +77,7 @@ static void model_init(struct janas_llm_model *m)
     m->ctx = MOCK_CTX;
     m->period = MOCK_VOCAB;
     m->draft_conf = 0.99f;
+    m->s2_bad_root_pos = UINT32_MAX;
     for (size_t i = 0; i < sizeof(m->mtp_tokens) / sizeof(*m->mtp_tokens); i++)
         m->mtp_tokens[i] = -1;
 }
@@ -217,11 +233,56 @@ int janas_llm_mtp_draft(struct janas_llm_model *m, const int32_t *tokens,
     *token = m->bad_drafts ? (tokens[n - 1] + 9) % MOCK_VOCAB
                           : next_token(m, tokens[n - 1]);
     *conf = m->draft_conf;
+    m->head_input = tokens[n - 1];
+    m->head_token = *token;
     m->costs.head_calls++;
     m->costs.head_seconds += m->draft_head_seconds > 0 ? m->draft_head_seconds : 1e-6;
     fixture_clock_advance(m->draft_seconds);
     return 0;
 }
+int janas_llm_mtp_branch_capable(const struct janas_llm_model *m)
+{ return m->s2_capable; }
+int janas_llm_mtp_maintain(struct janas_llm_model *m, const int32_t *tokens,
+                           const float *hidden, uint32_t n, uint32_t pos)
+{
+    m->maintain_calls++;
+    return janas_llm_mtp_forward(m, tokens, hidden, n, pos, NULL, 0);
+}
+int janas_llm_mtp_draft_tail(struct janas_llm_model *m, const int32_t *tokens,
+                             const float *hidden, uint32_t n, uint32_t pos,
+                             int32_t *token, float *confidence)
+{
+    m->tail_calls++;
+    int rc = janas_llm_mtp_draft(m, tokens, hidden, n, pos, token, confidence);
+    if (!rc && (pos + n - 1 == m->s2_bad_root_pos ||
+        (m->s2_bad_alt_child && pos == m->s2_bad_root_pos + 1))) {
+        *token = (tokens[n - 1] + 9) % MOCK_VOCAB;
+        *confidence = .55f;
+        m->head_token = *token;
+    }
+    return rc;
+}
+int janas_llm_mtp_candidates(const struct janas_llm_model *model, int32_t *ids,
+                             float *probabilities, uint32_t n)
+{
+    struct janas_llm_model *m = (struct janas_llm_model *)model;
+    m->candidate_calls++;
+    if (m->s2_candidate_failure || n < 2) return -1;
+    ids[0] = m->head_token;
+    ids[1] = next_token(m, m->head_input);
+    if (ids[1] == ids[0]) ids[1] = (ids[0] + 3) % MOCK_VOCAB;
+    if (m->s2_wrong_alternative) ids[1] = (ids[1] + 2) % MOCK_VOCAB;
+    probabilities[0] = m->draft_conf;
+    probabilities[1] = .4f;
+    return 2;
+}
+void janas_llm_model_phases(const struct janas_llm_model *m,
+                            double phases[JANAS_PH_COUNT])
+{
+    memset(phases, 0, JANAS_PH_COUNT * sizeof(*phases));
+    phases[JANAS_PH_EXPERTS] = m->forward_calls * 1e-8;
+}
+
 void janas_llm_mtp_note_tokens(struct janas_llm_model *m,
                                const int32_t *tokens, uint32_t n)
 { (void)tokens; m->note_rows += n; }
@@ -1162,7 +1223,18 @@ static void cost_stops_and_context(void)
 /* A lookup batch has different construction/recovery history from native
  * MTP. Its real cost must teach the source selector without changing the
  * calibrated fallback's target-width price table. */
-static void lookup_price_isolation(void)
+static unsigned s2_baseline_count(const struct janas_llm_session *s)
+{
+    unsigned count = 0;
+    for (unsigned warm = 0; warm < 2; warm++)
+        for (unsigned vocab = 0; vocab < JANAS_S2_VOCABS; vocab++)
+            for (unsigned reuse = 0; reuse < JANAS_S2_REUSE; reuse++)
+                for (unsigned width = 0; width < 18; width++)
+                    count += s->s2.width[warm][vocab][reuse][width].base_count;
+    return count;
+}
+
+static void lookup_price_isolation(int exact_s2)
 {
     struct janas_llm_model m;
     model_init(&m); m.period = 4; m.peaky = 1;
@@ -1173,6 +1245,7 @@ static void lookup_price_isolation(void)
     m.pass_seconds[3] = 0.300;
     struct janas_gen_options o = cost_options(0);
     o.spec_auto = 1; o.hybrid_lookup_max_drafts = 2;
+    o.s2_exact = exact_s2;
     struct janas_llm_session *s = janas_llm_session_create(&m, &o);
     CHECK(s != NULL, "source-isolated lookup pricing session created");
     if (!s) return;
@@ -1186,6 +1259,7 @@ static void lookup_price_isolation(void)
     CHECK(janas_llm_session_next(s, &token) == 0 && token == 0 &&
           s->pending.planner_source == JANAS_GEN_SOURCE_LOOKUP && s->n_mdraft == 2,
           "actual controller chooses a two-draft lookup before its priced target pass");
+    unsigned old_s2_baselines = s2_baseline_count(s);
     double old_width_cost = s->pl.t[3];
     double old_observed_cost = s->hybrid.lookup[1][0][2][2].seconds;
     double old_width_samples = s->hybrid.width[1][0][3].count;
@@ -1200,6 +1274,8 @@ static void lookup_price_isolation(void)
     CHECK(s->hybrid.lookup[1][0][2][2].seconds - old_observed_cost >= 0.300 &&
           s->hybrid.width[1][0][3].count == old_width_samples + 1,
           "source controller still learns lookup's complete cost and actual target width");
+    CHECK(s2_baseline_count(s) == old_s2_baselines,
+          "lookup target cost cannot pollute S2 native-MTP baseline evidence");
     /* Change only the offered source and the next MTP workload cost. Keep
        the same conversation/table, so a lookup spike cannot be hidden by
        append's ordinary per-turn timing reset. */
@@ -1314,6 +1390,319 @@ static void incoming_recovery_pricing(int previous_lookup, int cost_mode,
     janas_llm_session_destroy(s);
 }
 
+/* Prime only controller evidence/private RNG, never target logits or RNG.
+   This deterministic fixture reaches the bounded two-node exploration action
+   so the staged sibling path cannot silently remain untested. */
+static void s2_prime_probe(struct janas_llm_session *s)
+{
+    for (unsigned i = 0; i < 3; i++) {
+        struct janas_s2_observation o = {.cycle = s->s2_cycle, .warm = 1,
+            .vocab = 0, .reuse = 2, .width = 5, .delivered = 1,
+            .root_offered = 1, .rank2_probability = .4f,
+            .full_seconds = .01, .verify_seconds = .008,
+            .expert_cpu_seconds = .003, .expert_groups = 5,
+            .expert_assignments = 10};
+        janas_s2_observe(&s->s2, &o);
+    }
+    struct janas_s2_offer offer = {.cycle = s->s2_cycle + 1, .warm = 1,
+        .vocab = 0, .reuse = 2, .primary_nodes = 4, .available_alt_nodes = 4,
+        .branches = 2, .max_nodes = 8, .min_gain_percent = 5,
+        .rank2_probability = .4f};
+    for (uint64_t seed = 1; seed < 10000; seed++) {
+        struct janas_s2_controller copy = s->s2;
+        copy.rng = seed;
+        struct janas_s2_decision d = janas_s2_choose(&copy, &offer);
+        if (d.probe && d.alt_nodes == 2) { s->s2.rng = seed; return; }
+    }
+    CHECK(0, "bounded independent S2 probe can be deterministically reached");
+}
+
+static void s2_cached_branch(int wrong_alternative, int epoch_changed, int declined, int cancel)
+{
+    struct janas_llm_model m;
+    model_init(&m);
+    m.peaky = m.s2_capable = 1;
+    m.s2_bad_root_pos = 3;
+    m.s2_wrong_alternative = wrong_alternative;
+    struct janas_gen_options o = options(JANAS_SPEC_MTP, 0, 0);
+    o.spec_auto = 0;
+    o.s2_exact = 1; o.s2_branches = 2; o.s2_max_nodes = 8;
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "S2 fixture session created");
+    if (!s) return;
+    int32_t prompt[] = {1,2,3,4}, token;
+    CHECK(janas_llm_session_append(s, prompt, 4) == 0, "S2 prompt appended");
+    s2_prime_probe(s);
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 5,
+          "S2 primary target is unchanged");
+    CHECK(s->s2_pending.alt_nodes == 2 && s->s2_pending.tail_n == 1 &&
+          s->s2_metrics.alternate_builds == 1 && s->s2_metrics.probes == 1 &&
+          s->n_mdraft + (int)s->s2_pending.alt_nodes <= 8,
+          "S2 bounded root fork builds primary plus one two-node sibling");
+    CHECK(s->pending.preparation_seconds >= s->s2_pending.eager_seconds &&
+          s->s2_pending.eager_seconds > 0,
+          "all eagerly scored sibling work belongs to the primary proposal");
+    uint64_t heads = m.costs.head_calls;
+    unsigned maintenance = m.maintain_calls;
+    if (epoch_changed) m.costs.vocab_epoch++;
+    if (declined) {
+        /* The native planner may decline already-built primary drafts. Row
+           zero still independently proves a sampled alternative root. */
+        s->o.spec_auto = 1;
+        s->pl.t[1] = .001;
+        for (unsigned width = 2; width <= 5; width++) s->pl.t[width] = .5;
+    }
+    CHECK(janas_llm_session_next(s, &token) == 0 && token == 6,
+          "target independently samples correction after wrong primary root");
+    if (declined) CHECK(s->metrics.last.pass_width == 1,
+                        "native planner actually declines the prepared primary chain");
+    if (!wrong_alternative && !epoch_changed) {
+        CHECK(s->s2_pending.cached && s->s2_pending.continuation_kind == 2 &&
+              s->n_mdraft == 1 && s->mdraft[0] == 7 &&
+              m.costs.head_calls == heads && m.maintain_calls == maintenance + 1,
+              "rank-2 correction consumes sibling descendants after canonical maintenance without head/chain scoring");
+        CHECK(s->pending.preparation_seconds == 0,
+              "cached continuation does not charge eager sibling construction again");
+        if (cancel) {
+            uint64_t discarded = s->s2_metrics.discarded_nodes;
+            unsigned prepared = (unsigned)s->n_mdraft;
+            if (cancel == 1) {
+                o.s2_exact = 0;
+                CHECK(janas_llm_session_set_options(s, &o) == 0,
+                      "S2 can be disabled while a cached continuation is pending");
+            } else {
+                CHECK(janas_llm_session_save(s) == NULL,
+                      "snapshot attempt may fail but still invalidates derived sibling state");
+            }
+            CHECK(!s->n_mdraft && !s->s2_pending.tail_n &&
+                  s->s2_metrics.discarded_nodes == discarded + prepared,
+                  "cancelled cached descendants are invalidated and counted before option/snapshot transition");
+            CHECK(janas_llm_session_next(s, &token) == 0 && token == 7,
+                  "cancelled sibling is replaced by exact ordinary target work");
+            canonical_mtp(s, &m);
+            janas_llm_session_destroy(s);
+            return;
+        }
+        double trials = 0;
+        for (int i = 0; i < CAL_BINS; i++) trials += s->pl.tried[i];
+        CHECK(janas_llm_session_next(s, &token) == 0 && token == 7 &&
+              s->metrics.last.pass_width == 2 && s->metrics.last.accepted_prefix == 1,
+              "cached sibling still uses unchanged exact target verification");
+        double after = 0;
+        for (int i = 0; i < CAL_BINS; i++) after += s->pl.tried[i];
+        CHECK(trials == after && s->s2_metrics.cached_accepted == 1,
+              "cached branch acceptance is diagnosed separately from native MTP confidence bins");
+        /* Finish the second buffered target output so the cycle observation
+           includes actual delivered tokens and the parent's compatibility key. */
+        CHECK(janas_llm_session_next(s, &token) == 0 && token == 8,
+              "cached pass buffered correction returned in canonical order");
+        unsigned count = 0;
+        for (unsigned r = 0; r < JANAS_S2_REUSE; r++)
+            count += s->s2.cached_after_rank2[1][0][r][2].count;
+        CHECK(count == 1, "cached continuation teaches compatible observational full-cycle utility");
+    } else {
+        CHECK(!s->s2_pending.cached && m.costs.head_calls > heads &&
+              s->s2_metrics.cached_uses == 0 && s->s2_metrics.discarded_nodes >= 1,
+              "wrong or vocabulary-stale sibling discarded and fresh MTP scored");
+        if (!wrong_alternative)
+            CHECK(s->s2_pending.continuation_kind == 1,
+                  "rank-2 correction without usable cache tags fresh-MTP comparison");
+    }
+    CHECK(!m.invalid_calls && !m.invalid_prepare,
+          "root fork never issues target work at a sibling position");
+    canonical_mtp(s, &m);
+    uint64_t clock = s->s2_cycle;
+    janas_llm_session_reset(s);
+    CHECK(s->s2_cycle == clock && !s->s2_pending.tail_n && !s->s2_current.tail_n &&
+          !s->n_mdraft, "conversation reset invalidates sibling cache and retains monotonic learned clock");
+    janas_llm_session_destroy(s);
+}
+
+/* A cached sibling has its own causal recovery. Never subtract the
+   approximate row-share from native prices: refuse this mixed observation. */
+static void s2_recovery_price_isolation(int foreign)
+{
+    struct janas_llm_model m;
+    model_init(&m); m.peaky = 1;
+    m.s2_capable = foreign; m.bad_drafts = !foreign;
+    m.s2_bad_alt_child = foreign;
+    if (foreign) m.s2_bad_root_pos = 3;
+    for (unsigned width = 1; width <= 17; width++) m.pass_seconds[width] = .100;
+    struct janas_gen_options o = options(JANAS_SPEC_MTP, 0, 0);
+    o.spec_auto = 0; o.s2_exact = 1; o.s2_branches = 2; o.s2_max_nodes = 8;
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "S2 causal replay pricing session created");
+    if (!s) return;
+    int32_t prompt[] = {1,2,3,4}, token;
+    CHECK(janas_llm_session_append(s, prompt, 4) == 0, "S2 replay pricing prompt appended");
+    if (foreign) s2_prime_probe(s);
+    for (unsigned i = 0; i < (foreign ? 3u : 2u); i++)
+        CHECK(janas_llm_session_next(s, &token) == 0,
+              "actual wrong primary/cached proposal reaches deferred recovery");
+    CHECK(s->s2_waiting && (s->s2_wait.continuation_kind == 2) == foreign &&
+          s->metrics.last.accepted_prefix == 0 && s->n_mdraft == 4,
+          "actual prior proposal source and rejected suffix are retained until recovery");
+    s->o.spec_auto = 1;
+    for (unsigned width = 1; width <= 5; width++) s->pl.t[width] = .100;
+    m.pass_seconds[5] = .140; m.recovery_on_next = .040;
+    CHECK(janas_llm_session_next(s, &token) == 0 && s->metrics.last.pass_width == 5,
+          "next real MTP verification carries the previous source's replay");
+    CHECK(fabs(s->pl.t[5] - (foreign ? .100 : .108)) < 1e-9,
+          "foreign cached replay refuses mixed MTP price; own MTP replay retains legacy full-cost learning");
+    CHECK(s->metrics.last.verification_seconds >= .140 &&
+          s->metrics.last.total_seconds >= .140 && !s->s2_waiting == !s->metrics.last.rejected_rows,
+          "source-isolated learning preserves measured raw forward/cycle cost");
+    if (foreign) {
+        CHECK(s->s2_metrics.cached_nodes == 1 && s->s2_metrics.cached_accepted == 0 &&
+              s->s2_metrics.discarded_nodes >= 1,
+              "rejected cached descendants are fully counted as discarded nodes");
+        unsigned count = 0; double seconds = 0;
+        for (unsigned reuse = 0; reuse < JANAS_S2_REUSE; reuse++) {
+            const struct janas_s2_sample *sample = &s->s2.cached_after_rank2[1][0][reuse][2];
+            count += sample->count; seconds += sample->seconds;
+        }
+        CHECK(count == 1 && seconds >= .140 && seconds < .141,
+              "cached source ledger receives its causal recovery once without changing wall totals");
+        while (s->ret < s->n)
+            CHECK(janas_llm_session_next(s, &token) == 0, "drain accepted MTP prefix before next clean sample");
+        m.pass_seconds[5] = .200;
+        CHECK(janas_llm_session_next(s, &token) == 0 &&
+              s->metrics.last.pass_width == 5 && fabs(s->pl.t[5] - .120) < 1e-9,
+              "the next clean native MTP price resumes learning after one refused mixed sample");
+    }
+    CHECK(!m.invalid_calls && !m.invalid_prepare, "causal pricing does not alter target/KV boundaries");
+    janas_llm_session_destroy(s);
+}
+
+static void s2_zero_gain_threshold(unsigned gain)
+{
+    struct janas_llm_model m;
+    model_init(&m); m.peaky = m.s2_capable = 1; m.s2_bad_root_pos = 3;
+    struct janas_gen_options o = options(JANAS_SPEC_MTP, 0, 0);
+    o.spec_auto = 0; o.s2_exact = 1; o.s2_branches = 2;
+    o.s2_max_nodes = 8; o.s2_min_gain_percent = (int)gain;
+    struct janas_llm_session *s = janas_llm_session_create(&m, &o);
+    CHECK(s != NULL, "S2 explicit utility threshold fixture created");
+    if (!s) return;
+    int32_t prompt[]={1,2,3,4}, token;
+    CHECK(janas_llm_session_append(s,prompt,4)==0, "S2 threshold fixture prompt appended");
+    for (unsigned i=0;i<3;i++) {
+        struct janas_s2_observation observation = {.warm=1,.vocab=0,.reuse=2,
+            .width=5,.delivered=1,.root_offered=1,.rank2matched=1,
+            .rank2_probability=.4f,.full_seconds=.010,.verify_seconds=.008,
+            .expert_cpu_seconds=.003,.expert_groups=5,.expert_assignments=10};
+        janas_s2_observe(&s->s2,&observation);
+        observation.root_offered=observation.rank2matched=0;
+        observation.width=2; observation.continuation_kind=1;
+        janas_s2_observe(&s->s2,&observation);
+        observation.continuation_kind=2;observation.full_seconds=.009;
+        observation.accepted_prefix=1;
+        janas_s2_observe(&s->s2,&observation);
+        observation.width=0; observation.continuation_kind=0;
+        observation.alt_nodes=2;observation.eager_seconds=.0002;
+        janas_s2_observe(&s->s2,&observation);
+    }
+    /* Find a nonprobe RNG state so the observed 3.3% gain itself, rather
+       than exploration, distinguishes explicit 0% from the default 5%. */
+    struct janas_s2_offer offer={.cycle=1,.warm=1,.vocab=0,.reuse=2,
+        .primary_nodes=4,.available_alt_nodes=4,.branches=2,.max_nodes=8,
+        .min_gain_percent=5,.rank2_probability=.4f};
+    for(uint64_t rng=1;rng<10000;rng++) {
+        struct janas_s2_controller copy=s->s2;copy.rng=rng;
+        if(!janas_s2_choose(&copy,&offer).probe){s->s2.rng=rng;break;}
+    }
+    CHECK(janas_llm_session_next(s,&token)==0 && token==5,
+          "observed utility threshold leaves target behavior unchanged");
+    CHECK((s->s2_pending.alt_nodes==2)==(gain==0) &&
+          s->s2_metrics.probes==0,
+          "explicit zero S2 gain threshold is honored while five percent prunes a 3.3 percent prediction");
+    janas_llm_session_destroy(s);
+}
+
+static void s2_stop_limit_allocation(unsigned shape)
+{
+    struct janas_llm_model m;
+    model_init(&m); m.peaky = m.s2_capable = 1; m.s2_bad_root_pos = 3;
+    struct janas_gen_options o=options(JANAS_SPEC_MTP,0,0);
+    o.spec_auto=0;o.s2_exact=1;o.s2_branches=2;o.s2_max_nodes=8;
+    if(shape==0){o.stop[0]=6;o.n_stop=1;}
+    if(shape==2)o.spec_k=16;
+    struct janas_llm_session *s=janas_llm_session_create(&m,&o);
+    CHECK(s!=NULL,"S2 stop/limit/allocation fixture created");
+    if(!s)return;
+    int32_t prompt[]={1,2,3,4},token;
+    CHECK(janas_llm_session_append(s,prompt,4)==0,"S2 bounded fixture prompt appended");
+    s2_prime_probe(s);
+    if(shape==1)janas_llm_session_reply_remaining(s,3);
+    if(shape==3)fixture_refuse_root_allocation=1;
+    CHECK(janas_llm_session_next(s,&token)==0&&token==5,
+          "S2 optional capacity/snapshot allocation cannot change target output");
+    if(shape==0) {
+        CHECK(!s->s2_pending.alt_nodes,"stop alternative root is never expanded");
+        CHECK(janas_llm_session_next(s,&token)==0&&token==6&&!s->n_mdraft&&
+              !s->s2_pending.tail_n,"stop correction ends drafting and invalidates sibling state");
+    } else if(shape==1) {
+        CHECK(s->n_mdraft<=1&&!s->s2_pending.alt_nodes,
+              "known reply limit bounds both paths before speculative scoring");
+        for(unsigned i=0;i<2;i++)CHECK(janas_llm_session_next(s,&token)==0,
+                                     "bounded reply completes exactly");
+        CHECK(s->ret==s->n&&!s->n_mdraft,"reply clipping leaves no unread or speculative tail");
+    } else if(shape==2) {
+        CHECK(s->n_mdraft==8&&!s->s2_pending.alt_nodes,
+              "total node budget caps a longer configured primary chain without allocating siblings");
+    } else {
+        CHECK(!s->s2_root_hidden&&!s->s2_pending.alt_nodes&&m.tail_calls>0,
+              "failed optional root scratch allocation retains optimized exact primary execution");
+        CHECK(janas_llm_session_next(s,&token)==0&&token==6,
+              "allocation fallback preserves later exact rejection and maintenance");
+    }
+    CHECK(!m.invalid_calls&&!m.invalid_prepare,"S2 stop/cap/allocation fallbacks preserve valid model calls");
+    janas_llm_session_destroy(s);
+}
+
+static void s2_exact_transcript(float temperature, int guards, int capable)
+{
+    struct janas_llm_model a,b;
+    model_init(&a); model_init(&b);
+    b.s2_capable = capable;
+    struct janas_gen_options oa = options(JANAS_SPEC_OFF, 0, temperature);
+    struct janas_gen_options ob = options(JANAS_SPEC_MTP, 0, temperature);
+    ob.s2_exact = 1; ob.s2_branches = 2; ob.s2_max_nodes = 8;
+    if (guards & 2) {
+        oa.presence_penalty = ob.presence_penalty = .3f;
+        oa.frequency_penalty = ob.frequency_penalty = .2f;
+    }
+    struct janas_llm_session *sa = janas_llm_session_create(&a,&oa);
+    struct janas_llm_session *sb = janas_llm_session_create(&b,&ob);
+    CHECK(sa && sb, "S2/plain exact transcript sessions created");
+    if (!sa || !sb) { janas_llm_session_destroy(sa); janas_llm_session_destroy(sb); return; }
+    struct filter_state fa={0},fb={0};
+    struct janas_sample_filter filter_a={&fa,filter_active,filter_allows,filter_accept};
+    struct janas_sample_filter filter_b={&fb,filter_active,filter_allows,filter_accept};
+    if (guards & 1) { janas_llm_session_filter(sa,&filter_a); janas_llm_session_filter(sb,&filter_b); }
+    int32_t prompt[]={1,2,3,4}, turn[]={9,10};
+    for (unsigned reply=0;reply<3;reply++) {
+        CHECK(janas_llm_session_append(sa,reply?turn:prompt,reply?2:4)==0 &&
+              janas_llm_session_append(sb,reply?turn:prompt,reply?2:4)==0,
+              "S2 exactness across subsequent turns and cancelled unread suffix");
+        janas_llm_session_mark(sa);janas_llm_session_mark(sb);
+        if (reply) { janas_llm_session_reply_remaining(sa,25);janas_llm_session_reply_remaining(sb,25); }
+        for(unsigned i=0;i<(reply?25:7);i++) {
+            int32_t ta,tb;
+            CHECK(janas_llm_session_next(sa,&ta)==0 && janas_llm_session_next(sb,&tb)==0 && ta==tb,
+                  "S2 greedy/seeded token stream and target sampler state unchanged");
+        }
+        canonical_mtp(sb,&b);
+    }
+    CHECK(!a.invalid_calls && !b.invalid_calls && !b.invalid_prepare,
+          "S2 target and canonical maintenance bounds hold across turns");
+    if (!capable) CHECK(!b.tail_calls && !b.maintain_calls && !b.candidate_calls,
+                       "unsupported MTP falls back to untouched legacy helper");
+    if (guards) CHECK(sb->metrics.verification_rows==sb->metrics.cycles,
+                      "S2 preserves one-row verification guard with filters/penalties");
+    janas_llm_session_destroy(sa);janas_llm_session_destroy(sb);
+}
+
 int main(void)
 {
     {
@@ -1375,11 +1764,28 @@ int main(void)
     cost_lookup_maintenance_and_recovery();
     cost_recovery_conservation();
     cost_stops_and_context();
-    lookup_price_isolation();
+    lookup_price_isolation(0);
+    lookup_price_isolation(1);
     incoming_recovery_pricing(1, 1, 0);
     incoming_recovery_pricing(1, 1, 1);
     incoming_recovery_pricing(0, 1, 0);
     incoming_recovery_pricing(0, 0, 0);
+    s2_cached_branch(0, 0, 0, 0);
+    s2_cached_branch(1, 0, 0, 0);
+    s2_cached_branch(0, 1, 0, 0);
+    s2_cached_branch(0, 0, 1, 0);
+    s2_cached_branch(0, 0, 0, 1);
+    s2_cached_branch(0, 0, 0, 2);
+    for(unsigned shape=0;shape<4;shape++)s2_stop_limit_allocation(shape);
+    s2_recovery_price_isolation(0);
+    s2_recovery_price_isolation(1);
+    s2_zero_gain_threshold(0);
+    s2_zero_gain_threshold(5);
+    for (int seeded = 0; seeded < 2; seeded++)
+        for (int guards = 0; guards < 4; guards++) {
+            s2_exact_transcript(seeded ? 1.0f : 0.0f, guards, 1);
+            s2_exact_transcript(seeded ? 1.0f : 0.0f, guards, 0);
+        }
     printf("test_generate_cycle: %s\n", failures ? "FAILED" : "ok");
     return failures ? 1 : 0;
 }

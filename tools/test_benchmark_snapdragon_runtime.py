@@ -66,6 +66,8 @@ class RuntimeProtocolTests(unittest.TestCase):
         if run["binary"] == "B":
             setup.update({k: c[k] for k in ("spec_planner", "spec_explore", "draft_vocab", "draft_vocab_rows",
                                           "hybrid_policy", "lookup_drafts", "mtp_drafts", "hybrid_probe_percent")})
+        if c["s2_exact"] == "on":
+            setup.update({k: c[k] for k in ("s2_exact", "s2_branches", "s2_max_nodes", "s2_min_gain_percent")})
         setup.update({"fair_retain_controller": run["controller_protocol"] == "retained_across_fresh_conversations",
                           "fair_controller_protocol": run["controller_protocol"],
                           "conversation_cache_reuse": False,
@@ -84,9 +86,43 @@ class RuntimeProtocolTests(unittest.TestCase):
                             "input_seconds": 1.0, "accelerator_counters": {},
                             "speculation_metrics": {"cycles": 8}})
             samples[-1]["fair_controller_protocol"] = run["controller_protocol"]
+            if c["s2_exact"] == "on":
+                samples[-1]["s2_metrics"] = dict(schema=1, cycles=8, alternate_builds=0,
+                    alternate_nodes=0, cached_uses=0, pruned=8, probes=0)
             if c["hybrid_policy"] == "cost":
                 samples[-1]["hybrid_metrics"] = {"schema": 1, "decisions": 8}
         return [setup, *samples]
+
+    def test_s2_defaults_are_off_and_old_baseline_cli_stays_compatible(self):
+        plan = tool.build_plan(self.args(extra=["--candidate-case", "s2-exact"]), self.inputs())
+        for run in plan["contract"]["plan"]:
+            if run["binary"] == "A":
+                self.assertNotIn("--s2-exact", run["command"])
+                self.assertEqual(run["performance_controls"]["JANAS_S2_EXACT"], "off")
+            else:
+                self.assertEqual(run["command"][run["command"].index("--s2-exact")+1], "on")
+                self.assertEqual(run["control"]["speculation"], "mtp")
+            self.assertEqual(tool.validate_records(self.records(run), run), [])
+
+    def test_s2_invalid_controls_and_off_auxiliary_changes_have_no_effect(self):
+        for bad in ({"s2_exact": True}, {"s2_branches": 0}, {"s2_branches": 3},
+                    {"s2_max_nodes": 33}, {"s2_min_gain_percent": -1},
+                    {"s2_min_gain_percent": True}, {"s2_exact": "on", "speculation": "none"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError): tool.valid_control(bad)
+        self.assertEqual(tool.effective_control({}), tool.effective_control({"s2_branches": 1, "s2_max_nodes": 32}))
+        self.assertNotEqual(tool.effective_control({}), tool.effective_control({"s2_exact": "on"}))
+
+    def test_s2_on_requires_actual_setup_and_diagnostics(self):
+        plan = tool.build_plan(self.args(extra=["--candidate-case", "s2-exact"]), self.inputs())
+        run = next(r for r in plan["contract"]["plan"] if r["binary"] == "B")
+        records = self.records(run)
+        records[0]["s2_branches"] = 1
+        self.assertTrue(any("s2_branches" in e for e in tool.validate_records(records, run)))
+        records = self.records(run); records[1].pop("s2_metrics")
+        self.assertTrue(any("S2 diagnostics" in e for e in tool.validate_records(records, run)))
+
+    def test_s2_execute_and_resume_real_plumbing_with_old_off_baseline(self):
+        self.exercise_execution_plumbing(candidate_case="s2-exact")
 
     def test_public_paths_and_frozen_prompt_hashes(self):
         self.assertEqual(tool.ROOT, TOOL_PATH.resolve().parents[1])
@@ -439,7 +475,7 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertFalse(tool.attention_calibration_result(cache, frozen)["unchanged"])
         self.assertEqual(path.read_bytes(), data)
 
-    def exercise_execution_plumbing(self, same_binary=False):
+    def exercise_execution_plumbing(self, same_binary=False, candidate_case="hybrid-cost8"):
         # A fake process replaces the model executable, but the actual CLI,
         # execution loop, Win32 affinity calls, child_run, logs, parsers,
         # seeding, validation, summaries and final preservation all execute.
@@ -485,7 +521,7 @@ class RuntimeProtocolTests(unittest.TestCase):
             result.poll.return_value = 0
             return result
         args = ["paired", *self.argv, "--execute", "--workloads", "code", "--cooldown", "0",
-                "--candidate-case", "hybrid-cost8", "--calibration-file", str(drafts),
+                "--candidate-case", candidate_case, "--calibration-file", str(drafts),
                 "--attention-calibration-file", str(attention), "--output", str(output)]
         if same_binary:
             self.candidate.write_bytes(self.baseline.read_bytes())
