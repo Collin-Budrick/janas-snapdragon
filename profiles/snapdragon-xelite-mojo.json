@@ -46,9 +46,16 @@
   },
   "evidence": {
     "date": "2026-11-09",
+    "status": "validated opt-in module; C stable default retained",
     "promotion_gate_passed": false,
-    "status": "experimental; correctness and matched performance qualification recorded separately",
-    "notes": "Optional runtime-free Mojo panel module. CPU8/cache32GiB/reserve12GiB/MTP4/GDN111 retained. C singleton and unavailable/unsupported-module fallback retained. Build tools/build-mojo.sh first."
+    "whole_profile_geometric_mean_rate_ratio": 1.0362431834051178,
+    "automatic_shape_promotion": false,
+    "module_sha256": "763d287e889ad5d11ab6f9e157b54c21da033363ab7419946e836f0e68322bf1",
+    "source_commit": "aad8c55",
+    "report": "docs/benchmarks/snapdragon80b-20261109-mojo.md",
+    "raw_results": "docs/benchmarks/snapdragon80b-20261109-mojo.json",
+    "validation_report": "docs/benchmarks/snapdragon80b-20261109-mojo-validation.json",
+    "notes": "Original weights/CPU8/MTP4/cache32GiB/reserve12GiB/GDN111; exact multi-vector Mojo kernels with C singleton/fallback. Complete-cycle profile and individual kernel gains are separate gates; Q6 has no broad measured pool-inclusive win."
   },
   "runtime": {
     "mojo_library": "lib/mojo/aarch64-windows/janas_mojo.dll"

@@ -143,3 +143,7 @@ and [custom-op interface](https://max.modular.com/develop/build-custom-ops/) are
 implementation references. Neither a common quantization label nor a language port proves
 exact arithmetic or a speed gain. The 40 tok/s objective remains subject to matched
 measurements.
+
+The [matched first-module results](benchmarks/snapdragon80b-20261109-mojo.md)
+record the current optimized module against the frozen MTP4 profile. The
+whole-profile gain was 3.6%; the Mojo profile remains opt-in.
