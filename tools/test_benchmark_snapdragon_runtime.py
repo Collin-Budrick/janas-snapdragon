@@ -437,7 +437,7 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertFalse(tool.attention_calibration_result(cache, frozen)["unchanged"])
         self.assertEqual(path.read_bytes(), data)
 
-    def test_execute_cli_exercises_real_child_plumbing_with_private_frozen_seeds(self):
+    def exercise_execution_plumbing(self, same_binary=False):
         # A fake process replaces the model executable, but the actual CLI,
         # execution loop, Win32 affinity calls, child_run, logs, parsers,
         # seeding, validation, summaries and final preservation all execute.
@@ -478,6 +478,9 @@ class RuntimeProtocolTests(unittest.TestCase):
         args = ["paired", *self.argv, "--execute", "--workloads", "code", "--cooldown", "0",
                 "--candidate-case", "hybrid-cost8", "--calibration-file", str(drafts),
                 "--attention-calibration-file", str(attention), "--output", str(output)]
+        if same_binary:
+            self.candidate.write_bytes(self.baseline.read_bytes())
+            args.append("--allow-same-binary-controls")
         with (mock.patch.object(tool, "native_host", return_value=True),
               mock.patch.object(tool, "source_identity", return_value={"fixture": True}),
               mock.patch.object(tool.ctypes, "WinDLL", return_value=kernel, create=True),
@@ -486,6 +489,11 @@ class RuntimeProtocolTests(unittest.TestCase):
               contextlib.redirect_stdout(io.StringIO())):
             self.assertEqual(tool.main(args), 0)
         records = tool.read_json(output / "results.json")
+        comparison = tool.read_json(output / "manifest.json")["contract"]["comparison"]
+        kind = "same_binary_different_controls" if same_binary else "different_binaries"
+        self.assertEqual(comparison["kind"], kind)
+        self.assertEqual(comparison["allow_same_binary_controls"], same_binary)
+        self.assertTrue(all(v["comparison_kind"] == kind for v in records))
         self.assertEqual([v["binary"] for v in records], list("ABBA"))
         self.assertTrue(all(v["status"] == "ok" for v in records))
         self.assertTrue(all(v["attention_calibration_final"]["unchanged"] for v in records))
@@ -499,6 +507,29 @@ class RuntimeProtocolTests(unittest.TestCase):
               mock.patch.object(tool.subprocess, "Popen", side_effect=AssertionError("completed resume relaunched child")),
               contextlib.redirect_stdout(io.StringIO())):
             self.assertEqual(tool.main(args + ["--resume"]), 0)
+
+    def test_execute_cli_exercises_real_child_plumbing_with_private_frozen_seeds(self):
+        self.exercise_execution_plumbing()
+
+    def test_same_binary_different_controls_execute_and_resume_require_opt_in(self):
+        self.exercise_execution_plumbing(same_binary=True)
+
+    def test_identical_binary_rejected_without_flag_and_identical_effective_controls_rejected_with_flag(self):
+        self.candidate.write_bytes(self.baseline.read_bytes())
+        args = self.args(extra=["--execute", "--output", str(self.folder / "unused")])
+        with self.assertRaisesRegex(ValueError, "equals selected baseline"):
+            tool.prepare_inputs(args)
+        for overrides in ({}, {"hybrid_probe_percent": 0}, {"speculation": "auto"}):
+            candidate = self.folder / "same-controls.json"
+            candidate.write_text(json.dumps(overrides))
+            args = self.args(extra=["--allow-same-binary-controls", "--candidate-controls", str(candidate)])
+            with mock.patch.object(tool, "source_identity", return_value={"fixture": True}):
+                inputs = tool.prepare_inputs(args)
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, "different effective"):
+                tool.build_plan(args, inputs)
+        screen = self.args("screen", ["--allow-same-binary-controls"])
+        with self.assertRaisesRegex(ValueError, "paired mode"):
+            tool.check_args(screen)
 
     def test_promotion_requires_all_workloads_five_warm_and_guardrails(self):
         manifest = tool.build_plan(self.args(), self.inputs())

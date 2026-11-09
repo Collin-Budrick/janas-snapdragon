@@ -109,6 +109,23 @@ def valid_control(value):
     return c
 
 
+def effective_control(value):
+    """Resolve aliases and omit source controls that cannot affect this mode."""
+    c = valid_control(value)
+    if c["speculation"] == "auto":
+        c["speculation"] = "mtp"  # This runner always supplies the MTP sidecar.
+    if c["speculation"] != "hybrid" or c["hybrid_policy"] != "cost":
+        for key in ("hybrid_policy", "lookup_drafts", "mtp_drafts", "hybrid_probe_percent"):
+            c.pop(key)
+    else:
+        c["lookup_drafts"] = min(c["lookup_drafts"], c["draft_tokens"])
+        c["mtp_drafts"] = min(c["mtp_drafts"], c["draft_tokens"])
+        c["draft_tokens"] = max(c["lookup_drafts"], c["mtp_drafts"])
+    if c["speculation"] != "hybrid" and c["spec_planner"] != "cycle" and c["draft_vocab"] == "legacy":
+        c.pop("spec_explore")
+    return c
+
+
 def performance_controls(c):
     controls = dict(COMMON_ENV, JANAS_SPEC_PLANNER=c["spec_planner"],
         JANAS_SPEC_EXPLORE=str(c["spec_explore"]), JANAS_DRAFT_VOCAB_POLICY=c["draft_vocab"],
@@ -313,8 +330,8 @@ def prepare_inputs(args):
     baseline, baseline_receipt = baseline_input(args, pins)
     candidate = args.bench_exe.resolve()
     candidate_sha = sha(candidate)
-    if args.execute and candidate_sha == baseline["sha256"]:
-        raise ValueError("Candidate equals selected baseline; choose distinct builds")
+    if args.execute and candidate_sha == baseline["sha256"] and not args.allow_same_binary_controls:
+        raise ValueError("Candidate equals selected baseline; choose distinct builds or explicitly allow different controls")
     receipt_path = args.model_receipt.resolve() if args.model_receipt else None
     receipt = read_json(receipt_path) if receipt_path else None
     if receipt is not None and (not isinstance(receipt, dict) or
@@ -414,6 +431,7 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
         command += ["--fair-retain-controller"]
     value = {"id": f"{sequence:02d}-{workload}-{label}-{case}", "workload": workload, "case": case,
              "binary": label, "binary_sha256": binary["sha256"], "warm_rounds": rounds,
+             "comparison_kind": "same_binary_different_controls" if inputs["baseline"]["sha256"] == inputs["candidate"]["sha256"] else "different_binaries",
               "controller_protocol": controller_protocol,
              "control": control, "performance_controls": performance_controls(control), "command": command,
              "calibration": inputs["calibration"],
@@ -423,7 +441,17 @@ def run_spec(inputs, workload, case, control, label, rounds, sequence):
 
 
 def make_manifest(args, protocol, runs, inputs):
+    baseline = next(r["control"] for r in runs if r["binary"] == "A")
+    candidates = {r["case"]: effective_control(r["control"]) for r in runs if r["binary"] == "B"}
+    comparison = {"kind": runs[0]["comparison_kind"],
+        "allow_same_binary_controls": args.allow_same_binary_controls,
+        "baseline_effective_controls": effective_control(baseline),
+        "candidate_effective_controls": candidates}
+    if args.allow_same_binary_controls and (not candidates or any(
+            c == comparison["baseline_effective_controls"] for c in candidates.values())):
+        raise ValueError("--allow-same-binary-controls requires different effective baseline and candidate controls")
     contract = {"schema": 1, "protocol": protocol, "inputs": inputs, "plan": runs,
+                 "comparison": comparison,
                 "settings": {"compute_threads": 8, "parent_and_child_affinity": "0xff", "cache_gib": 32,
                     "reserve_gib": 12, "quality": "HIGH", "expert_bits": 6, "head_bits": 0,
                     "sampler": "greedy", "seed": 20260926, "context_tokens": 2048, "gen": 128,
@@ -733,7 +761,11 @@ def _execute(manifest, args):
     if not contract["inputs"].get("model_verification", {}).get("complete"):
         raise RuntimeError("Execution refuses unverified model payloads")
     if contract["inputs"]["candidate"]["sha256"] == contract["inputs"]["baseline"]["sha256"]:
-        raise RuntimeError("Candidate equals selected baseline; build first")
+        comparison = contract["comparison"]
+        baseline_controls = effective_control(next(r["control"] for r in contract["plan"] if r["binary"] == "A"))
+        candidates = [effective_control(r["control"]) for r in contract["plan"] if r["binary"] == "B"]
+        if not comparison["allow_same_binary_controls"] or not candidates or any(c == baseline_controls for c in candidates):
+            raise RuntimeError("Identical binaries require explicit opt-in and different effective controls")
     directory = args.output.resolve()
     if args.resume:
         old = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
@@ -811,6 +843,8 @@ def parser():
     action.add_argument("--execute", action="store_true", help="explicitly run sequential native Windows ARM64 children")
     p.add_argument("--baseline-exe", type=Path, help="explicit control executable; its SHA is recorded")
     p.add_argument("--baseline-manifest", type=Path, help="bind the control executable to a SHA/source receipt")
+    p.add_argument("--allow-same-binary-controls", action="store_true",
+                   help="paired: explicitly compare one identical binary under different effective controls")
     p.add_argument("--baseline-controls", type=Path, help="explicit validated baseline control JSON; default promoted MTP4/GDN111")
     p.add_argument("--calibration-file", type=Path, help="drafts-<fingerprint>.bin to seed identically into every private process cache; omission freezes absent state")
     p.add_argument("--attention-calibration-file", type=Path,
@@ -848,6 +882,8 @@ def check_args(args):
     names = (args.workloads or ("code,prose" if args.mode == "screen" else "code,prose,long")).split(",")
     if not names or len(set(names)) != len(names) or any(n not in PROMPTS for n in names):
         raise ValueError("Workloads must be a distinct subset of code,prose,long")
+    if args.allow_same_binary_controls and args.mode != "paired":
+        raise ValueError("--allow-same-binary-controls is for paired mode")
     if args.mode == "screen" and args.candidate_controls:
         raise ValueError("--candidate-controls is for paired mode")
     return names
